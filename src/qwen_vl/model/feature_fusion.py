@@ -1,6 +1,5 @@
 """Feature fusion modules for combining 2D and 3D features."""
 
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,8 +18,8 @@ class FeatureFusionConfig:
     decompose_hidden_size: Optional[int] = None
     align_mode: str = "cosine"  # "cosine"(default) or "infonce"
     align_temperature: float = 0.07
-    ortho_mode: str = "cosine"  # "cosine"(default) or "mine"
-    mine_hidden_size: Optional[int] = None
+    ortho_mode: str = "cosine"  # "cosine"(default) or "mine" (mine mode uses vCLUB)
+    mine_hidden_size: Optional[int] = None  # Hidden size for q_theta in vCLUB
 
 
 class CrossAttentionBlock(nn.Module):
@@ -246,11 +245,13 @@ class FeatureFusionModule(nn.Module):
             if self.ortho_mode == "mine":
                 mine_hidden = self.config.mine_hidden_size or self.hidden_size
                 self.mine_statistics_network = nn.Sequential(
-                    nn.LayerNorm(self.hidden_size * 2),
-                    nn.Linear(self.hidden_size * 2, mine_hidden),
+                    nn.LayerNorm(self.hidden_size),
+                    nn.Linear(self.hidden_size, mine_hidden),
                     nn.GELU(),
-                    nn.Linear(mine_hidden, 1),
+                    nn.Linear(mine_hidden, self.hidden_size),
                 )
+                # Keep q_theta out of the main optimizer; we train it in a dedicated step.
+                self.set_mine_network_trainable(False)
             if self.config.fusion_method == "decompose_concat":
                 self.decompose_projection = nn.Linear(self.hidden_size * 2, self.hidden_size)
 
@@ -265,7 +266,18 @@ class FeatureFusionModule(nn.Module):
             return []
         return list(self.mine_statistics_network.parameters())
 
-    def _compute_mine_objective_flat(
+    def _predict_t2d_mean_from_unique(self, unique_flat: torch.Tensor) -> torch.Tensor:
+        if self.ortho_mode != "mine" or not hasattr(self, "mine_statistics_network"):
+            raise ValueError("q_theta is only available when ortho_mode='mine'.")
+
+        unique_flat = unique_flat.float()
+        device_type = "cuda" if unique_flat.is_cuda else "cpu"
+        with torch.amp.autocast(device_type=device_type, enabled=False):
+            self.mine_statistics_network.to(torch.float32)
+            pred_mean = self.mine_statistics_network(unique_flat)
+        return pred_mean
+
+    def _compute_vclub_bound_flat(
         self, unique_flat: torch.Tensor, features_2d_flat: torch.Tensor
     ) -> torch.Tensor:
         if unique_flat.numel() == 0:
@@ -273,39 +285,52 @@ class FeatureFusionModule(nn.Module):
 
         if unique_flat.shape[0] != features_2d_flat.shape[0]:
             raise ValueError(
-                f"Feature pair size mismatch for MINE objective: "
+                f"Feature pair size mismatch for vCLUB objective: "
                 f"{unique_flat.shape[0]} vs {features_2d_flat.shape[0]}"
             )
 
-        # MINE statistics network uses LayerNorm; under DeepSpeed/bf16 the module params are bf16,
-        # so run entire block in float32 (input + module) to avoid dtype mismatch.
-        unique_flat = unique_flat.float()
         features_2d_flat = features_2d_flat.float()
+        pred_mean = self._predict_t2d_mean_from_unique(unique_flat)
 
-        perm = torch.randperm(features_2d_flat.shape[0], device=features_2d_flat.device)
-        shuffled_2d = features_2d_flat[perm]
+        # log q(T_i | F_i), assuming fixed isotropic sigma=1.
+        positive_log_prob = -0.5 * ((features_2d_flat - pred_mean) ** 2).sum(dim=-1)
 
-        joint_pairs = torch.cat([unique_flat, features_2d_flat], dim=-1)
-        marginal_pairs = torch.cat([unique_flat, shuffled_2d], dim=-1)
+        # log q(T_j | F_i) for all pairs (i, j), computed with matrix formulation.
+        pred_norm = (pred_mean ** 2).sum(dim=-1, keepdim=True)  # [N, 1]
+        t_norm = (features_2d_flat ** 2).sum(dim=-1).unsqueeze(0)  # [1, N]
+        cross = torch.matmul(pred_mean, features_2d_flat.transpose(0, 1))  # [N, N]
+        pairwise_log_prob = -0.5 * (pred_norm + t_norm - 2.0 * cross)
+        negative_log_prob = pairwise_log_prob.mean(dim=1)
 
-        # Keep MINE network in float32 for both forward and backward; do not cast back to bf16
-        # or backward will see dtype mismatch (saved tensors float32 vs params bf16).
-        with torch.amp.autocast("cuda", enabled=False):
-            self.mine_statistics_network.to(torch.float32)
-            joint_scores = self.mine_statistics_network(joint_pairs).squeeze(-1)
-            marginal_scores = self.mine_statistics_network(marginal_pairs).squeeze(-1)
+        vclub_bound = (positive_log_prob - negative_log_prob).mean()
+        # Theoretical lower bound is 0 for independent variables; clamp numeric noise.
+        return torch.clamp(vclub_bound, min=0.0)
 
-        log_mean_exp = torch.logsumexp(marginal_scores, dim=0) - math.log(
-            max(marginal_scores.shape[0], 1)
-        )
-        return joint_scores.mean() - log_mean_exp
+    def _compute_vclub_q_loss_flat(
+        self, unique_flat: torch.Tensor, features_2d_flat: torch.Tensor
+    ) -> torch.Tensor:
+        if unique_flat.shape[0] != features_2d_flat.shape[0]:
+            raise ValueError(
+                f"Feature pair size mismatch for q_theta update: "
+                f"{unique_flat.shape[0]} vs {features_2d_flat.shape[0]}"
+            )
+        features_2d_flat = features_2d_flat.float()
+        pred_mean = self._predict_t2d_mean_from_unique(unique_flat)
+        return F.mse_loss(pred_mean, features_2d_flat)
 
     def compute_mine_objective_from_cache(
         self, unique_flat: torch.Tensor, features_2d_flat: torch.Tensor
     ) -> torch.Tensor:
         if self.ortho_mode != "mine":
-            raise ValueError("MINE objective is only available when ortho_mode='mine'.")
-        return self._compute_mine_objective_flat(unique_flat, features_2d_flat)
+            raise ValueError("vCLUB objective is only available when ortho_mode='mine'.")
+        return self._compute_vclub_bound_flat(unique_flat, features_2d_flat)
+
+    def compute_mine_q_loss_from_cache(
+        self, unique_flat: torch.Tensor, features_2d_flat: torch.Tensor
+    ) -> torch.Tensor:
+        if self.ortho_mode != "mine":
+            raise ValueError("q_theta loss is only available when ortho_mode='mine'.")
+        return self._compute_vclub_q_loss_flat(unique_flat, features_2d_flat)
     
     def forward(
         self, features_2d: torch.Tensor, features_3d: torch.Tensor, return_aux_losses: bool = False
@@ -374,7 +399,7 @@ class FeatureFusionModule(nn.Module):
             if self.ortho_mode == "mine":
                 unique_flat = unique_3d_f.reshape(-1, unique_3d_f.shape[-1])
                 features_2d_flat = features_2d_f.reshape(-1, features_2d_f.shape[-1])
-                ortho_loss = self._compute_mine_objective_flat(unique_flat, features_2d_flat)
+                ortho_loss = self._compute_vclub_bound_flat(unique_flat, features_2d_flat)
             else:
                 ortho_loss = F.cosine_similarity(unique_3d_f, features_2d_f, dim=-1, eps=1e-6).abs().mean()
             recon_loss = F.mse_loss(shared_3d_f + unique_3d_f, features_3d_f)

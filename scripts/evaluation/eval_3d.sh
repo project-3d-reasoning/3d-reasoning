@@ -4,16 +4,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../utils/select_available_gpus.sh"
 
 export NCCL_NVLS_ENABLE=0
-benchmark=scan2cap # choices: [scan2cap, scanrefer, scannet_4frames, scannet_6frames]
+benchmark=scanrefer # choices: [scan2cap, scanrefer, scannet_4frames, scannet_6frames]
 output_path=logs/$(TZ="Asia/Shanghai" date "+%Y%m%d")
-model_path=/data7t-root/r1/dmgg/VG-LLM/aaatest
+model_path=/data7t-root/r1/dmgg/VG-LLM/3b-decompose-add-ffff
 FEATURE_FUSION_METHOD="decompose_add" # choices: add/concat/cross_attention/gated/weighted/decompose_add/decompose_concat
 DECOMPOSE_HIDDEN_SIZE=2048
 FUSION_ALIGN_MODE="cosine"
 FUSION_ORTHO_MODE="cosine"
 FUSION_LAMBDA_ALIGN=0.1
 FUSION_LAMBDA_ORTHO=0.3
-FUSION_LAMBDA_RECON=0.5
+FUSION_LAMBDA_RECON=0.001
 TUNE_MM_VISION=false
 TUNE_MM_VISION_LORA=false
 TUNE_GEOMETRY_ENCODER=false

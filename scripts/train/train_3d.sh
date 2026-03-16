@@ -19,6 +19,7 @@ fi
 select_available_gpus "$REQUESTED_GPUS" || exit 1
 NPROC_PER_NODE="$SELECTED_GPU_COUNT"
 
+
 # ======================
 # Path Configuration
 # ======================
@@ -34,10 +35,10 @@ FEATURE_FUSION_METHOD="decompose_add"      # choices: add/concat/cross_attention
 DECOMPOSE_HIDDEN_SIZE=2048                 # Set empty to follow hidden_size (e.g. DECOMPOSE_HIDDEN_SIZE="")
 FUSION_ALIGN_MODE="infonce"                 # choices: cosine/infonce
 FUSION_ORTHO_MODE="mine"                 # choices: cosine/mine
-FUSION_LAMBDA_ALIGN=0.1
-FUSION_LAMBDA_ORTHO=0.3
-FUSION_LAMBDA_RECON=0.5
-OUTPUT_DIR="3b-decompose-add-infonce-mine-ffff"                   # Directory for saving checkpoints
+FUSION_LAMBDA_ALIGN=0.02
+FUSION_LAMBDA_ORTHO=0.002
+FUSION_LAMBDA_RECON=0.005
+OUTPUT_DIR="3b-decompose-add-infonce-cosine-ffff"                   # Directory for saving checkpoints
 CACHE_DIR="./cache"                        # [TrainingArguments] Cache directory for models
 mkdir -p $OUTPUT_DIR
 

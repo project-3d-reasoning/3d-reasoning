@@ -388,13 +388,14 @@ def create_optimizer(self):
 
 
 class VGTrainer(Trainer):
-    """Trainer with optional extra MINE statistics-network updates per train step."""
+    """Trainer with optional extra q_theta updates for vCLUB in ortho mine mode."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._mine_cached_features: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._mine_optimizer: Optional[torch.optim.Optimizer] = None
         self._mine_update_steps: int = 5
+        self._aux_monitor_logs: Dict[str, float] = {}
 
     def _unwrap_model(self, model: torch.nn.Module) -> torch.nn.Module:
         while hasattr(model, "module"):
@@ -418,6 +419,55 @@ class VGTrainer(Trainer):
         if isinstance(outputs, dict):
             return outputs.get(name)
         return getattr(outputs, name, None)
+
+    def _update_aux_monitor_logs(self, model: torch.nn.Module, loss: torch.Tensor, outputs: Any) -> None:
+        self._aux_monitor_logs = {}
+        if outputs is None or loss is None:
+            return
+
+        loss_align = self._get_output_field(outputs, "loss_align")
+        loss_ortho = self._get_output_field(outputs, "loss_ortho")
+        loss_recon = self._get_output_field(outputs, "loss_recon")
+        if loss_align is None and loss_ortho is None and loss_recon is None:
+            return
+
+        base_model = self._unwrap_model(model)
+        lambda_align = float(getattr(base_model, "fusion_lambda_align", 1.0))
+        lambda_ortho = float(getattr(base_model, "fusion_lambda_ortho", 1.0))
+        lambda_recon = float(getattr(base_model, "fusion_lambda_recon", 1.0))
+
+        weighted_aux = loss.new_zeros(())
+        if loss_align is not None:
+            weighted_aux = weighted_aux + lambda_align * loss_align.to(loss.device, loss.dtype)
+        if loss_ortho is not None:
+            weighted_aux = weighted_aux + lambda_ortho * loss_ortho.to(loss.device, loss.dtype)
+        if loss_recon is not None:
+            weighted_aux = weighted_aux + lambda_recon * loss_recon.to(loss.device, loss.dtype)
+
+        ce_est = loss - weighted_aux
+        ce_safe = torch.clamp(ce_est, min=1e-8)
+        ratio = weighted_aux / ce_safe
+
+        self._aux_monitor_logs = {
+            "loss_ce_est": float(ce_est.detach().float().item()),
+            "loss_aux_weighted": float(weighted_aux.detach().float().item()),
+            "loss_aux_ratio": float(ratio.detach().float().item()),
+        }
+        if loss_align is not None:
+            self._aux_monitor_logs["loss_align"] = float(loss_align.detach().float().item())
+            self._aux_monitor_logs["loss_align_weighted"] = float(
+                (lambda_align * loss_align).detach().float().item()
+            )
+        if loss_ortho is not None:
+            self._aux_monitor_logs["loss_ortho"] = float(loss_ortho.detach().float().item())
+            self._aux_monitor_logs["loss_ortho_weighted"] = float(
+                (lambda_ortho * loss_ortho).detach().float().item()
+            )
+        if loss_recon is not None:
+            self._aux_monitor_logs["loss_recon"] = float(loss_recon.detach().float().item())
+            self._aux_monitor_logs["loss_recon_weighted"] = float(
+                (lambda_recon * loss_recon).detach().float().item()
+            )
 
     def _cache_mine_features(self, outputs: Any) -> None:
         unique_features = self._get_output_field(outputs, "mine_unique_features")
@@ -462,10 +512,10 @@ class VGTrainer(Trainer):
 
         for _ in range(self._mine_update_steps):
             self._mine_optimizer.zero_grad(set_to_none=True)
-            mine_objective = feature_fusion.compute_mine_objective_from_cache(
+            q_loss = feature_fusion.compute_mine_q_loss_from_cache(
                 unique_features, features_2d
             )
-            (-mine_objective).backward()
+            q_loss.backward()
             self._mine_optimizer.step()
 
         self._mine_optimizer.zero_grad(set_to_none=True)
@@ -490,6 +540,8 @@ class VGTrainer(Trainer):
         else:
             loss, outputs = loss_outputs, None
 
+        self._update_aux_monitor_logs(model, loss, outputs)
+
         if should_cache_mine:
             self._cache_mine_features(outputs)
         else:
@@ -503,6 +555,12 @@ class VGTrainer(Trainer):
         loss = super().training_step(model, inputs, *args, **kwargs)
         self._run_mine_updates(model)
         return loss
+
+    def log(self, logs: Dict[str, float], *args, **kwargs) -> None:
+        if self._aux_monitor_logs:
+            logs = dict(logs)
+            logs.update(self._aux_monitor_logs)
+        super().log(logs, *args, **kwargs)
 
 
 # Apply monkey patches
