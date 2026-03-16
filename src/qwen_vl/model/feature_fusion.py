@@ -1,19 +1,26 @@
 """Feature fusion modules for combining 2D and 3D features."""
 
+import math
 import torch
 import torch.nn as nn
-from typing import Optional
+import torch.nn.functional as F
+from typing import Dict, Optional, Tuple, Union
 from dataclasses import dataclass
 
 
 @dataclass
 class FeatureFusionConfig:
     """Configuration for feature fusion."""
-    fusion_method: str = "add"  # "add", "concat", "gated", "weighted", "cross_attention"
+    fusion_method: str = "add"  # "add", "concat", "gated", "weighted", "cross_attention", "decompose_add", "decompose_concat"
     hidden_size: int = 3584
     num_heads: int = 8
     dropout: float = 0.1
     num_layers: int = 1
+    decompose_hidden_size: Optional[int] = None
+    align_mode: str = "cosine"  # "cosine"(default) or "infonce"
+    align_temperature: float = 0.07
+    ortho_mode: str = "cosine"  # "cosine"(default) or "mine"
+    mine_hidden_size: Optional[int] = None
 
 
 class CrossAttentionBlock(nn.Module):
@@ -160,8 +167,48 @@ class FeatureFusionModule(nn.Module):
         self.config = config
         self.fusion_method = config.fusion_method
         self.hidden_size = config.hidden_size
+        self.align_mode = config.align_mode.lower()
+        if self.align_mode == "cos":
+            self.align_mode = "cosine"
+        if self.align_mode not in {"cosine", "infonce"}:
+            raise ValueError(
+                f"Unknown align_mode: {config.align_mode}. Supported values: cosine, infonce."
+            )
+        self.align_temperature = max(float(config.align_temperature), 1e-6)
+        self.ortho_mode = config.ortho_mode.lower()
+        if self.ortho_mode == "cos":
+            self.ortho_mode = "cosine"
+        if self.ortho_mode not in {"cosine", "mine"}:
+            raise ValueError(
+                f"Unknown ortho_mode: {config.ortho_mode}. Supported values: cosine, mine."
+            )
         
         self._build_fusion_layers()
+
+    def _compute_align_loss(self, shared_3d_f: torch.Tensor, features_2d_f: torch.Tensor) -> torch.Tensor:
+        if self.align_mode == "infonce":
+            # Flatten all patches in the current batch so negatives are other patches from the same batch.
+            shared_3d_flat = shared_3d_f.reshape(-1, shared_3d_f.shape[-1])
+            features_2d_flat = features_2d_f.reshape(-1, features_2d_f.shape[-1])
+            if shared_3d_flat.numel() == 0:
+                return shared_3d_f.new_zeros(())
+
+            shared_3d_flat = F.normalize(shared_3d_flat, dim=-1, eps=1e-6)
+            features_2d_flat = F.normalize(features_2d_flat, dim=-1, eps=1e-6)
+            logits = torch.matmul(shared_3d_flat, features_2d_flat.transpose(0, 1)) / self.align_temperature
+            targets = torch.arange(shared_3d_flat.shape[0], device=shared_3d_flat.device)
+            return F.cross_entropy(logits, targets)
+
+        return 1.0 - F.cosine_similarity(shared_3d_f, features_2d_f, dim=-1, eps=1e-6).mean()
+
+    def _build_decompose_mapper(self, hidden_dim: int) -> nn.Module:
+        """Build lightweight mapper for shared/unique 3D feature decomposition."""
+        return nn.Sequential(
+            nn.LayerNorm(self.hidden_size),
+            nn.Linear(self.hidden_size, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, self.hidden_size),
+        )
     
     def _build_fusion_layers(self):
         """Build fusion layers based on method."""
@@ -191,16 +238,87 @@ class FeatureFusionModule(nn.Module):
         elif self.config.fusion_method == "weighted":
             self.weight_2d = nn.Parameter(torch.tensor(0.5))
             self.weight_3d = nn.Parameter(torch.tensor(0.5))
+
+        elif self.config.fusion_method in {"decompose_add", "decompose_concat"}:
+            decompose_hidden = self.config.decompose_hidden_size or self.hidden_size
+            self.shared_mapper = self._build_decompose_mapper(decompose_hidden)
+            self.unique_mapper = self._build_decompose_mapper(decompose_hidden)
+            if self.ortho_mode == "mine":
+                mine_hidden = self.config.mine_hidden_size or self.hidden_size
+                self.mine_statistics_network = nn.Sequential(
+                    nn.LayerNorm(self.hidden_size * 2),
+                    nn.Linear(self.hidden_size * 2, mine_hidden),
+                    nn.GELU(),
+                    nn.Linear(mine_hidden, 1),
+                )
+            if self.config.fusion_method == "decompose_concat":
+                self.decompose_projection = nn.Linear(self.hidden_size * 2, self.hidden_size)
+
+    def set_mine_network_trainable(self, trainable: bool) -> None:
+        if self.ortho_mode != "mine" or not hasattr(self, "mine_statistics_network"):
+            return
+        for p in self.mine_statistics_network.parameters():
+            p.requires_grad_(trainable)
+
+    def get_mine_parameters(self):
+        if self.ortho_mode != "mine" or not hasattr(self, "mine_statistics_network"):
+            return []
+        return list(self.mine_statistics_network.parameters())
+
+    def _compute_mine_objective_flat(
+        self, unique_flat: torch.Tensor, features_2d_flat: torch.Tensor
+    ) -> torch.Tensor:
+        if unique_flat.numel() == 0:
+            return unique_flat.new_zeros(())
+
+        if unique_flat.shape[0] != features_2d_flat.shape[0]:
+            raise ValueError(
+                f"Feature pair size mismatch for MINE objective: "
+                f"{unique_flat.shape[0]} vs {features_2d_flat.shape[0]}"
+            )
+
+        # MINE statistics network uses LayerNorm; under DeepSpeed/bf16 the module params are bf16,
+        # so run entire block in float32 (input + module) to avoid dtype mismatch.
+        unique_flat = unique_flat.float()
+        features_2d_flat = features_2d_flat.float()
+
+        perm = torch.randperm(features_2d_flat.shape[0], device=features_2d_flat.device)
+        shuffled_2d = features_2d_flat[perm]
+
+        joint_pairs = torch.cat([unique_flat, features_2d_flat], dim=-1)
+        marginal_pairs = torch.cat([unique_flat, shuffled_2d], dim=-1)
+
+        # Keep MINE network in float32 for both forward and backward; do not cast back to bf16
+        # or backward will see dtype mismatch (saved tensors float32 vs params bf16).
+        with torch.amp.autocast("cuda", enabled=False):
+            self.mine_statistics_network.to(torch.float32)
+            joint_scores = self.mine_statistics_network(joint_pairs).squeeze(-1)
+            marginal_scores = self.mine_statistics_network(marginal_pairs).squeeze(-1)
+
+        log_mean_exp = torch.logsumexp(marginal_scores, dim=0) - math.log(
+            max(marginal_scores.shape[0], 1)
+        )
+        return joint_scores.mean() - log_mean_exp
+
+    def compute_mine_objective_from_cache(
+        self, unique_flat: torch.Tensor, features_2d_flat: torch.Tensor
+    ) -> torch.Tensor:
+        if self.ortho_mode != "mine":
+            raise ValueError("MINE objective is only available when ortho_mode='mine'.")
+        return self._compute_mine_objective_flat(unique_flat, features_2d_flat)
     
-    def forward(self, features_2d: torch.Tensor, features_3d: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, features_2d: torch.Tensor, features_3d: torch.Tensor, return_aux_losses: bool = False
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """
         Fuse 2D and 3D features.
         
         Args:
             features_2d: 2D image features
             features_3d: 3D geometry features
+            return_aux_losses: Return decomposition losses when supported by the fusion method.
         Returns:
-            Fused features
+            Fused features, optionally with auxiliary loss dict.
         """
 
         _, h_grid, w_grid, _ = features_3d.shape
@@ -234,6 +352,41 @@ class FeatureFusionModule(nn.Module):
             norm_weight_2d = self.weight_2d / weight_sum
             norm_weight_3d = self.weight_3d / weight_sum
             return norm_weight_2d * features_2d + norm_weight_3d * features_3d
+
+        elif self.fusion_method in {"decompose_add", "decompose_concat"}:
+            shared_3d = self.shared_mapper(features_3d)
+            unique_3d = self.unique_mapper(features_3d)
+
+            if self.fusion_method == "decompose_concat":
+                fused = self.decompose_projection(torch.cat([features_2d, unique_3d], dim=-1))
+            else:
+                fused = features_2d + unique_3d
+
+            if not return_aux_losses:
+                return fused
+
+            shared_3d_f = shared_3d.float()
+            unique_3d_f = unique_3d.float()
+            features_2d_f = features_2d.float()
+            features_3d_f = features_3d.float()
+
+            align_loss = self._compute_align_loss(shared_3d_f, features_2d_f)
+            if self.ortho_mode == "mine":
+                unique_flat = unique_3d_f.reshape(-1, unique_3d_f.shape[-1])
+                features_2d_flat = features_2d_f.reshape(-1, features_2d_f.shape[-1])
+                ortho_loss = self._compute_mine_objective_flat(unique_flat, features_2d_flat)
+            else:
+                ortho_loss = F.cosine_similarity(unique_3d_f, features_2d_f, dim=-1, eps=1e-6).abs().mean()
+            recon_loss = F.mse_loss(shared_3d_f + unique_3d_f, features_3d_f)
+            aux_losses = {
+                "loss_align": align_loss,
+                "loss_ortho": ortho_loss,
+                "loss_recon": recon_loss,
+            }
+            if self.ortho_mode == "mine":
+                aux_losses["mine_unique_features"] = unique_flat.detach()
+                aux_losses["mine_2d_features"] = features_2d_flat.detach()
+            return fused, aux_losses
             
         else:
             raise ValueError(f"Unknown fusion method: {self.fusion_method}")

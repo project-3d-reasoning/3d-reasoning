@@ -9,15 +9,26 @@ class ModelArguments:
     tune_mm_llm: bool = field(default=False)
     tune_mm_mlp: bool = field(default=False)
     tune_mm_vision: bool = field(default=False)
+    tune_mm_vision_lora: bool = field(default=False)  # Use LoRA to tune visual tower when tune_mm_vision=True
+    tune_geometry_encoder: bool = field(default=False)  # Tune geometry encoder parameters when use_geometry_encoder=True
+    tune_geometry_encoder_lora: bool = field(default=False)  # Use LoRA to tune geometry encoder when tune_geometry_encoder=True
 
     # Geometry encoder configuration
     use_geometry_encoder: bool = field(default=False)  # Whether to use 3D geometry encoder
     geometry_encoder_type: str = field(default="vggt")  # Type of geometry encoder ("vggt", "pi3")
     geometry_encoder_path: str = field(default="facebook/VGGT-1B/")  # Path to pre-trained geometry encoder model
     reference_frame: str = field(default="first")  # Reference frame for geometry encoding ("first", "last"), only available for vggt
-    feature_fusion_method: str = field(default="add")  # Method to fuse geometry and visual features ("add", "concat", "cross_attention", "gate")
+    feature_fusion_method: str = field(default="add")  # Method to fuse geometry and visual features ("add", "concat", "cross_attention", "gated", "decompose_add", "decompose_concat")
     fusion_num_layers: int = field(default=1)  # Number of layers in the cross-attention module when feature_fusion_method is "cross_attention"
     geometry_merger_type: str = field(default="mlp")  # Type of geometry feature merger ("mlp", "avg")
+    decompose_hidden_size: Optional[int] = field(default=None)  # Hidden size for shared/unique 3D decomposition MLPs
+    fusion_align_mode: str = field(default="cosine")  # Alignment loss mode ("cosine", "infonce")
+    fusion_ortho_mode: str = field(default="cosine")  # Orthogonality mode ("cosine", "mine")
+    fusion_lambda_align: float = field(default=1.0)  # Weight for alignment loss
+    fusion_lambda_ortho: float = field(default=1.0)  # Weight for orthogonality loss
+    fusion_lambda_recon: float = field(default=1.0)  # Weight for reconstruction loss
+    fusion_lambda_warmup: bool = field(default=False)  # Enable lambda warmup for decompose fusion methods
+    fusion_lambda_warmup_steps: int = field(default=100)  # Warmup steps for fusion lambdas when enabled
 
 @dataclass
 class DataArguments:

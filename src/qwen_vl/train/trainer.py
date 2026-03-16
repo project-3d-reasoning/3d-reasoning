@@ -1,5 +1,5 @@
 import os
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import datasets
 import torch
@@ -385,6 +385,124 @@ def create_optimizer(self):
         self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
 
     return self.optimizer
+
+
+class VGTrainer(Trainer):
+    """Trainer with optional extra MINE statistics-network updates per train step."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._mine_cached_features: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self._mine_optimizer: Optional[torch.optim.Optimizer] = None
+        self._mine_update_steps: int = 5
+
+    def _unwrap_model(self, model: torch.nn.Module) -> torch.nn.Module:
+        while hasattr(model, "module"):
+            model = model.module
+        return model
+
+    def _get_feature_fusion_module(self, model: torch.nn.Module):
+        unwrapped = self._unwrap_model(model)
+        return getattr(unwrapped, "feature_fusion", None)
+
+    def _is_mine_mode(self, feature_fusion) -> bool:
+        return (
+            feature_fusion is not None
+            and hasattr(feature_fusion, "ortho_mode")
+            and feature_fusion.ortho_mode == "mine"
+        )
+
+    def _get_output_field(self, outputs: Any, name: str):
+        if outputs is None:
+            return None
+        if isinstance(outputs, dict):
+            return outputs.get(name)
+        return getattr(outputs, name, None)
+
+    def _cache_mine_features(self, outputs: Any) -> None:
+        unique_features = self._get_output_field(outputs, "mine_unique_features")
+        features_2d = self._get_output_field(outputs, "mine_2d_features")
+        if unique_features is None or features_2d is None:
+            self._mine_cached_features = None
+            return
+
+        self._mine_cached_features = (
+            unique_features.detach(),
+            features_2d.detach(),
+        )
+
+    def _ensure_mine_optimizer(self, feature_fusion) -> None:
+        if self._mine_optimizer is not None:
+            return
+        mine_parameters = list(feature_fusion.get_mine_parameters())
+        if not mine_parameters:
+            return
+        mine_lr = float(getattr(self.args, "mm_projector_lr", None) or self.args.learning_rate)
+        self._mine_optimizer = torch.optim.AdamW(mine_parameters, lr=mine_lr, weight_decay=0.0)
+
+    def _run_mine_updates(self, model: torch.nn.Module) -> None:
+        if self._mine_cached_features is None:
+            return
+
+        feature_fusion = self._get_feature_fusion_module(model)
+        if not self._is_mine_mode(feature_fusion):
+            self._mine_cached_features = None
+            return
+
+        feature_fusion.set_mine_network_trainable(True)
+        self._ensure_mine_optimizer(feature_fusion)
+        if self._mine_optimizer is None:
+            feature_fusion.set_mine_network_trainable(False)
+            self._mine_cached_features = None
+            return
+
+        unique_features, features_2d = self._mine_cached_features
+        unique_features = unique_features.float()
+        features_2d = features_2d.float()
+
+        for _ in range(self._mine_update_steps):
+            self._mine_optimizer.zero_grad(set_to_none=True)
+            mine_objective = feature_fusion.compute_mine_objective_from_cache(
+                unique_features, features_2d
+            )
+            (-mine_objective).backward()
+            self._mine_optimizer.step()
+
+        self._mine_optimizer.zero_grad(set_to_none=True)
+        feature_fusion.set_mine_network_trainable(False)
+        self._mine_cached_features = None
+
+    def compute_loss(self, model, inputs, return_outputs=False, *args, **kwargs):
+        feature_fusion = self._get_feature_fusion_module(model)
+        should_cache_mine = bool(model.training and self._is_mine_mode(feature_fusion))
+        if should_cache_mine:
+            feature_fusion.set_mine_network_trainable(False)
+
+        loss_outputs = super().compute_loss(
+            model,
+            inputs,
+            return_outputs=True,
+            *args,
+            **kwargs,
+        )
+        if isinstance(loss_outputs, tuple):
+            loss, outputs = loss_outputs
+        else:
+            loss, outputs = loss_outputs, None
+
+        if should_cache_mine:
+            self._cache_mine_features(outputs)
+        else:
+            self._mine_cached_features = None
+
+        if return_outputs:
+            return loss, outputs
+        return loss
+
+    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]], *args, **kwargs):
+        loss = super().training_step(model, inputs, *args, **kwargs)
+        self._run_mine_updates(model)
+        return loss
 
 
 # Apply monkey patches

@@ -1,17 +1,39 @@
 set -e
 export LMMS_EVAL_LAUNCHER="accelerate"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../utils/select_available_gpus.sh"
 
 export NCCL_NVLS_ENABLE=0
 benchmark=scan2cap # choices: [scan2cap, scanrefer, scannet_4frames, scannet_6frames]
 output_path=logs/$(TZ="Asia/Shanghai" date "+%Y%m%d")
-model_path=zd11024/vgllm-3d-vggt-4b
+model_path=/data7t-root/r1/dmgg/VG-LLM/aaatest
+FEATURE_FUSION_METHOD="decompose_add" # choices: add/concat/cross_attention/gated/weighted/decompose_add/decompose_concat
+DECOMPOSE_HIDDEN_SIZE=2048
+FUSION_ALIGN_MODE="cosine"
+FUSION_ORTHO_MODE="cosine"
+FUSION_LAMBDA_ALIGN=0.1
+FUSION_LAMBDA_ORTHO=0.3
+FUSION_LAMBDA_RECON=0.5
+TUNE_MM_VISION=false
+TUNE_MM_VISION_LORA=false
+TUNE_GEOMETRY_ENCODER=false
+TUNE_GEOMETRY_ENCODER_LORA=false
+NUM_GPUS="${NUM_GPUS:-4}" # Set evaluation GPU count directly here
 
-model_args_str="pretrained=$model_path,use_flash_attention_2=true,max_num_frames=32,max_length=12800"
+# Set NUM_GPUS to request N GPUs.
+REQUESTED_GPUS="$NUM_GPUS"
+select_available_gpus "$REQUESTED_GPUS"
+NUM_PROCESSES="$SELECTED_GPU_COUNT"
+
+echo "Using CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+echo "Using num_processes=$NUM_PROCESSES"
+
+model_args_str="pretrained=$model_path,use_flash_attention_2=true,max_num_frames=32,max_length=12800,feature_fusion_method=$FEATURE_FUSION_METHOD,decompose_hidden_size=$DECOMPOSE_HIDDEN_SIZE,fusion_align_mode=$FUSION_ALIGN_MODE,fusion_ortho_mode=$FUSION_ORTHO_MODE,fusion_lambda_align=$FUSION_LAMBDA_ALIGN,fusion_lambda_ortho=$FUSION_LAMBDA_ORTHO,fusion_lambda_recon=$FUSION_LAMBDA_RECON,tune_mm_vision=$TUNE_MM_VISION,tune_mm_vision_lora=$TUNE_MM_VISION_LORA,tune_geometry_encoder=$TUNE_GEOMETRY_ENCODER,tune_geometry_encoder_lora=$TUNE_GEOMETRY_ENCODER_LORA"
 if [ "$benchmark" = "scanrefer" ]; then
     model_args_str="${model_args_str},add_frame_index=true"
 fi
 
-accelerate launch --num_processes=8  --main_process_port 29501 -m lmms_eval \
+accelerate launch --num_processes="$NUM_PROCESSES" --main_process_port 29501 -m lmms_eval \
     --model vgllm \
     --model_args "$model_args_str" \
     --tasks ${benchmark} \

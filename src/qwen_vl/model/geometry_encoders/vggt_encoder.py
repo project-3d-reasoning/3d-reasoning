@@ -30,7 +30,11 @@ class VGGTEncoder(BaseGeometryEncoder):
     
     def encode(self, images: torch.Tensor) -> torch.Tensor:
         """Encode images using VGGT."""
-        self.vggt.eval()
+        grad_enabled = self.training and any(param.requires_grad for param in self.vggt.parameters())
+        if grad_enabled:
+            self.vggt.train()
+        else:
+            self.vggt.eval()
 
         # Apply reference frame transformation
         images = self._apply_reference_frame_transform(images)
@@ -38,7 +42,7 @@ class VGGTEncoder(BaseGeometryEncoder):
         # Determine dtype for mixed precision
         dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
-        with torch.no_grad():
+        with torch.set_grad_enabled(grad_enabled):
             with torch.cuda.amp.autocast(dtype=dtype):
                 # Get aggregated tokens from VGGT
                 aggregated_tokens_list, patch_start_idx = self.vggt.aggregator(images[None])

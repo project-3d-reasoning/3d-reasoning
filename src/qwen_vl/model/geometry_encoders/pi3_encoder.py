@@ -31,11 +31,16 @@ class Pi3Encoder(BaseGeometryEncoder):
     
     def encode(self, images: torch.Tensor) -> torch.Tensor:
         """Encode images using PI3."""
+        grad_enabled = self.training and any(param.requires_grad for param in self.pi3.parameters())
+        if grad_enabled:
+            self.pi3.train()
+        else:
+            self.pi3.eval()
         
         # Determine dtype for mixed precision
         dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
         
-        with torch.no_grad():
+        with torch.set_grad_enabled(grad_enabled):
             with torch.cuda.amp.autocast(dtype=dtype):
                 # PI3 expects input shape (B, N, C, H, W)
                 # where B=batch_size, N=num_frames, C=channels, H=height, W=width

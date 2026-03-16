@@ -6,14 +6,41 @@
 # ======================
 MASTER_ADDR="127.0.0.1"                     # [Required] Master node IP for multi-GPU training
 MASTER_PORT=$(shuf -i 20000-29999 -n 1)     # Random port to avoid conflicts
-NPROC_PER_NODE=$(nvidia-smi --list-gpus | wc -l)  # Automatically detects available GPUs
+NUM_GPUS="${NUM_GPUS:-}"                    # Set e.g. "4" to use 4 GPUs; leave empty to use all local GPUs
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../utils/select_available_gpus.sh"
+
+# Set NUM_GPUS to request N GPUs. If unset, request all local GPUs.
+if [ -n "${NUM_GPUS:-}" ]; then
+    REQUESTED_GPUS="$NUM_GPUS"
+else
+    REQUESTED_GPUS=$(nvidia-smi --list-gpus | wc -l)
+fi
+select_available_gpus "$REQUESTED_GPUS" || exit 1
+NPROC_PER_NODE="$SELECTED_GPU_COUNT"
 
 # ======================
 # Path Configuration
 # ======================
-MODEL_PATH="Qwen/Qwen2.5-VL-7B-Instruct/"  # [ModelArguments] Pretrained model path
+MODEL_PATH="Qwen/Qwen2.5-VL-7B-Instruct"   # [ModelArguments] Pretrained model path
+MODEL_PATH="${MODEL_PATH%/}"               # Safety: strip trailing slash for HF repo id validation
+
+
 GEOMETRY_ENCODER_TYPE="vggt"
 GEOMETRY_ENCODER_PATH="facebook/VGGT-1B"
+TUNE_MM_VISION=False
+TUNE_MM_VISION_LORA=False
+TUNE_GEOMETRY_ENCODER=False
+TUNE_GEOMETRY_ENCODER_LORA=False
+FEATURE_FUSION_METHOD="decompose_add"      # choices: add/concat/cross_attention/gated/weighted/decompose_add/decompose_concat
+DECOMPOSE_HIDDEN_SIZE=2048                 # Set empty to follow hidden_size (e.g. DECOMPOSE_HIDDEN_SIZE="")
+FUSION_ALIGN_MODE="cosine"                 # choices: cosine/infonce
+FUSION_ORTHO_MODE="cosine"                 # choices: cosine/mine
+FUSION_LAMBDA_ALIGN=1.0
+FUSION_LAMBDA_ORTHO=1.0
+FUSION_LAMBDA_RECON=1.0
+FUSION_LAMBDA_WARMUP=True
+FUSION_LAMBDA_WARMUP_STEPS=100
 OUTPUT_DIR="PATH_TO_OUTPUT_DIR"                   # Directory for saving checkpoints
 CACHE_DIR="./cache"                        # [TrainingArguments] Cache directory for models
 mkdir -p $OUTPUT_DIR
@@ -29,6 +56,12 @@ DATASETS="spar_234k,llava_hound_64k"                  # [DataArguments] Dataset 
 LR=1e-5
 total_batch_size=64
 GRADIENT_ACCUMULATION_STEPS=$(($total_batch_size / $NPROC_PER_NODE))
+if [ "$GRADIENT_ACCUMULATION_STEPS" -lt 1 ]; then
+    GRADIENT_ACCUMULATION_STEPS=1
+fi
+
+echo "Using CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+echo "Using NPROC_PER_NODE=$NPROC_PER_NODE"
 
 torchrun --nproc_per_node=$NPROC_PER_NODE \
             --master_addr=$MASTER_ADDR \
@@ -36,7 +69,8 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             src/qwen_vl/train/train_qwen.py \
             --model_name_or_path $MODEL_PATH \
             --tune_mm_llm True \
-            --tune_mm_vision False \
+            --tune_mm_vision $TUNE_MM_VISION \
+            --tune_mm_vision_lora $TUNE_MM_VISION_LORA \
             --tune_mm_mlp False \
             --dataset_use $DATASETS \
             --output_dir $OUTPUT_DIR \
@@ -71,7 +105,17 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --seed 0 \
             --report_to "none" \
             --use_geometry_encoder true \
+            --tune_geometry_encoder $TUNE_GEOMETRY_ENCODER \
+            --tune_geometry_encoder_lora $TUNE_GEOMETRY_ENCODER_LORA \
             --geometry_encoder_type $GEOMETRY_ENCODER_TYPE \
             --geometry_encoder_path $GEOMETRY_ENCODER_PATH \
-            --feature_fusion_method "add" \
+            --feature_fusion_method $FEATURE_FUSION_METHOD \
+            --decompose_hidden_size $DECOMPOSE_HIDDEN_SIZE \
+            --fusion_align_mode $FUSION_ALIGN_MODE \
+            --fusion_ortho_mode $FUSION_ORTHO_MODE \
+            --fusion_lambda_align $FUSION_LAMBDA_ALIGN \
+            --fusion_lambda_ortho $FUSION_LAMBDA_ORTHO \
+            --fusion_lambda_recon $FUSION_LAMBDA_RECON \
+            --fusion_lambda_warmup $FUSION_LAMBDA_WARMUP \
+            --fusion_lambda_warmup_steps $FUSION_LAMBDA_WARMUP_STEPS \
             > ${OUTPUT_DIR}/train.log 2>&1

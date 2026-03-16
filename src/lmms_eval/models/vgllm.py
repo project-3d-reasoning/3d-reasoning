@@ -52,10 +52,21 @@ class VGLLM(lmms):
         max_image_size: Optional[int] = None,  # Only applicable if use_custom_video_loader is True
         max_length: Optional[int] = None,
         add_frame_index: bool=False,
+        tune_mm_vision: Optional[bool] = None,
+        tune_mm_vision_lora: Optional[bool] = None,
+        tune_geometry_encoder: Optional[bool] = None,
+        tune_geometry_encoder_lora: Optional[bool] = None,
+        feature_fusion_method: Optional[str] = None,
+        decompose_hidden_size: Optional[int] = None,
+        fusion_align_mode: Optional[str] = None,
+        fusion_ortho_mode: Optional[str] = None,
+        fusion_lambda_align: Optional[float] = None,
+        fusion_lambda_ortho: Optional[float] = None,
+        fusion_lambda_recon: Optional[float] = None,
         **kwargs,
     ) -> None:
         super().__init__()
-        # Do not use kwargs for now
+        # Keep strict kwargs check for safety.
         assert kwargs == {}, f"Unexpected kwargs: {kwargs}"
 
         self.use_custom_video_loader = use_custom_video_loader
@@ -79,6 +90,28 @@ class VGLLM(lmms):
             self.device_map = f"cuda:{accelerator.local_process_index}"
 
         config = AutoConfig.from_pretrained(pretrained)
+        if feature_fusion_method is not None:
+            setattr(config, "feature_fusion_method", feature_fusion_method)
+        if decompose_hidden_size is not None:
+            setattr(config, "decompose_hidden_size", decompose_hidden_size)
+        if fusion_align_mode is not None:
+            setattr(config, "fusion_align_mode", fusion_align_mode)
+        if fusion_ortho_mode is not None:
+            setattr(config, "fusion_ortho_mode", fusion_ortho_mode)
+        if fusion_lambda_align is not None:
+            setattr(config, "fusion_lambda_align", fusion_lambda_align)
+        if fusion_lambda_ortho is not None:
+            setattr(config, "fusion_lambda_ortho", fusion_lambda_ortho)
+        if fusion_lambda_recon is not None:
+            setattr(config, "fusion_lambda_recon", fusion_lambda_recon)
+        if tune_mm_vision is not None:
+            setattr(config, "tune_mm_vision", tune_mm_vision)
+        if tune_mm_vision_lora is not None:
+            setattr(config, "tune_mm_vision_lora", tune_mm_vision_lora)
+        if tune_geometry_encoder is not None:
+            setattr(config, "tune_geometry_encoder", tune_geometry_encoder)
+        if tune_geometry_encoder_lora is not None:
+            setattr(config, "tune_geometry_encoder_lora", tune_geometry_encoder_lora)
 
         if getattr(config, "use_geometry_encoder", False) or getattr(config, "use_vggt_feature", False):
             load_class = Qwen2_5_VLForConditionalGenerationWithVGGT
