@@ -258,7 +258,8 @@ def train(attn_implementation="flash_attention_2"):
     os.makedirs(training_args.output_dir, exist_ok=True)
 
     if "qwen2.5" in model_args.model_name_or_path.lower():
-        if not model_args.use_geometry_encoder:
+        use_custom_model = model_args.use_geometry_encoder or model_args.use_learnable_prefix
+        if not use_custom_model:
             from transformers import Qwen2_5_VLForConditionalGeneration
             model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 model_args.model_name_or_path,
@@ -294,18 +295,21 @@ def train(attn_implementation="flash_attention_2"):
                 "tune_mm_vision_lora",
                 "tune_geometry_encoder",
                 "tune_geometry_encoder_lora",
+                "use_learnable_prefix",
+                "learnable_prefix_len",
             ]:
                 setattr(config, k, getattr(model_args, k))
 
-            assert model_args.geometry_encoder_path is not None, \
-                "geometry_encoder_path must be set in the config when use_geometry_encoder is True."
+            if model_args.use_geometry_encoder:
+                assert model_args.geometry_encoder_path is not None, \
+                    "geometry_encoder_path must be set in the config when use_geometry_encoder is True."
             model = Qwen2_5_VLForConditionalGenerationWithVGGT.from_pretrained(
                 pretrained_model_name_or_path=model_args.model_name_or_path,
                 config=config,
                 cache_dir=training_args.cache_dir,
                 attn_implementation=attn_implementation,
                 torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-                geometry_encoder_path=model_args.geometry_encoder_path
+                geometry_encoder_path=(model_args.geometry_encoder_path if model_args.use_geometry_encoder else None)
             )
 
         data_args.image_processor = AutoProcessor.from_pretrained(

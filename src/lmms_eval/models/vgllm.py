@@ -56,6 +56,8 @@ class VGLLM(lmms):
         tune_mm_vision_lora: Optional[bool] = None,
         tune_geometry_encoder: Optional[bool] = None,
         tune_geometry_encoder_lora: Optional[bool] = None,
+        use_learnable_prefix: Optional[bool] = None,
+        learnable_prefix_len: Optional[int] = None,
         feature_fusion_method: Optional[str] = None,
         decompose_hidden_size: Optional[int] = None,
         fusion_align_mode: Optional[str] = None,
@@ -112,8 +114,17 @@ class VGLLM(lmms):
             setattr(config, "tune_geometry_encoder", tune_geometry_encoder)
         if tune_geometry_encoder_lora is not None:
             setattr(config, "tune_geometry_encoder_lora", tune_geometry_encoder_lora)
+        if use_learnable_prefix is not None:
+            setattr(config, "use_learnable_prefix", use_learnable_prefix)
+        if learnable_prefix_len is not None:
+            setattr(config, "learnable_prefix_len", learnable_prefix_len)
 
-        if getattr(config, "use_geometry_encoder", False) or getattr(config, "use_vggt_feature", False):
+        if (
+            getattr(config, "use_geometry_encoder", False)
+            or getattr(config, "use_vggt_feature", False)
+            or getattr(config, "use_learnable_prefix", False)
+            or getattr(config, "learnable_prefix_len", 0) > 0
+        ):
             load_class = Qwen2_5_VLForConditionalGenerationWithVGGT
             eval_logger.info("Using Qwen2_5_VLForConditionalGenerationWithVGGT")
         else:

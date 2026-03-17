@@ -1595,9 +1595,20 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.rope_deltas = None  # cache rope_deltas here
+        self.use_learnable_prefix = bool(getattr(config, "use_learnable_prefix", False))
+        self.learnable_prefix_len = int(getattr(config, "learnable_prefix_len", 0) or 0)
+        if self.use_learnable_prefix and self.learnable_prefix_len > 0:
+            self.learnable_prefix_embeddings = nn.Parameter(
+                torch.zeros(self.learnable_prefix_len, config.hidden_size)
+            )
+        else:
+            self.learnable_prefix_embeddings = None
 
         # Initialize weights and apply final processing
         self.post_init()
+        if self.learnable_prefix_embeddings is not None:
+            with torch.no_grad():
+                self.learnable_prefix_embeddings.zero_()
     
     def _init_geometry_encoder(self, config):
         """Initialize geometry encoder and related modules."""
@@ -1880,6 +1891,188 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             return position_ids, mrope_position_deltas
     
 
+    def _should_apply_learnable_prefix(
+        self,
+        past_key_values: Optional[List[torch.FloatTensor]],
+        cache_position: Optional[torch.LongTensor],
+    ) -> bool:
+        if self.learnable_prefix_embeddings is None:
+            return False
+        if not getattr(self.config, "use_learnable_prefix", False):
+            return False
+        if self.learnable_prefix_len <= 0:
+            return False
+        past_len = 0
+        if past_key_values is not None and hasattr(past_key_values, "get_seq_length"):
+            past_len = past_key_values.get_seq_length()
+        if past_len > 0:
+            return False
+        if cache_position is not None and cache_position.numel() > 0:
+            if int(cache_position[0]) != 0:
+                return False
+        return True
+
+    def _apply_learnable_prefix(
+        self,
+        inputs_embeds: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        labels: Optional[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        prefix_len = self.learnable_prefix_len
+        if prefix_len <= 0 or self.learnable_prefix_embeddings is None:
+            return inputs_embeds, attention_mask, labels, position_ids
+
+        prefix_embed = self.learnable_prefix_embeddings.to(
+            device=inputs_embeds.device,
+            dtype=inputs_embeds.dtype,
+        )
+
+        # Packed sequence (cu_seqlens) case
+        if attention_mask is not None and attention_mask.dim() == 1:
+            cu_seqlens = attention_mask
+            prefix_embed = prefix_embed.unsqueeze(0)  # (1, prefix_len, hidden)
+            segments = []
+            label_segments = [] if labels is not None else None
+            pos_segments = [] if position_ids is not None else None
+            lengths = []
+            for idx in range(cu_seqlens.numel() - 1):
+                start = int(cu_seqlens[idx].item())
+                end = int(cu_seqlens[idx + 1].item())
+                lengths.append(end - start + prefix_len)
+                segment = inputs_embeds[:, start:end, :]
+                segments.append(torch.cat([prefix_embed, segment], dim=1))
+                if labels is not None:
+                    prefix_labels = labels.new_full((labels.shape[0], prefix_len), -100)
+                    seg_labels = labels[:, start:end]
+                    label_segments.append(torch.cat([prefix_labels, seg_labels], dim=1))
+                if position_ids is not None:
+                    if position_ids.dim() == 3:
+                        prefix_pos = (
+                            torch.arange(prefix_len, device=position_ids.device, dtype=position_ids.dtype)
+                            .view(1, 1, -1)
+                            .expand(3, 1, -1)
+                        )
+                        seg_pos = position_ids[:, :, start:end] + prefix_len
+                        pos_segments.append(torch.cat([prefix_pos, seg_pos], dim=2))
+                    else:
+                        prefix_pos = torch.arange(prefix_len, device=position_ids.device, dtype=position_ids.dtype).view(
+                            1, -1
+                        )
+                        seg_pos = position_ids[:, start:end] + prefix_len
+                        pos_segments.append(torch.cat([prefix_pos, seg_pos], dim=1))
+
+            inputs_embeds = torch.cat(segments, dim=1)
+            if labels is not None:
+                labels = torch.cat(label_segments, dim=1)
+            if position_ids is not None:
+                if position_ids.dim() == 3:
+                    position_ids = torch.cat(pos_segments, dim=2)
+                else:
+                    position_ids = torch.cat(pos_segments, dim=1)
+            new_cu_seqlens = torch.zeros(
+                len(lengths) + 1, device=cu_seqlens.device, dtype=cu_seqlens.dtype
+            )
+            new_cu_seqlens[1:] = torch.tensor(lengths, device=cu_seqlens.device, dtype=cu_seqlens.dtype).cumsum(0)
+            attention_mask = new_cu_seqlens
+            return inputs_embeds, attention_mask, labels, position_ids
+
+        batch_size = inputs_embeds.size(0)
+        prefix_embed = prefix_embed.unsqueeze(0).expand(batch_size, -1, -1)
+
+        if attention_mask is None:
+            inputs_embeds = torch.cat([prefix_embed, inputs_embeds], dim=1)
+            if labels is not None:
+                prefix_labels = labels.new_full((batch_size, prefix_len), -100)
+                labels = torch.cat([prefix_labels, labels], dim=1)
+            if position_ids is not None:
+                if position_ids.dim() == 3:
+                    prefix_pos = (
+                        torch.arange(prefix_len, device=position_ids.device, dtype=position_ids.dtype)
+                        .view(1, 1, -1)
+                        .expand(3, batch_size, -1)
+                    )
+                    position_ids = torch.cat([prefix_pos, position_ids + prefix_len], dim=2)
+                else:
+                    prefix_pos = torch.arange(prefix_len, device=position_ids.device, dtype=position_ids.dtype).view(
+                        1, -1
+                    )
+                    position_ids = torch.cat([prefix_pos.expand(batch_size, -1), position_ids + prefix_len], dim=1)
+            return inputs_embeds, attention_mask, labels, position_ids
+
+        prefix_mask = attention_mask.new_ones(prefix_len)
+        prefix_range = None
+        if position_ids is not None:
+            prefix_range = torch.arange(prefix_len, device=position_ids.device, dtype=position_ids.dtype)
+            if position_ids.dim() == 3:
+                prefix_range = prefix_range.view(1, -1).expand(3, -1)
+
+        new_embeds = []
+        new_masks = []
+        new_labels = [] if labels is not None else None
+        new_positions = [] if position_ids is not None else None
+
+        for idx in range(batch_size):
+            mask = attention_mask[idx]
+            pad_left = mask[0].item() == 0 and mask[-1].item() == 1
+            pad_len = int((mask == 0).sum().item())
+            seq_len = mask.numel()
+            if pad_left:
+                valid_start = pad_len
+                pad_embeds = inputs_embeds[idx, :valid_start]
+                valid_embeds = inputs_embeds[idx, valid_start:]
+                new_embeds.append(torch.cat([pad_embeds, prefix_embed[idx], valid_embeds], dim=0))
+                new_masks.append(torch.cat([mask[:valid_start], prefix_mask, mask[valid_start:]], dim=0))
+                if labels is not None:
+                    prefix_labels = labels.new_full((prefix_len,), -100)
+                    pad_labels = labels[idx, :valid_start]
+                    valid_labels = labels[idx, valid_start:]
+                    new_labels.append(torch.cat([pad_labels, prefix_labels, valid_labels], dim=0))
+                if position_ids is not None:
+                    if position_ids.dim() == 3:
+                        pos = position_ids[:, idx, :]
+                        pad_pos = pos[:, :valid_start]
+                        valid_pos = pos[:, valid_start:] + prefix_len
+                        new_positions.append(torch.cat([pad_pos, prefix_range, valid_pos], dim=1))
+                    else:
+                        pos = position_ids[idx, :]
+                        pad_pos = pos[:valid_start]
+                        valid_pos = pos[valid_start:] + prefix_len
+                        new_positions.append(torch.cat([pad_pos, prefix_range, valid_pos], dim=0))
+            else:
+                valid_len = seq_len - pad_len
+                valid_embeds = inputs_embeds[idx, :valid_len]
+                pad_embeds = inputs_embeds[idx, valid_len:]
+                new_embeds.append(torch.cat([prefix_embed[idx], valid_embeds, pad_embeds], dim=0))
+                new_masks.append(torch.cat([prefix_mask, mask[:valid_len], mask[valid_len:]], dim=0))
+                if labels is not None:
+                    prefix_labels = labels.new_full((prefix_len,), -100)
+                    valid_labels = labels[idx, :valid_len]
+                    pad_labels = labels[idx, valid_len:]
+                    new_labels.append(torch.cat([prefix_labels, valid_labels, pad_labels], dim=0))
+                if position_ids is not None:
+                    if position_ids.dim() == 3:
+                        pos = position_ids[:, idx, :]
+                        valid_pos = pos[:, :valid_len] + prefix_len
+                        pad_pos = pos[:, valid_len:]
+                        new_positions.append(torch.cat([prefix_range, valid_pos, pad_pos], dim=1))
+                    else:
+                        pos = position_ids[idx, :]
+                        valid_pos = pos[:valid_len] + prefix_len
+                        pad_pos = pos[valid_len:]
+                        new_positions.append(torch.cat([prefix_range, valid_pos, pad_pos], dim=0))
+
+        inputs_embeds = torch.stack(new_embeds, dim=0)
+        attention_mask = torch.stack(new_masks, dim=0)
+        if labels is not None:
+            labels = torch.stack(new_labels, dim=0)
+        if position_ids is not None:
+            if position_ids.dim() == 3:
+                position_ids = torch.stack(new_positions, dim=1)
+            else:
+                position_ids = torch.stack(new_positions, dim=0)
+        return inputs_embeds, attention_mask, labels, position_ids
+
     @add_start_docstrings_to_model_forward(QWEN2_5_VL_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=Qwen2_5_VLCausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     def forward(
@@ -2006,6 +2199,41 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
 
             if attention_mask is not None:
                 attention_mask = attention_mask.to(inputs_embeds.device)
+
+        base_attention_mask = attention_mask
+        if self._should_apply_learnable_prefix(past_key_values, cache_position):
+            base_rope_deltas = None
+            if position_ids is None and (base_attention_mask is None or base_attention_mask.ndim == 2):
+                if input_ids is not None:
+                    position_ids, base_rope_deltas = self.get_rope_index(
+                        input_ids,
+                        image_grid_thw,
+                        video_grid_thw,
+                        second_per_grid_ts,
+                        base_attention_mask,
+                    )
+                else:
+                    position_ids = (
+                        torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
+                        .view(1, 1, -1)
+                        .expand(3, inputs_embeds.shape[0], -1)
+                    )
+                    base_rope_deltas = torch.zeros(
+                        [inputs_embeds.shape[0], 1],
+                        device=inputs_embeds.device,
+                        dtype=position_ids.dtype,
+                    )
+
+            inputs_embeds, attention_mask, labels, position_ids = self._apply_learnable_prefix(
+                inputs_embeds,
+                attention_mask,
+                labels,
+                position_ids,
+            )
+            if base_rope_deltas is not None:
+                self.rope_deltas = base_rope_deltas + self.learnable_prefix_len
+            if cache_position is not None and cache_position.numel() != inputs_embeds.shape[1]:
+                cache_position = None
 
         # if we get 4D attention mask we cannot calculate rope deltas anymore. TODO @raushan fixme
         if position_ids is None and (attention_mask is None or attention_mask.ndim == 2):

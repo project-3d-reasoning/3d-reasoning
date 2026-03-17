@@ -41,6 +41,8 @@ FUSION_LAMBDA_ORTHO=1.0
 FUSION_LAMBDA_RECON=1.0
 FUSION_LAMBDA_WARMUP=True
 FUSION_LAMBDA_WARMUP_STEPS=100
+USE_LEARNABLE_PREFIX=false
+LEARNABLE_PREFIX_LEN=0
 OUTPUT_DIR="PATH_TO_OUTPUT_DIR"                   # Directory for saving checkpoints
 CACHE_DIR="./cache"                        # [TrainingArguments] Cache directory for models
 mkdir -p $OUTPUT_DIR
@@ -118,4 +120,6 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --fusion_lambda_recon $FUSION_LAMBDA_RECON \
             --fusion_lambda_warmup $FUSION_LAMBDA_WARMUP \
             --fusion_lambda_warmup_steps $FUSION_LAMBDA_WARMUP_STEPS \
+            --use_learnable_prefix $USE_LEARNABLE_PREFIX \
+            --learnable_prefix_len $LEARNABLE_PREFIX_LEN \
             > ${OUTPUT_DIR}/train.log 2>&1
