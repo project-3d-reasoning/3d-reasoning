@@ -26,11 +26,10 @@ class ModelArguments:
     decompose_hidden_size: Optional[int] = field(default=None)  # Hidden size for shared/unique 3D decomposition MLPs
     fusion_align_mode: str = field(default="cosine")  # Alignment loss mode ("cosine", "infonce")
     fusion_ortho_mode: str = field(default="cosine")  # Orthogonality mode ("cosine", "mine")
-    fusion_lambda_align: float = field(default=1.0)  # Weight for alignment loss
     fusion_lambda_ortho: float = field(default=1.0)  # Weight for orthogonality loss
-    fusion_lambda_recon: float = field(default=1.0)  # Weight for reconstruction loss
-    fusion_lambda_warmup: bool = field(default=False)  # Enable lambda warmup for decompose fusion methods
-    fusion_lambda_warmup_steps: int = field(default=100)  # Warmup steps for fusion lambdas when enabled
+    fusion_lambda_warmup: bool = field(default=False)  # Enable ortho lambda warmup for decompose fusion methods
+    fusion_lambda_warmup_steps: int = field(default=100)  # Warmup steps for ortho lambda when enabled
+    fusion_mine_q_warmup_steps: int = field(default=500)  # q_theta-only warmup updates at each epoch start when ortho mode is "mine"
 
 @dataclass
 class DataArguments:

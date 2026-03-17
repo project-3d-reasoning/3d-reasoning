@@ -33,14 +33,11 @@ TUNE_MM_VISION_LORA=False
 TUNE_GEOMETRY_ENCODER=False
 TUNE_GEOMETRY_ENCODER_LORA=False
 FEATURE_FUSION_METHOD="decompose_add"      # choices: add/concat/cross_attention/gated/weighted/decompose_add/decompose_concat
-DECOMPOSE_HIDDEN_SIZE=2048                 # Set empty to follow hidden_size (e.g. DECOMPOSE_HIDDEN_SIZE="")
-FUSION_ALIGN_MODE="cosine"                 # choices: cosine/infonce
 FUSION_ORTHO_MODE="cosine"                 # choices: cosine/mine
-FUSION_LAMBDA_ALIGN=1.0
 FUSION_LAMBDA_ORTHO=1.0
-FUSION_LAMBDA_RECON=1.0
 FUSION_LAMBDA_WARMUP=True
 FUSION_LAMBDA_WARMUP_STEPS=100
+FUSION_MINE_Q_WARMUP_STEPS=500            # q_net-only warmup updates per epoch when FUSION_ORTHO_MODE=mine
 USE_LEARNABLE_PREFIX=false
 LEARNABLE_PREFIX_LEN=0
 OUTPUT_DIR="PATH_TO_OUTPUT_DIR"                   # Directory for saving checkpoints
@@ -112,14 +109,11 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --geometry_encoder_type $GEOMETRY_ENCODER_TYPE \
             --geometry_encoder_path $GEOMETRY_ENCODER_PATH \
             --feature_fusion_method $FEATURE_FUSION_METHOD \
-            --decompose_hidden_size $DECOMPOSE_HIDDEN_SIZE \
-            --fusion_align_mode $FUSION_ALIGN_MODE \
             --fusion_ortho_mode $FUSION_ORTHO_MODE \
-            --fusion_lambda_align $FUSION_LAMBDA_ALIGN \
             --fusion_lambda_ortho $FUSION_LAMBDA_ORTHO \
-            --fusion_lambda_recon $FUSION_LAMBDA_RECON \
             --fusion_lambda_warmup $FUSION_LAMBDA_WARMUP \
             --fusion_lambda_warmup_steps $FUSION_LAMBDA_WARMUP_STEPS \
+            --fusion_mine_q_warmup_steps $FUSION_MINE_Q_WARMUP_STEPS \
             --use_learnable_prefix $USE_LEARNABLE_PREFIX \
             --learnable_prefix_len $LEARNABLE_PREFIX_LEN \
             > ${OUTPUT_DIR}/train.log 2>&1

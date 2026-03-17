@@ -1495,9 +1495,7 @@ class Qwen2_5_VLCausalLMOutputWithPast(ModelOutput):
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[torch.FloatTensor]] = None
     rope_deltas: Optional[torch.LongTensor] = None
-    loss_align: Optional[torch.FloatTensor] = None
     loss_ortho: Optional[torch.FloatTensor] = None
-    loss_recon: Optional[torch.FloatTensor] = None
     mine_unique_features: Optional[torch.FloatTensor] = None
     mine_2d_features: Optional[torch.FloatTensor] = None
 
@@ -1645,9 +1643,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             mine_hidden_size=getattr(config, "fusion_mine_hidden_size", None),
         )
         self.feature_fusion = FeatureFusionModule(fusion_config)
-        self.fusion_lambda_align = getattr(config, "fusion_lambda_align", 1.0)
         self.fusion_lambda_ortho = getattr(config, "fusion_lambda_ortho", 1.0)
-        self.fusion_lambda_recon = getattr(config, "fusion_lambda_recon", 1.0)
 
     def _process_geometry_features(self, image_embeds, geometry_encoder_inputs, return_aux_losses: bool = False):
         """Process geometry features using the geometry encoder."""
@@ -2282,9 +2278,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
         loss = None
-        loss_align = None
         loss_ortho = None
-        loss_recon = None
         mine_unique_features = None
         mine_2d_features = None
         if labels is not None:
@@ -2301,17 +2295,13 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
             if fusion_aux_losses is not None:
-                loss_align = fusion_aux_losses["loss_align"].to(loss.device, loss.dtype)
-                loss_ortho = fusion_aux_losses["loss_ortho"].to(loss.device, loss.dtype)
-                loss_recon = fusion_aux_losses["loss_recon"].to(loss.device, loss.dtype)
+                loss_ortho_raw = fusion_aux_losses.get("loss_ortho")
+                if loss_ortho_raw is not None:
+                    loss_ortho = loss_ortho_raw.to(loss.device, loss.dtype)
                 mine_unique_features = fusion_aux_losses.get("mine_unique_features")
                 mine_2d_features = fusion_aux_losses.get("mine_2d_features")
-                loss = (
-                    loss
-                    + getattr(self, "fusion_lambda_align", 1.0) * loss_align
-                    + getattr(self, "fusion_lambda_ortho", 1.0) * loss_ortho
-                    + getattr(self, "fusion_lambda_recon", 1.0) * loss_recon
-                )
+                if loss_ortho is not None:
+                    loss = loss + getattr(self, "fusion_lambda_ortho", 1.0) * loss_ortho
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -2324,9 +2314,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             rope_deltas=self.rope_deltas,
-            loss_align=loss_align,
             loss_ortho=loss_ortho,
-            loss_recon=loss_recon,
             mine_unique_features=mine_unique_features,
             mine_2d_features=mine_2d_features,
         )

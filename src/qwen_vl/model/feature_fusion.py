@@ -239,9 +239,8 @@ class FeatureFusionModule(nn.Module):
             self.weight_3d = nn.Parameter(torch.tensor(0.5))
 
         elif self.config.fusion_method in {"decompose_add", "decompose_concat"}:
-            decompose_hidden = self.config.decompose_hidden_size or self.hidden_size
-            self.shared_mapper = self._build_decompose_mapper(decompose_hidden)
-            self.unique_mapper = self._build_decompose_mapper(decompose_hidden)
+            # Learnable scalar gate for the unique 3D component.
+            self.unique_alpha = nn.Parameter(torch.tensor(1.0))
             if self.ortho_mode == "mine":
                 mine_hidden = self.config.mine_hidden_size or self.hidden_size
                 self.mine_statistics_network = nn.Sequential(
@@ -302,7 +301,7 @@ class FeatureFusionModule(nn.Module):
         pairwise_log_prob = -0.5 * (pred_norm + t_norm - 2.0 * cross)
         negative_log_prob = pairwise_log_prob.mean(dim=1)
 
-        vclub_bound = (positive_log_prob - negative_log_prob).mean()
+        vclub_bound = (positive_log_prob - negative_log_prob).mean()/4096
         # Theoretical lower bound is 0 for independent variables; clamp numeric noise.
         return torch.clamp(vclub_bound, min=0.0)
 
@@ -379,34 +378,28 @@ class FeatureFusionModule(nn.Module):
             return norm_weight_2d * features_2d + norm_weight_3d * features_3d
 
         elif self.fusion_method in {"decompose_add", "decompose_concat"}:
-            shared_3d = self.shared_mapper(features_3d)
-            unique_3d = self.unique_mapper(features_3d)
+            unique_3d = features_3d - features_2d
+            alpha = self.unique_alpha.to(unique_3d.dtype)
+            unique_3d = unique_3d * alpha
 
             if self.fusion_method == "decompose_concat":
                 fused = self.decompose_projection(torch.cat([features_2d, unique_3d], dim=-1))
             else:
-                fused = features_2d + unique_3d
+                fused = 2*features_2d + unique_3d
 
             if not return_aux_losses:
                 return fused
 
-            shared_3d_f = shared_3d.float()
             unique_3d_f = unique_3d.float()
             features_2d_f = features_2d.float()
-            features_3d_f = features_3d.float()
-
-            align_loss = self._compute_align_loss(shared_3d_f, features_2d_f)
             if self.ortho_mode == "mine":
                 unique_flat = unique_3d_f.reshape(-1, unique_3d_f.shape[-1])
                 features_2d_flat = features_2d_f.reshape(-1, features_2d_f.shape[-1])
                 ortho_loss = self._compute_vclub_bound_flat(unique_flat, features_2d_flat)
             else:
                 ortho_loss = F.cosine_similarity(unique_3d_f, features_2d_f, dim=-1, eps=1e-6).abs().mean()
-            recon_loss = F.mse_loss(shared_3d_f + unique_3d_f, features_3d_f)
             aux_losses = {
-                "loss_align": align_loss,
                 "loss_ortho": ortho_loss,
-                "loss_recon": recon_loss,
             }
             if self.ortho_mode == "mine":
                 aux_losses["mine_unique_features"] = unique_flat.detach()

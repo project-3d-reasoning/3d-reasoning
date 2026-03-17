@@ -1,11 +1,12 @@
 import os
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import datasets
 import torch
 import torch.nn as nn
 from flash_attn.flash_attn_interface import flash_attn_varlen_func
 from torch.utils.data import DataLoader, Sampler
+from tqdm.auto import tqdm
 from transformers import Trainer
 from transformers.cache_utils import Cache
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
@@ -395,6 +396,7 @@ class VGTrainer(Trainer):
         self._mine_cached_features: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._mine_optimizer: Optional[torch.optim.Optimizer] = None
         self._mine_update_steps: int = 5
+        self._mine_warmup_done_epochs: Set[int] = set()
         self._aux_monitor_logs: Dict[str, float] = {}
 
     def _unwrap_model(self, model: torch.nn.Module) -> torch.nn.Module:
@@ -405,6 +407,20 @@ class VGTrainer(Trainer):
     def _get_feature_fusion_module(self, model: torch.nn.Module):
         unwrapped = self._unwrap_model(model)
         return getattr(unwrapped, "feature_fusion", None)
+
+    def _get_unique_alpha(self, model: torch.nn.Module) -> Optional[float]:
+        feature_fusion = self._get_feature_fusion_module(model)
+        if feature_fusion is None:
+            return None
+        alpha = getattr(feature_fusion, "unique_alpha", None)
+        if alpha is None:
+            return None
+        if isinstance(alpha, torch.Tensor):
+            return float(alpha.detach().float().cpu().item())
+        try:
+            return float(alpha)
+        except (TypeError, ValueError):
+            return None
 
     def _is_mine_mode(self, feature_fusion) -> bool:
         return (
@@ -425,49 +441,27 @@ class VGTrainer(Trainer):
         if outputs is None or loss is None:
             return
 
-        loss_align = self._get_output_field(outputs, "loss_align")
         loss_ortho = self._get_output_field(outputs, "loss_ortho")
-        loss_recon = self._get_output_field(outputs, "loss_recon")
-        if loss_align is None and loss_ortho is None and loss_recon is None:
+        if loss_ortho is None:
+            loss_ce = loss.detach().float()
+            self._aux_monitor_logs = {
+                "loss_ce": float(loss_ce.item()),
+                "loss_ce_est": float(loss_ce.item()),
+            }
             return
 
+        loss_ortho = loss_ortho.to(loss.device, loss.dtype)
+
         base_model = self._unwrap_model(model)
-        lambda_align = float(getattr(base_model, "fusion_lambda_align", 1.0))
         lambda_ortho = float(getattr(base_model, "fusion_lambda_ortho", 1.0))
-        lambda_recon = float(getattr(base_model, "fusion_lambda_recon", 1.0))
-
-        weighted_aux = loss.new_zeros(())
-        if loss_align is not None:
-            weighted_aux = weighted_aux + lambda_align * loss_align.to(loss.device, loss.dtype)
-        if loss_ortho is not None:
-            weighted_aux = weighted_aux + lambda_ortho * loss_ortho.to(loss.device, loss.dtype)
-        if loss_recon is not None:
-            weighted_aux = weighted_aux + lambda_recon * loss_recon.to(loss.device, loss.dtype)
-
-        ce_est = loss - weighted_aux
-        ce_safe = torch.clamp(ce_est, min=1e-8)
-        ratio = weighted_aux / ce_safe
-
+        loss_ortho_weighted = lambda_ortho * loss_ortho
+        loss_ce = loss - loss_ortho_weighted
         self._aux_monitor_logs = {
-            "loss_ce_est": float(ce_est.detach().float().item()),
-            "loss_aux_weighted": float(weighted_aux.detach().float().item()),
-            "loss_aux_ratio": float(ratio.detach().float().item()),
+            "loss_ce": float(loss_ce.detach().float().item()),
+            "loss_ce_est": float(loss_ce.detach().float().item()),
+            "loss_ortho": float(loss_ortho.detach().float().item()),
+            "loss_ortho_weighted": float(loss_ortho_weighted.detach().float().item()),
         }
-        if loss_align is not None:
-            self._aux_monitor_logs["loss_align"] = float(loss_align.detach().float().item())
-            self._aux_monitor_logs["loss_align_weighted"] = float(
-                (lambda_align * loss_align).detach().float().item()
-            )
-        if loss_ortho is not None:
-            self._aux_monitor_logs["loss_ortho"] = float(loss_ortho.detach().float().item())
-            self._aux_monitor_logs["loss_ortho_weighted"] = float(
-                (lambda_ortho * loss_ortho).detach().float().item()
-            )
-        if loss_recon is not None:
-            self._aux_monitor_logs["loss_recon"] = float(loss_recon.detach().float().item())
-            self._aux_monitor_logs["loss_recon_weighted"] = float(
-                (lambda_recon * loss_recon).detach().float().item()
-            )
 
     def _cache_mine_features(self, outputs: Any) -> None:
         unique_features = self._get_output_field(outputs, "mine_unique_features")
@@ -489,6 +483,123 @@ class VGTrainer(Trainer):
             return
         mine_lr = float(getattr(self.args, "mm_projector_lr", None) or self.args.learning_rate)
         self._mine_optimizer = torch.optim.AdamW(mine_parameters, lr=mine_lr, weight_decay=0.0)
+
+    def _get_mine_warmup_steps(self, model: torch.nn.Module) -> int:
+        base_model = self._unwrap_model(model)
+        config = getattr(base_model, "config", None)
+        warmup_steps = int(getattr(config, "fusion_mine_q_warmup_steps", 500) or 0)
+        return max(warmup_steps, 0)
+
+    def _run_mine_warmup(self, model: torch.nn.Module, epoch_idx: int, warmup_steps: int) -> None:
+        if warmup_steps <= 0:
+            return
+
+        feature_fusion = self._get_feature_fusion_module(model)
+        if not self._is_mine_mode(feature_fusion):
+            return
+
+        supported_methods = {"decompose_add", "decompose_concat"}
+        fusion_method = getattr(feature_fusion, "fusion_method", None)
+        if fusion_method not in supported_methods:
+            if self.is_world_process_zero():
+                print(
+                    "[MINEWarmup] Skip q_net warmup because "
+                    f"fusion_method={fusion_method} does not provide cached mine features."
+                )
+            return
+
+        self._ensure_mine_optimizer(feature_fusion)
+        if self._mine_optimizer is None:
+            if self.is_world_process_zero():
+                print("[MINEWarmup] Skip q_net warmup because mine optimizer is unavailable.")
+            return
+
+        # Build an independent iterator so warmup never consumes the ongoing main-train iterator.
+        warmup_dataloader = self.get_train_dataloader()
+        warmup_iterator = iter(warmup_dataloader)
+        is_rank0 = self.is_world_process_zero()
+        if is_rank0:
+            print(
+                f"[MINEWarmup] Epoch {epoch_idx}: q_net warmup starts "
+                f"({warmup_steps} batches / {warmup_steps} updates)."
+            )
+        progress_bar = tqdm(
+            range(warmup_steps),
+            desc=f"[MINEWarmup][Epoch {epoch_idx}] q_net",
+            disable=not is_rank0,
+            leave=False,
+        )
+        last_q_loss: Optional[float] = None
+        feature_fusion.set_mine_network_trainable(False)
+        try:
+            for _ in progress_bar:
+                try:
+                    warmup_inputs = next(warmup_iterator)
+                except StopIteration:
+                    warmup_iterator = iter(warmup_dataloader)
+                    warmup_inputs = next(warmup_iterator)
+
+                warmup_inputs = self._prepare_inputs(warmup_inputs)
+                with torch.no_grad():
+                    with self.compute_loss_context_manager():
+                        outputs = model(**warmup_inputs)
+
+                unique_features = self._get_output_field(outputs, "mine_unique_features")
+                features_2d = self._get_output_field(outputs, "mine_2d_features")
+                if unique_features is None or features_2d is None:
+                    continue
+
+                unique_features = unique_features.detach().float()
+                features_2d = features_2d.detach().float()
+
+                feature_fusion.set_mine_network_trainable(True)
+                self._mine_optimizer.zero_grad(set_to_none=True)
+                q_loss = feature_fusion.compute_mine_q_loss_from_cache(
+                    unique_features, features_2d
+                )
+                q_loss.backward()
+                self._mine_optimizer.step()
+                feature_fusion.set_mine_network_trainable(False)
+
+                last_q_loss = float(q_loss.detach().float().item())
+                if is_rank0:
+                    progress_bar.set_postfix({"q_loss": f"{last_q_loss:.4f}"})
+        finally:
+            self._mine_optimizer.zero_grad(set_to_none=True)
+            feature_fusion.set_mine_network_trainable(False)
+            progress_bar.close()
+
+        if is_rank0:
+            if last_q_loss is None:
+                print(
+                    f"[MINEWarmup] Epoch {epoch_idx}: q_net warmup completed, "
+                    "but no valid mine feature pairs were found."
+                )
+            else:
+                print(
+                    f"[MINEWarmup] Epoch {epoch_idx}: q_net warmup completed, "
+                    f"last_q_loss={last_q_loss:.6f}"
+                )
+
+    def _maybe_run_mine_warmup(self, model: torch.nn.Module) -> None:
+        feature_fusion = self._get_feature_fusion_module(model)
+        if not self._is_mine_mode(feature_fusion):
+            return
+
+        warmup_steps = self._get_mine_warmup_steps(model)
+        if warmup_steps <= 0:
+            return
+
+        epoch_value = 0.0 if self.state.epoch is None else float(self.state.epoch)
+        epoch_idx = max(int(epoch_value), 0)
+        # Only trigger at epoch boundaries, not in the middle of a resumed epoch.
+        if abs(epoch_value - float(epoch_idx)) > 1e-8:
+            return
+        if epoch_idx in self._mine_warmup_done_epochs:
+            return
+
+        self._run_mine_warmup(model, epoch_idx=epoch_idx, warmup_steps=warmup_steps)
+        self._mine_warmup_done_epochs.add(epoch_idx)
 
     def _run_mine_updates(self, model: torch.nn.Module) -> None:
         if self._mine_cached_features is None:
@@ -552,6 +663,7 @@ class VGTrainer(Trainer):
         return loss
 
     def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]], *args, **kwargs):
+        self._maybe_run_mine_warmup(model)
         loss = super().training_step(model, inputs, *args, **kwargs)
         self._run_mine_updates(model)
         return loss
@@ -560,6 +672,10 @@ class VGTrainer(Trainer):
         if self._aux_monitor_logs:
             logs = dict(logs)
             logs.update(self._aux_monitor_logs)
+        unique_alpha = self._get_unique_alpha(self.model)
+        if unique_alpha is not None:
+            logs = dict(logs)
+            logs["unique_alpha"] = unique_alpha
         super().log(logs, *args, **kwargs)
 
 

@@ -182,7 +182,7 @@ def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
 
 class FusionLambdaWarmupCallback(transformers.TrainerCallback):
     """
-    Linearly warm up fusion lambdas from 0 to target values.
+    Linearly warm up fusion ortho lambda from 0 to target value.
 
     Only applies when:
     - `fusion_lambda_warmup` is enabled
@@ -213,14 +213,12 @@ class FusionLambdaWarmupCallback(transformers.TrainerCallback):
             return
         if not self.enabled:
             return
-        if not all(hasattr(model, key) for key in ("fusion_lambda_align", "fusion_lambda_ortho", "fusion_lambda_recon")):
-            rank0_print("[FusionLambdaWarmup] Skip: fusion lambda attributes are not found on model.")
+        if not hasattr(model, "fusion_lambda_ortho"):
+            rank0_print("[FusionLambdaWarmup] Skip: fusion_lambda_ortho is not found on model.")
             return
 
         self.target_lambdas = {
-            "fusion_lambda_align": float(model.fusion_lambda_align),
             "fusion_lambda_ortho": float(model.fusion_lambda_ortho),
-            "fusion_lambda_recon": float(model.fusion_lambda_recon),
         }
         self.active = True
         init_factor = min(max(state.global_step, 0) / float(self.warmup_steps), 1.0)
@@ -286,11 +284,10 @@ def train(attn_implementation="flash_attention_2"):
                 "decompose_hidden_size",
                 "fusion_align_mode",
                 "fusion_ortho_mode",
-                "fusion_lambda_align",
                 "fusion_lambda_ortho",
-                "fusion_lambda_recon",
                 "fusion_lambda_warmup",
                 "fusion_lambda_warmup_steps",
+                "fusion_mine_q_warmup_steps",
                 "tune_mm_vision",
                 "tune_mm_vision_lora",
                 "tune_geometry_encoder",

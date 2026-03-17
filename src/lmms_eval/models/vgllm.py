@@ -62,9 +62,7 @@ class VGLLM(lmms):
         decompose_hidden_size: Optional[int] = None,
         fusion_align_mode: Optional[str] = None,
         fusion_ortho_mode: Optional[str] = None,
-        fusion_lambda_align: Optional[float] = None,
         fusion_lambda_ortho: Optional[float] = None,
-        fusion_lambda_recon: Optional[float] = None,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -100,12 +98,8 @@ class VGLLM(lmms):
             setattr(config, "fusion_align_mode", fusion_align_mode)
         if fusion_ortho_mode is not None:
             setattr(config, "fusion_ortho_mode", fusion_ortho_mode)
-        if fusion_lambda_align is not None:
-            setattr(config, "fusion_lambda_align", fusion_lambda_align)
         if fusion_lambda_ortho is not None:
             setattr(config, "fusion_lambda_ortho", fusion_lambda_ortho)
-        if fusion_lambda_recon is not None:
-            setattr(config, "fusion_lambda_recon", fusion_lambda_recon)
         if tune_mm_vision is not None:
             setattr(config, "tune_mm_vision", tune_mm_vision)
         if tune_mm_vision_lora is not None:
