@@ -25,7 +25,7 @@ class ModelArguments:
     geometry_merger_type: str = field(default="mlp")  # Type of geometry feature merger ("mlp", "avg")
     decompose_hidden_size: Optional[int] = field(default=None)  # Hidden size for shared/unique 3D decomposition MLPs
     fusion_align_mode: str = field(default="cosine")  # Alignment loss mode ("cosine", "infonce")
-    fusion_ortho_mode: str = field(default="cosine")  # Orthogonality mode ("cosine", "mine")
+    fusion_ortho_mode: str = field(default="cosine")  # Orthogonality mode ("cosine", "club")
     fusion_lambda_align: float = field(default=1.0)  # Weight for alignment loss
     fusion_lambda_ortho: float = field(default=1.0)  # Weight for orthogonality loss
     fusion_lambda_recon: float = field(default=1.0)  # Weight for reconstruction loss

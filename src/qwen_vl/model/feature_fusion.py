@@ -1,5 +1,6 @@
 """Feature fusion modules for combining 2D and 3D features."""
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,7 +19,7 @@ class FeatureFusionConfig:
     decompose_hidden_size: Optional[int] = None
     align_mode: str = "cosine"  # "cosine"(default) or "infonce"
     align_temperature: float = 0.07
-    ortho_mode: str = "cosine"  # "cosine"(default) or "mine" (mine mode uses vCLUB)
+    ortho_mode: str = "cosine"  # "cosine"(default) or "club" (club mode uses vCLUB)
     mine_hidden_size: Optional[int] = None  # Hidden size for q_theta in vCLUB
 
 
@@ -177,9 +178,12 @@ class FeatureFusionModule(nn.Module):
         self.ortho_mode = config.ortho_mode.lower()
         if self.ortho_mode == "cos":
             self.ortho_mode = "cosine"
-        if self.ortho_mode not in {"cosine", "mine"}:
+        if self.ortho_mode == "mine":
+            # Backward-compat: map legacy "mine" to new "club" name.
+            self.ortho_mode = "club"
+        if self.ortho_mode not in {"cosine", "club"}:
             raise ValueError(
-                f"Unknown ortho_mode: {config.ortho_mode}. Supported values: cosine, mine."
+                f"Unknown ortho_mode: {config.ortho_mode}. Supported values: cosine, club."
             )
         
         self._build_fusion_layers()
@@ -202,12 +206,20 @@ class FeatureFusionModule(nn.Module):
 
     def _build_decompose_mapper(self, hidden_dim: int) -> nn.Module:
         """Build lightweight mapper for shared/unique 3D feature decomposition."""
-        return nn.Sequential(
+        mapper = nn.Sequential(
             nn.LayerNorm(self.hidden_size),
             nn.Linear(self.hidden_size, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, self.hidden_size),
         )
+        # Initialize the last Linear layer with Kaiming for better training dynamics.
+        last_linear = mapper[-1]
+        nn.init.kaiming_uniform_(last_linear.weight, a=math.sqrt(5))
+        if last_linear.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(last_linear.weight)
+            bound = 1 / math.sqrt(fan_in)
+            nn.init.uniform_(last_linear.bias, -bound, bound)
+        return mapper
     
     def _build_fusion_layers(self):
         """Build fusion layers based on method."""
@@ -239,10 +251,9 @@ class FeatureFusionModule(nn.Module):
             self.weight_3d = nn.Parameter(torch.tensor(0.5))
 
         elif self.config.fusion_method in {"decompose_add", "decompose_concat"}:
-            decompose_hidden = self.config.decompose_hidden_size or self.hidden_size
-            self.shared_mapper = self._build_decompose_mapper(decompose_hidden)
-            self.unique_mapper = self._build_decompose_mapper(decompose_hidden)
-            if self.ortho_mode == "mine":
+            # No shared/unique MLPs; use direct residual (T_3D - T_2D) as F_unique.
+            self.alpha_unique = nn.Parameter(torch.tensor(0.5))
+            if self.ortho_mode == "club":
                 mine_hidden = self.config.mine_hidden_size or self.hidden_size
                 self.mine_statistics_network = nn.Sequential(
                     nn.LayerNorm(self.hidden_size),
@@ -256,19 +267,19 @@ class FeatureFusionModule(nn.Module):
                 self.decompose_projection = nn.Linear(self.hidden_size * 2, self.hidden_size)
 
     def set_mine_network_trainable(self, trainable: bool) -> None:
-        if self.ortho_mode != "mine" or not hasattr(self, "mine_statistics_network"):
+        if self.ortho_mode != "club" or not hasattr(self, "mine_statistics_network"):
             return
         for p in self.mine_statistics_network.parameters():
             p.requires_grad_(trainable)
 
     def get_mine_parameters(self):
-        if self.ortho_mode != "mine" or not hasattr(self, "mine_statistics_network"):
+        if self.ortho_mode != "club" or not hasattr(self, "mine_statistics_network"):
             return []
         return list(self.mine_statistics_network.parameters())
 
     def _predict_t2d_mean_from_unique(self, unique_flat: torch.Tensor) -> torch.Tensor:
-        if self.ortho_mode != "mine" or not hasattr(self, "mine_statistics_network"):
-            raise ValueError("q_theta is only available when ortho_mode='mine'.")
+        if self.ortho_mode != "club" or not hasattr(self, "mine_statistics_network"):
+            raise ValueError("q_theta is only available when ortho_mode='club'.")
 
         unique_flat = unique_flat.float()
         device_type = "cuda" if unique_flat.is_cuda else "cpu"
@@ -289,7 +300,11 @@ class FeatureFusionModule(nn.Module):
                 f"{unique_flat.shape[0]} vs {features_2d_flat.shape[0]}"
             )
 
+        unique_flat = unique_flat.float()
         features_2d_flat = features_2d_flat.float()
+        # L2-normalize features to keep vCLUB stable in high-dimensional space.
+        unique_flat = F.normalize(unique_flat, p=2, dim=-1, eps=1e-6)
+        features_2d_flat = F.normalize(features_2d_flat, p=2, dim=-1, eps=1e-6)
         pred_mean = self._predict_t2d_mean_from_unique(unique_flat)
 
         # log q(T_i | F_i), assuming fixed isotropic sigma=1.
@@ -314,22 +329,26 @@ class FeatureFusionModule(nn.Module):
                 f"Feature pair size mismatch for q_theta update: "
                 f"{unique_flat.shape[0]} vs {features_2d_flat.shape[0]}"
             )
+        unique_flat = unique_flat.float()
         features_2d_flat = features_2d_flat.float()
+        # Keep q_theta training on normalized features for numeric stability.
+        unique_flat = F.normalize(unique_flat, p=2, dim=-1, eps=1e-6)
+        features_2d_flat = F.normalize(features_2d_flat, p=2, dim=-1, eps=1e-6)
         pred_mean = self._predict_t2d_mean_from_unique(unique_flat)
         return F.mse_loss(pred_mean, features_2d_flat)
 
     def compute_mine_objective_from_cache(
         self, unique_flat: torch.Tensor, features_2d_flat: torch.Tensor
     ) -> torch.Tensor:
-        if self.ortho_mode != "mine":
-            raise ValueError("vCLUB objective is only available when ortho_mode='mine'.")
+        if self.ortho_mode != "club":
+            raise ValueError("vCLUB objective is only available when ortho_mode='club'.")
         return self._compute_vclub_bound_flat(unique_flat, features_2d_flat)
 
     def compute_mine_q_loss_from_cache(
         self, unique_flat: torch.Tensor, features_2d_flat: torch.Tensor
     ) -> torch.Tensor:
-        if self.ortho_mode != "mine":
-            raise ValueError("q_theta loss is only available when ortho_mode='mine'.")
+        if self.ortho_mode != "club":
+            raise ValueError("q_theta loss is only available when ortho_mode='club'.")
         return self._compute_vclub_q_loss_flat(unique_flat, features_2d_flat)
     
     def forward(
@@ -379,36 +398,34 @@ class FeatureFusionModule(nn.Module):
             return norm_weight_2d * features_2d + norm_weight_3d * features_3d
 
         elif self.fusion_method in {"decompose_add", "decompose_concat"}:
-            shared_3d = self.shared_mapper(features_3d)
-            unique_3d = self.unique_mapper(features_3d)
-
+            unique_3d = features_3d - features_2d
+            gated_unique = self.alpha_unique * unique_3d
             if self.fusion_method == "decompose_concat":
-                fused = self.decompose_projection(torch.cat([features_2d, unique_3d], dim=-1))
+                fused = self.decompose_projection(
+                    torch.cat([features_2d, gated_unique], dim=-1)
+                )
             else:
-                fused = features_2d + unique_3d
+                fused = features_2d + gated_unique
 
             if not return_aux_losses:
                 return fused
 
-            shared_3d_f = shared_3d.float()
             unique_3d_f = unique_3d.float()
             features_2d_f = features_2d.float()
-            features_3d_f = features_3d.float()
 
-            align_loss = self._compute_align_loss(shared_3d_f, features_2d_f)
-            if self.ortho_mode == "mine":
+            if self.ortho_mode == "club":
                 unique_flat = unique_3d_f.reshape(-1, unique_3d_f.shape[-1])
                 features_2d_flat = features_2d_f.reshape(-1, features_2d_f.shape[-1])
                 ortho_loss = self._compute_vclub_bound_flat(unique_flat, features_2d_flat)
             else:
-                ortho_loss = F.cosine_similarity(unique_3d_f, features_2d_f, dim=-1, eps=1e-6).abs().mean()
-            recon_loss = F.mse_loss(shared_3d_f + unique_3d_f, features_3d_f)
+                ortho_loss = F.cosine_similarity(
+                    unique_3d_f, features_2d_f, dim=-1, eps=1e-6
+                ).abs().mean()
+
             aux_losses = {
-                "loss_align": align_loss,
                 "loss_ortho": ortho_loss,
-                "loss_recon": recon_loss,
             }
-            if self.ortho_mode == "mine":
+            if self.ortho_mode == "club":
                 aux_losses["mine_unique_features"] = unique_flat.detach()
                 aux_losses["mine_2d_features"] = features_2d_flat.detach()
             return fused, aux_losses

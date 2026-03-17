@@ -31,16 +31,12 @@ TUNE_MM_VISION=False
 TUNE_MM_VISION_LORA=False
 TUNE_GEOMETRY_ENCODER=False
 TUNE_GEOMETRY_ENCODER_LORA=False
-FEATURE_FUSION_METHOD="add"      # choices: add/concat/cross_attention/gated/weighted/decompose_add/decompose_concat
-DECOMPOSE_HIDDEN_SIZE=2048                 # Set empty to follow hidden_size (e.g. DECOMPOSE_HIDDEN_SIZE="")
-FUSION_ALIGN_MODE="infonce"                 # choices: cosine/infonce
-FUSION_ORTHO_MODE="mine"                 # choices: cosine/mine
-FUSION_LAMBDA_ALIGN=0.02
-FUSION_LAMBDA_ORTHO=0.002
-FUSION_LAMBDA_RECON=0.005
-USE_LEARNABLE_PREFIX=true
+FEATURE_FUSION_METHOD="decompose_add"      # choices: add/concat/cross_attention/gated/weighted/decompose_add/decompose_concat
+FUSION_ORTHO_MODE="club"                 # choices: cosine/club
+FUSION_LAMBDA_ORTHO=1
+USE_LEARNABLE_PREFIX=false
 LEARNABLE_PREFIX_LEN=10
-OUTPUT_DIR="3b-add-prefix"                   # Directory for saving checkpoints
+OUTPUT_DIR="3b-decompose-add-infonce-club-0.02-0.2-0.005"                   # Directory for saving checkpoints
 CACHE_DIR="./cache"                        # [TrainingArguments] Cache directory for models
 mkdir -p $OUTPUT_DIR
 
@@ -110,12 +106,8 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --geometry_encoder_type $GEOMETRY_ENCODER_TYPE \
             --geometry_encoder_path $GEOMETRY_ENCODER_PATH \
             --feature_fusion_method $FEATURE_FUSION_METHOD \
-            --decompose_hidden_size $DECOMPOSE_HIDDEN_SIZE \
-            --fusion_align_mode $FUSION_ALIGN_MODE \
             --fusion_ortho_mode $FUSION_ORTHO_MODE \
-            --fusion_lambda_align $FUSION_LAMBDA_ALIGN \
             --fusion_lambda_ortho $FUSION_LAMBDA_ORTHO \
-            --fusion_lambda_recon $FUSION_LAMBDA_RECON \
             --use_learnable_prefix $USE_LEARNABLE_PREFIX \
             --learnable_prefix_len $LEARNABLE_PREFIX_LEN \
             "$@" \

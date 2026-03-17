@@ -1,11 +1,17 @@
+import copy
+import itertools
+import logging
 import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import datasets
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+import torch.nn.functional as F
 from flash_attn.flash_attn_interface import flash_attn_varlen_func
-from torch.utils.data import DataLoader, Sampler
+from torch.utils.data import DataLoader, IterableDataset, RandomSampler, Sampler
+from tqdm import tqdm
 from transformers import Trainer
 from transformers.cache_utils import Cache
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
@@ -24,6 +30,7 @@ from transformers.trainer import (
 )
 from transformers.trainer_utils import seed_worker
 
+logger = logging.getLogger(__name__)
 
 def _flash_attention_forward(
     query_states: torch.Tensor,
@@ -388,7 +395,7 @@ def create_optimizer(self):
 
 
 class VGTrainer(Trainer):
-    """Trainer with optional extra q_theta updates for vCLUB in ortho mine mode."""
+    """Trainer with optional extra q_theta updates for vCLUB in ortho club mode."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -396,6 +403,10 @@ class VGTrainer(Trainer):
         self._mine_optimizer: Optional[torch.optim.Optimizer] = None
         self._mine_update_steps: int = 5
         self._aux_monitor_logs: Dict[str, float] = {}
+        self._club_warmup_done: bool = False
+        self._club_warmup_steps: int = 100
+        self._club_warmup_log_every: int = 10
+        self._gate_log_every: int = 10
 
     def _unwrap_model(self, model: torch.nn.Module) -> torch.nn.Module:
         while hasattr(model, "module"):
@@ -410,8 +421,199 @@ class VGTrainer(Trainer):
         return (
             feature_fusion is not None
             and hasattr(feature_fusion, "ortho_mode")
-            and feature_fusion.ortho_mode == "mine"
+            and feature_fusion.ortho_mode == "club"
         )
+
+    def _log_rank0(self, message: str) -> None:
+        if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
+            return
+        if logger.isEnabledFor(logging.INFO):
+            logger.info(message)
+        else:
+            print(message, flush=True)
+
+    def _build_club_warmup_dataloader(self) -> Optional[DataLoader]:
+        train_dataset = self.train_dataset
+        if train_dataset is None:
+            return None
+
+        warmup_dataset = train_dataset
+        if isinstance(train_dataset, IterableDataset):
+            # Avoid consuming the same iterator used by the main training dataloader.
+            try:
+                warmup_dataset = copy.deepcopy(train_dataset)
+            except Exception:
+                try:
+                    warmup_dataset = copy.copy(train_dataset)
+                except Exception:
+                    return None
+
+        # Build an isolated dataloader so warmup batches do not affect training batches.
+        sampler = None
+        if not isinstance(warmup_dataset, IterableDataset):
+            if dist.is_available() and dist.is_initialized():
+                sampler = torch.utils.data.distributed.DistributedSampler(
+                    warmup_dataset,
+                    num_replicas=dist.get_world_size(),
+                    rank=dist.get_rank(),
+                    shuffle=True,
+                    seed=int(getattr(self.args, "seed", 0)) + 12345,
+                    drop_last=self.args.dataloader_drop_last,
+                )
+            else:
+                generator = torch.Generator()
+                generator.manual_seed(int(getattr(self.args, "seed", 0)) + 12345)
+                sampler = RandomSampler(warmup_dataset, generator=generator)
+
+        collate_fn = self.data_collator
+        get_collator = getattr(self, "_get_collator_with_removed_columns", None)
+        if callable(get_collator):
+            collate_fn = get_collator(collate_fn, description="training")
+
+        dataloader_kwargs = dict(
+            batch_size=self.args.per_device_train_batch_size,
+            collate_fn=collate_fn,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+            drop_last=self.args.dataloader_drop_last,
+            worker_init_fn=seed_worker,
+        )
+        if self.args.dataloader_num_workers > 0:
+            dataloader_kwargs["persistent_workers"] = self.args.dataloader_persistent_workers
+            prefetch_factor = getattr(self.args, "dataloader_prefetch_factor", None)
+            if prefetch_factor is not None:
+                dataloader_kwargs["prefetch_factor"] = prefetch_factor
+        if sampler is not None:
+            dataloader_kwargs["sampler"] = sampler
+
+        return DataLoader(warmup_dataset, **dataloader_kwargs)
+
+    def _maybe_warmup_club_qnet(self, model: torch.nn.Module) -> None:
+        if self._club_warmup_done:
+            return
+        show_bar = True
+        if dist.is_available() and dist.is_initialized():
+            show_bar = dist.get_rank() == 0
+
+        feature_fusion = self._get_feature_fusion_module(model)
+        if not self._is_mine_mode(feature_fusion):
+            self._club_warmup_done = True
+            return
+        if hasattr(self, "state") and getattr(self.state, "global_step", 0) > 0:
+            self._club_warmup_done = True
+            return
+
+        warmup_dataloader = self._build_club_warmup_dataloader()
+        if warmup_dataloader is None:
+            if show_bar:
+                self._log_rank0("Club warmup skipped: no suitable warmup dataloader.")
+            self._club_warmup_done = True
+            return
+
+        feature_fusion.set_mine_network_trainable(True)
+        self._ensure_mine_optimizer(feature_fusion)
+        if self._mine_optimizer is None:
+            feature_fusion.set_mine_network_trainable(False)
+            if show_bar:
+                self._log_rank0("Club warmup skipped: q_net optimizer unavailable.")
+            self._club_warmup_done = True
+            return
+
+        was_training = model.training
+        model.train()
+
+        if show_bar:
+            self._log_rank0(f"Club warmup started: {self._club_warmup_steps} batches.")
+
+        step = 0
+        loss_sum = 0.0
+        cos_sum = 0.0
+        update_steps = 0
+        warmup_iter = tqdm(
+            itertools.islice(warmup_dataloader, self._club_warmup_steps),
+            total=self._club_warmup_steps,
+            desc="club warmup",
+            disable=not show_bar,
+        )
+        for inputs in warmup_iter:
+            step += 1
+            inputs = self._prepare_inputs(inputs)
+            with torch.no_grad():
+                outputs = model(**inputs)
+            unique_features = self._get_output_field(outputs, "mine_unique_features")
+            features_2d = self._get_output_field(outputs, "mine_2d_features")
+            if unique_features is None or features_2d is None:
+                continue
+            unique_features = unique_features.detach().float()
+            features_2d = features_2d.detach().float()
+            unique_features = F.normalize(unique_features, p=2, dim=-1, eps=1e-6)
+            features_2d = F.normalize(features_2d, p=2, dim=-1, eps=1e-6)
+
+            self._mine_optimizer.zero_grad(set_to_none=True)
+            pred_mean = feature_fusion._predict_t2d_mean_from_unique(unique_features)
+            q_loss = F.mse_loss(pred_mean, features_2d)
+            loss_val = float(q_loss.detach().float().item())
+            loss_sum += loss_val
+            cos_val = float(
+                F.cosine_similarity(pred_mean, features_2d, dim=-1, eps=1e-6)
+                .mean()
+                .detach()
+                .float()
+                .item()
+            )
+            cos_sum += cos_val
+            q_loss.backward()
+            self._mine_optimizer.step()
+            update_steps += 1
+            if show_bar:
+                warmup_iter.set_postfix(q_loss=f"{loss_val:.4f}", cos=f"{cos_val:.4f}")
+            if show_bar and self._club_warmup_log_every > 0 and update_steps % self._club_warmup_log_every == 0:
+                avg = loss_sum / max(update_steps, 1)
+                cos_avg = cos_sum / max(update_steps, 1)
+                self._log_rank0(
+                    "Club warmup step "
+                    f"{update_steps}/{self._club_warmup_steps}: "
+                    f"q_loss={loss_val:.6f} (avg={avg:.6f}), "
+                    f"cos={cos_val:.6f} (avg={cos_avg:.6f})"
+                )
+
+        self._mine_optimizer.zero_grad(set_to_none=True)
+        feature_fusion.set_mine_network_trainable(False)
+        if not was_training:
+            model.eval()
+        if show_bar:
+            if update_steps == 0:
+                self._log_rank0(
+                    "Club warmup done: 0 valid updates (missing aux features). "
+                    "Check decompose_* mode and that labels are present."
+                )
+            else:
+                avg = loss_sum / max(update_steps, 1)
+                cos_avg = cos_sum / max(update_steps, 1)
+                self._log_rank0(
+                    "Club warmup done: "
+                    f"{update_steps} updates, avg q_loss={avg:.6f}, avg cos={cos_avg:.6f}."
+                )
+        self._club_warmup_done = True
+
+    def _maybe_log_gate(self, model: torch.nn.Module) -> None:
+        if self._gate_log_every <= 0:
+            return
+        step = int(getattr(self.state, "global_step", 0)) + 1
+        if step % self._gate_log_every != 0:
+            return
+        show_bar = True
+        if dist.is_available() and dist.is_initialized():
+            show_bar = dist.get_rank() == 0
+        if not show_bar:
+            return
+        feature_fusion = self._get_feature_fusion_module(model)
+        if feature_fusion is None:
+            return
+        if not hasattr(feature_fusion, "alpha_unique"):
+            return
+        alpha_unique = float(feature_fusion.alpha_unique.detach().float().item())
+        self._log_rank0(f"Train step {step}: alpha_unique={alpha_unique:.6f}")
 
     def _get_output_field(self, outputs: Any, name: str):
         if outputs is None:
@@ -552,8 +754,10 @@ class VGTrainer(Trainer):
         return loss
 
     def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]], *args, **kwargs):
+        self._maybe_warmup_club_qnet(model)
         loss = super().training_step(model, inputs, *args, **kwargs)
         self._run_mine_updates(model)
+        self._maybe_log_gate(model)
         return loss
 
     def log(self, logs: Dict[str, float], *args, **kwargs) -> None:

@@ -2301,17 +2301,23 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
             if fusion_aux_losses is not None:
-                loss_align = fusion_aux_losses["loss_align"].to(loss.device, loss.dtype)
-                loss_ortho = fusion_aux_losses["loss_ortho"].to(loss.device, loss.dtype)
-                loss_recon = fusion_aux_losses["loss_recon"].to(loss.device, loss.dtype)
+                loss_align = fusion_aux_losses.get("loss_align")
+                if loss_align is not None:
+                    loss_align = loss_align.to(loss.device, loss.dtype)
+                loss_ortho = fusion_aux_losses.get("loss_ortho")
+                if loss_ortho is not None:
+                    loss_ortho = loss_ortho.to(loss.device, loss.dtype)
+                loss_recon = fusion_aux_losses.get("loss_recon")
+                if loss_recon is not None:
+                    loss_recon = loss_recon.to(loss.device, loss.dtype)
                 mine_unique_features = fusion_aux_losses.get("mine_unique_features")
                 mine_2d_features = fusion_aux_losses.get("mine_2d_features")
-                loss = (
-                    loss
-                    + getattr(self, "fusion_lambda_align", 1.0) * loss_align
-                    + getattr(self, "fusion_lambda_ortho", 1.0) * loss_ortho
-                    + getattr(self, "fusion_lambda_recon", 1.0) * loss_recon
-                )
+                if loss_ortho is not None:
+                    loss = loss + getattr(self, "fusion_lambda_ortho", 1.0) * loss_ortho
+                if loss_align is not None:
+                    loss = loss + getattr(self, "fusion_lambda_align", 1.0) * loss_align
+                if loss_recon is not None:
+                    loss = loss + getattr(self, "fusion_lambda_recon", 1.0) * loss_recon
 
         if not return_dict:
             output = (logits,) + outputs[1:]
