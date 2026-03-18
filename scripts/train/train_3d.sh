@@ -37,7 +37,7 @@ FUSION_LAMBDA_ORTHO=0.2
 FUSION_MINE_Q_WARMUP_STEPS=500            # q_net-only warmup updates per epoch when FUSION_ORTHO_MODE=mine
 USE_LEARNABLE_PREFIX=false
 LEARNABLE_PREFIX_LEN=10
-OUTPUT_DIR="3b-add-prefix222"                   # Directory for saving checkpoints
+OUTPUT_DIR="3b-decompose-add-club"                   # Directory for saving checkpoints
 CACHE_DIR="./cache"                        # [TrainingArguments] Cache directory for models
 mkdir -p $OUTPUT_DIR
 

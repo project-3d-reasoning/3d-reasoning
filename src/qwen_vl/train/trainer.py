@@ -398,6 +398,16 @@ class VGTrainer(Trainer):
         self._mine_update_steps: int = 5
         self._mine_warmup_done_epochs: Set[int] = set()
         self._aux_monitor_logs: Dict[str, float] = {}
+        # EMA for monitoring and dynamic lambda adjustment in ortho "mine" mode.
+        # We smooth loss_ce/loss_ortho and then set:
+        #   fusion_lambda_ortho * loss_ortho ~= target_ratio * loss_ce
+        self._loss_ce_ema: Optional[float] = None
+        self._loss_ortho_ema: Optional[float] = None
+        self._ema_decay: float = float(getattr(self.args, "fusion_loss_ema_decay", 0.98))
+        self._ortho_target_ratio: float = float(getattr(self.args, "fusion_ortho_target_ratio", 0.1))
+        self._ortho_lambda_max: float = float(getattr(self.args, "fusion_ortho_lambda_max", 0.2))
+        self._ortho_lambda_min: float = float(getattr(self.args, "fusion_ortho_lambda_min", 1e-8))
+        self._ema_eps: float = float(getattr(self.args, "fusion_ema_eps", 1e-12))
 
     def _unwrap_model(self, model: torch.nn.Module) -> torch.nn.Module:
         while hasattr(model, "module"):
@@ -442,11 +452,58 @@ class VGTrainer(Trainer):
         lambda_ortho = float(getattr(base_model, "fusion_lambda_ortho", 1.0))
         loss_ortho_weighted = lambda_ortho * loss_ortho
         loss_ce = loss - loss_ortho_weighted
+
+        # Convert to float scalars (possibly average across DDP ranks).
+        loss_ce_val = loss_ce.detach().float()
+        loss_ortho_val = loss_ortho.detach().float()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            world_size = torch.distributed.get_world_size()
+            # All-reduce scalars for consistent dynamic lambda across workers.
+            reduce_t = torch.stack([loss_ce_val, loss_ortho_val]).to(loss.device)
+            torch.distributed.all_reduce(reduce_t, op=torch.distributed.ReduceOp.SUM)
+            reduce_t = reduce_t / world_size
+            loss_ce_val = reduce_t[0]
+            loss_ortho_val = reduce_t[1]
+
+        loss_ce_val_f = float(loss_ce_val.item())
+        loss_ortho_val_f = float(loss_ortho_val.item())
+
+        # EMA update.
+        if self._loss_ce_ema is None:
+            self._loss_ce_ema = loss_ce_val_f
+            self._loss_ortho_ema = loss_ortho_val_f
+        else:
+            decay = max(min(self._ema_decay, 0.999999), 0.0)
+            self._loss_ce_ema = decay * self._loss_ce_ema + (1.0 - decay) * loss_ce_val_f
+            self._loss_ortho_ema = decay * self._loss_ortho_ema + (1.0 - decay) * loss_ortho_val_f
+
+        # Dynamic ortho lambda adjustment (after optional warmup).
+        lambda_new = lambda_ortho
+        warmup_enabled = bool(getattr(self.args, "fusion_lambda_warmup", False))
+        warmup_steps = int(getattr(self.args, "fusion_lambda_warmup_steps", 0) or 0)
+        # Only adjust lambda after warmup has completed.
+        should_adjust = not warmup_enabled or (self.state.global_step >= warmup_steps)
+        if should_adjust and self._loss_ortho_ema is not None:
+            lambda_target = self._ortho_target_ratio * self._loss_ce_ema / (self._loss_ortho_ema + self._ema_eps)
+            lambda_new = max(self._ortho_lambda_min, min(self._ortho_lambda_max, float(lambda_target)))
+            # Update on the base model for subsequent forward/loss computation.
+            setattr(base_model, "fusion_lambda_ortho", lambda_new)
+
+        # For logging: report EMA-smoothed values, and use the *updated* lambda_new for the weighted term.
+        loss_ce_ema = float(self._loss_ce_ema)
+        loss_ortho_ema = float(self._loss_ortho_ema)
+        loss_ortho_weighted_ema = float(lambda_new) * loss_ortho_ema
+
         self._aux_monitor_logs = {
-            "loss_ce": float(loss_ce.detach().float().item()),
-            "loss_ce_est": float(loss_ce.detach().float().item()),
-            "loss_ortho": float(loss_ortho.detach().float().item()),
-            "loss_ortho_weighted": float(loss_ortho_weighted.detach().float().item()),
+            # EMA-smoothed outputs for monitoring.
+            "loss_ce": loss_ce_ema,
+            "loss_ce_est": loss_ce_ema,
+            "loss_ortho": loss_ortho_ema,
+            "loss_ortho_weighted": loss_ortho_weighted_ema,
+            # Raw values for debugging (optional).
+            "loss_ce_raw": loss_ce_val_f,
+            "loss_ortho_raw": loss_ortho_val_f,
+            "fusion_lambda_ortho_dyn": float(lambda_new),
         }
 
     def _cache_mine_features(self, outputs: Any) -> None:
