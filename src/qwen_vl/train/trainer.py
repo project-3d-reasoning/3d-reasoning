@@ -408,20 +408,6 @@ class VGTrainer(Trainer):
         unwrapped = self._unwrap_model(model)
         return getattr(unwrapped, "feature_fusion", None)
 
-    def _get_unique_alpha(self, model: torch.nn.Module) -> Optional[float]:
-        feature_fusion = self._get_feature_fusion_module(model)
-        if feature_fusion is None:
-            return None
-        alpha = getattr(feature_fusion, "unique_alpha", None)
-        if alpha is None:
-            return None
-        if isinstance(alpha, torch.Tensor):
-            return float(alpha.detach().float().cpu().item())
-        try:
-            return float(alpha)
-        except (TypeError, ValueError):
-            return None
-
     def _is_mine_mode(self, feature_fusion) -> bool:
         return (
             feature_fusion is not None
@@ -672,10 +658,6 @@ class VGTrainer(Trainer):
         if self._aux_monitor_logs:
             logs = dict(logs)
             logs.update(self._aux_monitor_logs)
-        unique_alpha = self._get_unique_alpha(self.model)
-        if unique_alpha is not None:
-            logs = dict(logs)
-            logs["unique_alpha"] = unique_alpha
         super().log(logs, *args, **kwargs)
 
 

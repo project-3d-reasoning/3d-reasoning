@@ -239,13 +239,13 @@ class FeatureFusionModule(nn.Module):
             self.weight_3d = nn.Parameter(torch.tensor(0.5))
 
         elif self.config.fusion_method in {"decompose_add", "decompose_concat"}:
-            # Learnable scalar gate for the unique 3D component.
-            self.unique_alpha = nn.Parameter(torch.tensor(1.0))
             if self.ortho_mode == "mine":
                 mine_hidden = self.config.mine_hidden_size or self.hidden_size
                 self.mine_statistics_network = nn.Sequential(
                     nn.LayerNorm(self.hidden_size),
                     nn.Linear(self.hidden_size, mine_hidden),
+                    nn.GELU(),
+                    nn.Linear(mine_hidden, self.hidden_size),
                     nn.GELU(),
                     nn.Linear(mine_hidden, self.hidden_size),
                 )
@@ -379,8 +379,6 @@ class FeatureFusionModule(nn.Module):
 
         elif self.fusion_method in {"decompose_add", "decompose_concat"}:
             unique_3d = features_3d - features_2d
-            alpha = self.unique_alpha.to(unique_3d.dtype)
-            unique_3d = unique_3d * alpha
 
             if self.fusion_method == "decompose_concat":
                 fused = self.decompose_projection(torch.cat([features_2d, unique_3d], dim=-1))
