@@ -32,9 +32,13 @@ TUNE_MM_VISION=False
 TUNE_MM_VISION_LORA=False
 TUNE_GEOMETRY_ENCODER=False
 TUNE_GEOMETRY_ENCODER_LORA=False
-FEATURE_FUSION_METHOD="decompose_add"      # choices: add/concat/cross_attention/gated/weighted/decompose_add/decompose_concat
+FEATURE_FUSION_METHOD="decompose_add"      # choices: add/concat/cross_attention/gated/weighted/decompose_add/decompose_concat/nrsr_add/nrsr_concat
 FUSION_ORTHO_MODE="cosine"                 # choices: cosine/mine
 FUSION_LAMBDA_ORTHO=1.0
+FUSION_LAMBDA_NRSR=1.0
+FUSION_LAMBDA_NRSR_DYNAMIC=True
+FUSION_LAMBDA_NRSR_STAGE2_RATIO=0.10
+FUSION_LAMBDA_NRSR_STAGE3_RATIO=0.03
 FUSION_LAMBDA_WARMUP=True
 FUSION_LAMBDA_WARMUP_STEPS=100
 FUSION_MINE_Q_WARMUP_STEPS=500            # q_net-only warmup updates per epoch when FUSION_ORTHO_MODE=mine
@@ -111,6 +115,10 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --feature_fusion_method $FEATURE_FUSION_METHOD \
             --fusion_ortho_mode $FUSION_ORTHO_MODE \
             --fusion_lambda_ortho $FUSION_LAMBDA_ORTHO \
+            --fusion_lambda_nrsr $FUSION_LAMBDA_NRSR \
+            --fusion_lambda_nrsr_dynamic $FUSION_LAMBDA_NRSR_DYNAMIC \
+            --fusion_lambda_nrsr_stage2_ratio $FUSION_LAMBDA_NRSR_STAGE2_RATIO \
+            --fusion_lambda_nrsr_stage3_ratio $FUSION_LAMBDA_NRSR_STAGE3_RATIO \
             --fusion_lambda_warmup $FUSION_LAMBDA_WARMUP \
             --fusion_lambda_warmup_steps $FUSION_LAMBDA_WARMUP_STEPS \
             --fusion_mine_q_warmup_steps $FUSION_MINE_Q_WARMUP_STEPS \

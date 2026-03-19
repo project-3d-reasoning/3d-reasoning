@@ -20,13 +20,18 @@ class ModelArguments:
     geometry_encoder_type: str = field(default="vggt")  # Type of geometry encoder ("vggt", "pi3")
     geometry_encoder_path: str = field(default="facebook/VGGT-1B/")  # Path to pre-trained geometry encoder model
     reference_frame: str = field(default="first")  # Reference frame for geometry encoding ("first", "last"), only available for vggt
-    feature_fusion_method: str = field(default="add")  # Method to fuse geometry and visual features ("add", "concat", "cross_attention", "gated", "decompose_add", "decompose_concat")
+    feature_fusion_method: str = field(default="add")  # Method to fuse geometry and visual features ("add", "concat", "cross_attention", "gated", "decompose_add", "decompose_concat", "nrsr_add", "nrsr_concat")
     fusion_num_layers: int = field(default=1)  # Number of layers in the cross-attention module when feature_fusion_method is "cross_attention"
     geometry_merger_type: str = field(default="mlp")  # Type of geometry feature merger ("mlp", "avg")
     decompose_hidden_size: Optional[int] = field(default=None)  # Hidden size for shared/unique 3D decomposition MLPs
+    nrsr_hidden_size: Optional[int] = field(default=None)  # Hidden size for NRSR VIB MLP
     fusion_align_mode: str = field(default="cosine")  # Alignment loss mode ("cosine", "infonce")
     fusion_ortho_mode: str = field(default="cosine")  # Orthogonality mode ("cosine", "mine")
     fusion_lambda_ortho: float = field(default=1.0)  # Weight for orthogonality loss
+    fusion_lambda_nrsr: float = field(default=1.0)  # Weight for NRSR KL loss
+    fusion_lambda_nrsr_dynamic: bool = field(default=True)  # Enable 3-stage dynamic schedule for NRSR lambda
+    fusion_lambda_nrsr_stage2_ratio: float = field(default=0.10)  # Forced weighted-KL ratio in stage 2
+    fusion_lambda_nrsr_stage3_ratio: float = field(default=0.03)  # Forced weighted-KL ratio in stage 3
     fusion_lambda_warmup: bool = field(default=False)  # Enable ortho lambda warmup for decompose fusion methods
     fusion_lambda_warmup_steps: int = field(default=100)  # Warmup steps for ortho lambda when enabled
     fusion_mine_q_warmup_steps: int = field(default=500)  # q_theta-only warmup updates at each epoch start when ortho mode is "mine"

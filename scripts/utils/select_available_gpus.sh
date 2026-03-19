@@ -53,8 +53,11 @@ select_available_gpus() {
         {
             gsub(/ /, "", $1); gsub(/ /, "", $2); gsub(/ /, "", $3); gsub(/ /, "", $4);
             idx=$1; used=$2; free=$3; util=$4;
-            if (used <= max_mem && util <= max_util) {
-                print idx "," used "," free "," util;
+            # Force numeric comparison. Some drivers may report N/A; in awk, (value + 0)
+            # safely coerces non-numeric strings to 0 instead of doing lexicographic compare.
+            used_num=(used + 0); free_num=(free + 0); util_num=(util + 0);
+            if (used_num <= max_mem && util_num <= max_util) {
+                print idx "," used_num "," free_num "," util_num;
             }
         }
     ' | sort -t',' -k2,2n -k4,4n -k3,3nr)
@@ -76,7 +79,7 @@ select_available_gpus() {
         all_candidates=$(echo "$gpu_stats" | awk -F',' '
             {
                 gsub(/ /, "", $1); gsub(/ /, "", $2); gsub(/ /, "", $3); gsub(/ /, "", $4);
-                print $1 "," $2 "," $3 "," $4;
+                print $1 "," ($2 + 0) "," ($3 + 0) "," ($4 + 0);
             }
         ' | sort -t',' -k3,3nr -k4,4n -k2,2n)
 
@@ -93,6 +96,7 @@ select_available_gpus() {
 
     if [ "${#selected[@]}" -lt "$requested" ]; then
         echo "[GPU-SELECT] Requested $requested idle GPUs, but only ${#selected[@]} matched thresholds (used<=${max_used_mem}MB, util<=${max_util}%)." >&2
+        echo "[GPU-SELECT] Raw stats: $gpu_stats" >&2
         if [ "$allow_backfill" != "1" ]; then
             echo "[GPU-SELECT] Set GPU_ALLOW_BACKFILL=1 to allow non-idle fallback by free memory." >&2
         fi

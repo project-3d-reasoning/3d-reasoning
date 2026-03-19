@@ -10,12 +10,13 @@ from dataclasses import dataclass
 @dataclass
 class FeatureFusionConfig:
     """Configuration for feature fusion."""
-    fusion_method: str = "add"  # "add", "concat", "gated", "weighted", "cross_attention", "decompose_add", "decompose_concat"
+    fusion_method: str = "add"  # "add", "concat", "gated", "weighted", "cross_attention", "decompose_add", "decompose_concat", "nrsr_add", "nrsr_concat"
     hidden_size: int = 3584
     num_heads: int = 8
     dropout: float = 0.1
     num_layers: int = 1
     decompose_hidden_size: Optional[int] = None
+    nrsr_hidden_size: Optional[int] = None
     align_mode: str = "cosine"  # "cosine"(default) or "infonce"
     align_temperature: float = 0.07
     ortho_mode: str = "cosine"  # "cosine"(default) or "mine" (mine mode uses vCLUB)
@@ -164,7 +165,8 @@ class FeatureFusionModule(nn.Module):
     def __init__(self, config: FeatureFusionConfig):
         super().__init__()
         self.config = config
-        self.fusion_method = config.fusion_method
+        self.fusion_method = str(config.fusion_method).lower()
+        self.config.fusion_method = self.fusion_method
         self.hidden_size = config.hidden_size
         self.align_mode = config.align_mode.lower()
         if self.align_mode == "cos":
@@ -211,12 +213,12 @@ class FeatureFusionModule(nn.Module):
     
     def _build_fusion_layers(self):
         """Build fusion layers based on method."""
-        if self.config.fusion_method == "concat":
+        if self.fusion_method == "concat":
             self.norm1 = nn.LayerNorm(self.hidden_size)
             self.norm2 = nn.LayerNorm(self.hidden_size)
             self.projection = nn.Linear(self.hidden_size * 2, self.hidden_size)
             
-        elif self.config.fusion_method == "cross_attention":
+        elif self.fusion_method == "cross_attention":
             self.cross_attn_blocks = nn.ModuleList([
                 CrossAttentionBlock(
                     self.hidden_size, 
@@ -226,7 +228,7 @@ class FeatureFusionModule(nn.Module):
                 for _ in range(self.config.num_layers)
             ])
 
-        elif self.config.fusion_method == "gated":
+        elif self.fusion_method == "gated":
             self.norm1 = nn.LayerNorm(self.hidden_size)
             self.norm2 = nn.LayerNorm(self.hidden_size)
             self.gate_projection = nn.Sequential(
@@ -234,11 +236,11 @@ class FeatureFusionModule(nn.Module):
                 nn.Sigmoid()
             )
             
-        elif self.config.fusion_method == "weighted":
+        elif self.fusion_method == "weighted":
             self.weight_2d = nn.Parameter(torch.tensor(0.5))
             self.weight_3d = nn.Parameter(torch.tensor(0.5))
 
-        elif self.config.fusion_method in {"decompose_add", "decompose_concat"}:
+        elif self.fusion_method in {"decompose_add", "decompose_concat"}:
             if self.ortho_mode == "mine":
                 mine_hidden = self.config.mine_hidden_size or self.hidden_size
                 self.mine_statistics_network = nn.Sequential(
@@ -251,8 +253,18 @@ class FeatureFusionModule(nn.Module):
                 )
                 # Keep q_theta out of the main optimizer; we train it in a dedicated step.
                 self.set_mine_network_trainable(False)
-            if self.config.fusion_method == "decompose_concat":
+            if self.fusion_method == "decompose_concat":
                 self.decompose_projection = nn.Linear(self.hidden_size * 2, self.hidden_size)
+        elif self.fusion_method in {"nrsr_add", "nrsr_concat"}:
+            nrsr_hidden = self.config.nrsr_hidden_size or self.hidden_size
+            self.nrsr_encoder = nn.Sequential(
+                nn.LayerNorm(self.hidden_size),
+                nn.Linear(self.hidden_size, nrsr_hidden),
+                nn.GELU(),
+                nn.Linear(nrsr_hidden, self.hidden_size * 2),
+            )
+            if self.fusion_method == "nrsr_concat":
+                self.nrsr_projection = nn.Linear(self.hidden_size * 2, self.hidden_size)
 
     def set_mine_network_trainable(self, trainable: bool) -> None:
         if self.ortho_mode != "mine" or not hasattr(self, "mine_statistics_network"):
@@ -376,6 +388,34 @@ class FeatureFusionModule(nn.Module):
             norm_weight_2d = self.weight_2d / weight_sum
             norm_weight_3d = self.weight_3d / weight_sum
             return norm_weight_2d * features_2d + norm_weight_3d * features_3d
+
+        elif self.fusion_method in {"nrsr_add", "nrsr_concat"}:
+            stats = self.nrsr_encoder(features_3d)
+            mu, log_var = torch.chunk(stats, 2, dim=-1)
+
+            if self.training:
+                std = torch.exp(0.5 * log_var)
+                eps = torch.randn_like(std)
+                unique_3d = mu + eps * std
+            else:
+                unique_3d = mu
+
+            if self.fusion_method == "nrsr_concat":
+                fused = self.nrsr_projection(torch.cat([features_2d, unique_3d], dim=-1))
+            else:
+                fused = features_2d + unique_3d
+
+            if not return_aux_losses:
+                return fused
+
+            mu_f = mu.float()
+            log_var_f = log_var.float()
+            kl_term = 1.0 + log_var_f - mu_f.pow(2) - log_var_f.exp()
+            kl_loss = (-0.5 * kl_term.sum(dim=-1)).mean()
+            aux_losses = {
+                "loss_nrsr_kl": kl_loss,
+            }
+            return fused, aux_losses
 
         elif self.fusion_method in {"decompose_add", "decompose_concat"}:
             unique_3d = features_3d - features_2d

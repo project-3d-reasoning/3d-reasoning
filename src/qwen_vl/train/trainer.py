@@ -390,6 +390,8 @@ def create_optimizer(self):
 
 class VGTrainer(Trainer):
     """Trainer with optional extra q_theta updates for vCLUB in ortho mine mode."""
+    NRSR_STAGE1_END = 0.1
+    NRSR_STAGE2_END = 0.5
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -408,6 +410,9 @@ class VGTrainer(Trainer):
         self._ortho_lambda_max: float = float(getattr(self.args, "fusion_ortho_lambda_max", 0.2))
         self._ortho_lambda_min: float = float(getattr(self.args, "fusion_ortho_lambda_min", 1e-8))
         self._ema_eps: float = float(getattr(self.args, "fusion_ema_eps", 1e-12))
+        self._nrsr_stage2_ratio: float = float(getattr(self.args, "fusion_lambda_nrsr_stage2_ratio", 0.10))
+        self._nrsr_stage3_ratio: float = float(getattr(self.args, "fusion_lambda_nrsr_stage3_ratio", 0.03))
+        self._nrsr_ratio_eps: float = float(getattr(self.args, "fusion_nrsr_ratio_eps", 1e-12))
 
     def _unwrap_model(self, model: torch.nn.Module) -> torch.nn.Module:
         while hasattr(model, "module"):
@@ -432,13 +437,92 @@ class VGTrainer(Trainer):
             return outputs.get(name)
         return getattr(outputs, name, None)
 
+    def _training_progress(self) -> float:
+        max_steps = int(getattr(self.state, "max_steps", 0) or 0)
+        if max_steps > 0:
+            return float(max(0.0, min(1.0, self.state.global_step / float(max_steps))))
+
+        epoch = getattr(self.state, "epoch", None)
+        num_train_epochs = getattr(self.args, "num_train_epochs", None)
+        if epoch is not None and num_train_epochs is not None and float(num_train_epochs) > 0:
+            return float(max(0.0, min(1.0, float(epoch) / float(num_train_epochs))))
+        return 0.0
+
+    def _is_nrsr_dynamic_enabled(self, model: torch.nn.Module) -> bool:
+        if not bool(getattr(self.args, "fusion_lambda_nrsr_dynamic", False)):
+            return False
+        base_model = self._unwrap_model(model)
+        fusion_method = str(
+            getattr(getattr(base_model, "config", None), "feature_fusion_method", "add")
+        ).lower()
+        return fusion_method in {"nrsr_add", "nrsr_concat"}
+
+    def _nrsr_target_ratio_from_progress(self, progress: float) -> float:
+        if progress < self.NRSR_STAGE1_END:
+            return 0.0
+        if progress < self.NRSR_STAGE2_END:
+            return max(0.0, float(self._nrsr_stage2_ratio))
+        return max(0.0, float(self._nrsr_stage3_ratio))
+
+    def _apply_nrsr_ratio_constraint(
+        self, model: torch.nn.Module, loss: torch.Tensor, outputs: Any
+    ) -> torch.Tensor:
+        if outputs is None or loss is None or not model.training:
+            return loss
+        if not self._is_nrsr_dynamic_enabled(model):
+            return loss
+
+        loss_nrsr_kl = self._get_output_field(outputs, "loss_nrsr_kl")
+        if loss_nrsr_kl is None:
+            return loss
+        loss_nrsr_kl = loss_nrsr_kl.to(loss.device, loss.dtype)
+
+        loss_ortho = self._get_output_field(outputs, "loss_ortho")
+        if loss_ortho is not None:
+            loss_ortho = loss_ortho.to(loss.device, loss.dtype)
+
+        base_model = self._unwrap_model(model)
+        lambda_ortho = float(getattr(base_model, "fusion_lambda_ortho", 1.0))
+        lambda_nrsr_prev = float(getattr(base_model, "fusion_lambda_nrsr", 1.0))
+
+        loss_ce = loss - (lambda_nrsr_prev * loss_nrsr_kl)
+        if loss_ortho is not None:
+            loss_ce = loss_ce - (lambda_ortho * loss_ortho)
+
+        # Use globally averaged CE/KL (under DDP) so every rank shares the same lambda.
+        scalars = torch.stack([loss_ce.detach().float(), loss_nrsr_kl.detach().float()]).to(loss.device)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            world_size = torch.distributed.get_world_size()
+            torch.distributed.all_reduce(scalars, op=torch.distributed.ReduceOp.SUM)
+            scalars = scalars / world_size
+
+        loss_ce_scalar = float(scalars[0].item())
+        loss_nrsr_scalar = float(scalars[1].item())
+
+        progress = self._training_progress()
+        target_ratio = self._nrsr_target_ratio_from_progress(progress)
+        if target_ratio <= 0.0 or loss_nrsr_scalar <= 0.0:
+            lambda_nrsr_new = 0.0
+        else:
+            lambda_nrsr_new = target_ratio * max(loss_ce_scalar, 0.0) / (loss_nrsr_scalar + self._nrsr_ratio_eps)
+            if not (lambda_nrsr_new >= 0.0):
+                lambda_nrsr_new = 0.0
+
+        setattr(base_model, "fusion_lambda_nrsr", float(lambda_nrsr_new))
+
+        loss_new = loss_ce + (float(lambda_nrsr_new) * loss_nrsr_kl)
+        if loss_ortho is not None:
+            loss_new = loss_new + (lambda_ortho * loss_ortho)
+        return loss_new
+
     def _update_aux_monitor_logs(self, model: torch.nn.Module, loss: torch.Tensor, outputs: Any) -> None:
         self._aux_monitor_logs = {}
         if outputs is None or loss is None:
             return
 
         loss_ortho = self._get_output_field(outputs, "loss_ortho")
-        if loss_ortho is None:
+        loss_nrsr_kl = self._get_output_field(outputs, "loss_nrsr_kl")
+        if loss_ortho is None and loss_nrsr_kl is None:
             loss_ce = loss.detach().float()
             self._aux_monitor_logs = {
                 "loss_ce": float(loss_ce.item()),
@@ -446,65 +530,112 @@ class VGTrainer(Trainer):
             }
             return
 
-        loss_ortho = loss_ortho.to(loss.device, loss.dtype)
-
         base_model = self._unwrap_model(model)
-        lambda_ortho = float(getattr(base_model, "fusion_lambda_ortho", 1.0))
-        loss_ortho_weighted = lambda_ortho * loss_ortho
-        loss_ce = loss - loss_ortho_weighted
+        loss_ce = loss
+        lambda_ortho = None
+        lambda_nrsr = None
+
+        if loss_ortho is not None:
+            loss_ortho = loss_ortho.to(loss.device, loss.dtype)
+            lambda_ortho = float(getattr(base_model, "fusion_lambda_ortho", 1.0))
+            loss_ce = loss_ce - (lambda_ortho * loss_ortho)
+
+        if loss_nrsr_kl is not None:
+            loss_nrsr_kl = loss_nrsr_kl.to(loss.device, loss.dtype)
+            lambda_nrsr = float(getattr(base_model, "fusion_lambda_nrsr", 1.0))
+            loss_ce = loss_ce - (lambda_nrsr * loss_nrsr_kl)
 
         # Convert to float scalars (possibly average across DDP ranks).
         loss_ce_val = loss_ce.detach().float()
-        loss_ortho_val = loss_ortho.detach().float()
+        values = [loss_ce_val]
+        if loss_ortho is not None:
+            values.append(loss_ortho.detach().float())
+        if loss_nrsr_kl is not None:
+            values.append(loss_nrsr_kl.detach().float())
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             world_size = torch.distributed.get_world_size()
             # All-reduce scalars for consistent dynamic lambda across workers.
-            reduce_t = torch.stack([loss_ce_val, loss_ortho_val]).to(loss.device)
+            reduce_t = torch.stack(values).to(loss.device)
             torch.distributed.all_reduce(reduce_t, op=torch.distributed.ReduceOp.SUM)
             reduce_t = reduce_t / world_size
-            loss_ce_val = reduce_t[0]
-            loss_ortho_val = reduce_t[1]
+            values = [reduce_t[i] for i in range(reduce_t.shape[0])]
 
-        loss_ce_val_f = float(loss_ce_val.item())
-        loss_ortho_val_f = float(loss_ortho_val.item())
+        loss_ce_val_f = float(values[0].item())
+        idx = 1
+        loss_ortho_val_f = None
+        loss_nrsr_val_f = None
+        if loss_ortho is not None:
+            loss_ortho_val_f = float(values[idx].item())
+            idx += 1
+        if loss_nrsr_kl is not None:
+            loss_nrsr_val_f = float(values[idx].item())
 
         # EMA update.
-        if self._loss_ce_ema is None:
-            self._loss_ce_ema = loss_ce_val_f
-            self._loss_ortho_ema = loss_ortho_val_f
+        aux_logs: Dict[str, float] = {}
+        if loss_ortho is not None:
+            if self._loss_ce_ema is None:
+                self._loss_ce_ema = loss_ce_val_f
+                self._loss_ortho_ema = loss_ortho_val_f
+            else:
+                decay = max(min(self._ema_decay, 0.999999), 0.0)
+                self._loss_ce_ema = decay * self._loss_ce_ema + (1.0 - decay) * loss_ce_val_f
+                self._loss_ortho_ema = decay * self._loss_ortho_ema + (1.0 - decay) * loss_ortho_val_f
+
+            # Dynamic ortho lambda adjustment (after optional warmup).
+            lambda_new = lambda_ortho
+            warmup_enabled = bool(getattr(self.args, "fusion_lambda_warmup", False))
+            warmup_steps = int(getattr(self.args, "fusion_lambda_warmup_steps", 0) or 0)
+            # Only adjust lambda after warmup has completed.
+            should_adjust = not warmup_enabled or (self.state.global_step >= warmup_steps)
+            if should_adjust and self._loss_ortho_ema is not None:
+                lambda_target = self._ortho_target_ratio * self._loss_ce_ema / (self._loss_ortho_ema + self._ema_eps)
+                lambda_new = max(self._ortho_lambda_min, min(self._ortho_lambda_max, float(lambda_target)))
+                # Update on the base model for subsequent forward/loss computation.
+                setattr(base_model, "fusion_lambda_ortho", lambda_new)
+
+            # For logging: report EMA-smoothed values, and use the *updated* lambda_new for the weighted term.
+            loss_ce_ema = float(self._loss_ce_ema)
+            loss_ortho_ema = float(self._loss_ortho_ema)
+            loss_ortho_weighted_ema = float(lambda_new) * loss_ortho_ema
+
+            aux_logs.update(
+                {
+                    # EMA-smoothed outputs for monitoring.
+                    "loss_ce": loss_ce_ema,
+                    "loss_ce_est": loss_ce_ema,
+                    "loss_ortho": loss_ortho_ema,
+                    "loss_ortho_weighted": loss_ortho_weighted_ema,
+                    # Raw values for debugging (optional).
+                    "loss_ce_raw": loss_ce_val_f,
+                    "loss_ortho_raw": loss_ortho_val_f,
+                    "fusion_lambda_ortho_dyn": float(lambda_new),
+                }
+            )
         else:
-            decay = max(min(self._ema_decay, 0.999999), 0.0)
-            self._loss_ce_ema = decay * self._loss_ce_ema + (1.0 - decay) * loss_ce_val_f
-            self._loss_ortho_ema = decay * self._loss_ortho_ema + (1.0 - decay) * loss_ortho_val_f
+            aux_logs.update(
+                {
+                    "loss_ce": loss_ce_val_f,
+                    "loss_ce_est": loss_ce_val_f,
+                }
+            )
 
-        # Dynamic ortho lambda adjustment (after optional warmup).
-        lambda_new = lambda_ortho
-        warmup_enabled = bool(getattr(self.args, "fusion_lambda_warmup", False))
-        warmup_steps = int(getattr(self.args, "fusion_lambda_warmup_steps", 0) or 0)
-        # Only adjust lambda after warmup has completed.
-        should_adjust = not warmup_enabled or (self.state.global_step >= warmup_steps)
-        if should_adjust and self._loss_ortho_ema is not None:
-            lambda_target = self._ortho_target_ratio * self._loss_ce_ema / (self._loss_ortho_ema + self._ema_eps)
-            lambda_new = max(self._ortho_lambda_min, min(self._ortho_lambda_max, float(lambda_target)))
-            # Update on the base model for subsequent forward/loss computation.
-            setattr(base_model, "fusion_lambda_ortho", lambda_new)
+        if loss_nrsr_kl is not None:
+            loss_nrsr_weighted = float(lambda_nrsr) * float(loss_nrsr_val_f)
+            nrsr_ratio = loss_nrsr_weighted / (loss_ce_val_f + self._ema_eps)
+            nrsr_progress = self._training_progress()
+            nrsr_ratio_target = self._nrsr_target_ratio_from_progress(nrsr_progress)
+            aux_logs.update(
+                {
+                    "loss_nrsr_kl": float(loss_nrsr_val_f),
+                    "loss_nrsr_kl_weighted": loss_nrsr_weighted,
+                    "fusion_lambda_nrsr_dyn": float(lambda_nrsr),
+                    "loss_nrsr_ratio": float(nrsr_ratio),
+                    "loss_nrsr_ratio_target": float(nrsr_ratio_target),
+                    "nrsr_progress": float(nrsr_progress),
+                }
+            )
 
-        # For logging: report EMA-smoothed values, and use the *updated* lambda_new for the weighted term.
-        loss_ce_ema = float(self._loss_ce_ema)
-        loss_ortho_ema = float(self._loss_ortho_ema)
-        loss_ortho_weighted_ema = float(lambda_new) * loss_ortho_ema
-
-        self._aux_monitor_logs = {
-            # EMA-smoothed outputs for monitoring.
-            "loss_ce": loss_ce_ema,
-            "loss_ce_est": loss_ce_ema,
-            "loss_ortho": loss_ortho_ema,
-            "loss_ortho_weighted": loss_ortho_weighted_ema,
-            # Raw values for debugging (optional).
-            "loss_ce_raw": loss_ce_val_f,
-            "loss_ortho_raw": loss_ortho_val_f,
-            "fusion_lambda_ortho_dyn": float(lambda_new),
-        }
+        self._aux_monitor_logs = aux_logs
 
     def _cache_mine_features(self, outputs: Any) -> None:
         unique_features = self._get_output_field(outputs, "mine_unique_features")
@@ -694,6 +825,7 @@ class VGTrainer(Trainer):
         else:
             loss, outputs = loss_outputs, None
 
+        loss = self._apply_nrsr_ratio_constraint(model, loss, outputs)
         self._update_aux_monitor_logs(model, loss, outputs)
 
         if should_cache_mine:

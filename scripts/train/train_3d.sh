@@ -31,13 +31,17 @@ TUNE_MM_VISION=False
 TUNE_MM_VISION_LORA=False
 TUNE_GEOMETRY_ENCODER=False
 TUNE_GEOMETRY_ENCODER_LORA=False
-FEATURE_FUSION_METHOD="decompose_add"      # choices: add/concat/cross_attention/gated/weighted/decompose_add/decompose_concat
+FEATURE_FUSION_METHOD="decompose_add"      # choices: add/concat/cross_attention/gated/weighted/decompose_add/decompose_concat/nrsr_add/nrsr_concat
 FUSION_ORTHO_MODE="mine"                 # choices: cosine/mine
-FUSION_LAMBDA_ORTHO=0.2
+FUSION_LAMBDA_ORTHO=0.05
+FUSION_LAMBDA_NRSR=1.0
+FUSION_LAMBDA_NRSR_DYNAMIC=True
+FUSION_LAMBDA_NRSR_STAGE2_RATIO=0.05
+FUSION_LAMBDA_NRSR_STAGE3_RATIO=0.02
 FUSION_MINE_Q_WARMUP_STEPS=500            # q_net-only warmup updates per epoch when FUSION_ORTHO_MODE=mine
 USE_LEARNABLE_PREFIX=false
 LEARNABLE_PREFIX_LEN=10
-OUTPUT_DIR="3b-decompose-add-club"                   # Directory for saving checkpoints
+OUTPUT_DIR="3b-nsrs"                   # Directory for saving checkpoints
 CACHE_DIR="./cache"                        # [TrainingArguments] Cache directory for models
 mkdir -p $OUTPUT_DIR
 
@@ -109,6 +113,10 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --feature_fusion_method $FEATURE_FUSION_METHOD \
             --fusion_ortho_mode $FUSION_ORTHO_MODE \
             --fusion_lambda_ortho $FUSION_LAMBDA_ORTHO \
+            --fusion_lambda_nrsr $FUSION_LAMBDA_NRSR \
+            --fusion_lambda_nrsr_dynamic $FUSION_LAMBDA_NRSR_DYNAMIC \
+            --fusion_lambda_nrsr_stage2_ratio $FUSION_LAMBDA_NRSR_STAGE2_RATIO \
+            --fusion_lambda_nrsr_stage3_ratio $FUSION_LAMBDA_NRSR_STAGE3_RATIO \
             --fusion_mine_q_warmup_steps $FUSION_MINE_Q_WARMUP_STEPS \
             --use_learnable_prefix $USE_LEARNABLE_PREFIX \
             --learnable_prefix_len $LEARNABLE_PREFIX_LEN \

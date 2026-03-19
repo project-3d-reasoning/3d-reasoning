@@ -205,6 +205,7 @@ class FusionLambdaWarmupCallback(transformers.TrainerCallback):
             return
         model = _unwrap_model(model)
         fusion_method = getattr(getattr(model, "config", None), "feature_fusion_method", None)
+        fusion_method = str(fusion_method).lower() if fusion_method is not None else None
         if fusion_method not in {"decompose_add", "decompose_concat"}:
             if self.enabled:
                 rank0_print(
@@ -240,6 +241,90 @@ class FusionLambdaWarmupCallback(transformers.TrainerCallback):
             return
         model = _unwrap_model(model)
         self._apply_factor(model, 1.0)
+
+
+class FusionLambdaNRSRCallback(transformers.TrainerCallback):
+    """
+    Three-stage schedule for fusion_lambda_nrsr:
+    - Stage 1 [0, stage1_end): lambda = 0
+    - Stage 2/3 lambda baseline is controlled by trainer-side ratio constraints
+      when fusion_lambda_nrsr_dynamic is enabled.
+    """
+
+    STAGE1_END = 0.1
+    STAGE2_END = 0.5
+
+    def __init__(self, enabled: bool):
+        self.enabled = bool(enabled)
+        self.active = False
+        self.target_lambda: float = 0.0
+        self.current_lambda: float = 0.0
+
+    def _training_progress(self, state) -> float:
+        if state.max_steps is not None and state.max_steps > 0:
+            return float(max(0.0, min(1.0, state.global_step / float(state.max_steps))))
+        if state.epoch is not None and state.num_train_epochs is not None and state.num_train_epochs > 0:
+            return float(max(0.0, min(1.0, float(state.epoch) / float(state.num_train_epochs))))
+        return 0.0
+
+    def _scale_from_progress(self, progress: float) -> float:
+        if progress < self.STAGE1_END:
+            return 0.0
+        if progress < self.STAGE2_END:
+            ramp = max(self.STAGE2_END - self.STAGE1_END, 1e-12)
+            return float((progress - self.STAGE1_END) / ramp)
+        return 1.0
+
+    def _apply(self, model: torch.nn.Module, state) -> None:
+        progress = self._training_progress(state)
+        scale = self._scale_from_progress(progress)
+        self.current_lambda = self.target_lambda * scale
+        setattr(model, "fusion_lambda_nrsr", self.current_lambda)
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        if model is None:
+            return
+        model = _unwrap_model(model)
+        fusion_method = getattr(getattr(model, "config", None), "feature_fusion_method", None)
+        fusion_method = str(fusion_method).lower() if fusion_method is not None else None
+        if fusion_method not in {"nrsr_add", "nrsr_concat"}:
+            if self.enabled:
+                rank0_print(
+                    f"[FusionLambdaNRSR] Skip: fusion_method={fusion_method} (only nrsr_* supported)."
+                )
+            return
+        if not self.enabled:
+            return
+        if not hasattr(model, "fusion_lambda_nrsr"):
+            rank0_print("[FusionLambdaNRSR] Skip: fusion_lambda_nrsr is not found on model.")
+            return
+
+        self.target_lambda = float(model.fusion_lambda_nrsr)
+        self.active = True
+        self._apply(model, state)
+        rank0_print(
+            "[FusionLambdaNRSR] Enabled with "
+            f"target={self.target_lambda}, stage1_end={self.STAGE1_END}, "
+            f"stage2_end={self.STAGE2_END}, init_lambda={self.current_lambda:.6f}"
+        )
+
+    def on_step_begin(self, args, state, control, model=None, **kwargs):
+        if not self.active or model is None:
+            return
+        model = _unwrap_model(model)
+        self._apply(model, state)
+
+    def on_log(self, args, state, control, logs=None, model=None, **kwargs):
+        if not self.active or logs is None:
+            return
+        # Keep a separate key to avoid overriding trainer-computed dynamic lambda logs.
+        logs.setdefault("fusion_lambda_nrsr_sched", float(self.current_lambda))
+
+    def on_train_end(self, args, state, control, model=None, **kwargs):
+        if not self.active or model is None:
+            return
+        model = _unwrap_model(model)
+        setattr(model, "fusion_lambda_nrsr", self.target_lambda)
 
 
 def train(attn_implementation="flash_attention_2"):
@@ -282,9 +367,14 @@ def train(attn_implementation="flash_attention_2"):
                 "fusion_num_layers",
                 "geometry_merger_type",
                 "decompose_hidden_size",
+                "nrsr_hidden_size",
                 "fusion_align_mode",
                 "fusion_ortho_mode",
                 "fusion_lambda_ortho",
+                "fusion_lambda_nrsr",
+                "fusion_lambda_nrsr_dynamic",
+                "fusion_lambda_nrsr_stage2_ratio",
+                "fusion_lambda_nrsr_stage3_ratio",
                 "fusion_lambda_warmup",
                 "fusion_lambda_warmup_steps",
                 "fusion_mine_q_warmup_steps",
@@ -360,11 +450,14 @@ def train(attn_implementation="flash_attention_2"):
         enabled=model_args.fusion_lambda_warmup,
         warmup_steps=model_args.fusion_lambda_warmup_steps,
     )
+    fusion_lambda_nrsr_callback = FusionLambdaNRSRCallback(
+        enabled=model_args.fusion_lambda_nrsr_dynamic,
+    )
     trainer = VGTrainer(
         model=model,
         processing_class=tokenizer,
         args=training_args,
-        callbacks=[fusion_lambda_warmup_callback],
+        callbacks=[fusion_lambda_warmup_callback, fusion_lambda_nrsr_callback],
         **data_module,
     )
 

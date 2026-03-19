@@ -1496,6 +1496,7 @@ class Qwen2_5_VLCausalLMOutputWithPast(ModelOutput):
     attentions: Optional[Tuple[torch.FloatTensor]] = None
     rope_deltas: Optional[torch.LongTensor] = None
     loss_ortho: Optional[torch.FloatTensor] = None
+    loss_nrsr_kl: Optional[torch.FloatTensor] = None
     mine_unique_features: Optional[torch.FloatTensor] = None
     mine_2d_features: Optional[torch.FloatTensor] = None
 
@@ -1637,6 +1638,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             dropout=getattr(config, "fusion_dropout", 0.1),
             num_layers=getattr(config, "fusion_num_layers", 1),
             decompose_hidden_size=getattr(config, "decompose_hidden_size", None),
+            nrsr_hidden_size=getattr(config, "nrsr_hidden_size", None),
             align_mode=getattr(config, "fusion_align_mode", "cosine"),
             align_temperature=getattr(config, "fusion_align_temperature", 0.07),
             ortho_mode=getattr(config, "fusion_ortho_mode", "cosine"),
@@ -1644,6 +1646,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         )
         self.feature_fusion = FeatureFusionModule(fusion_config)
         self.fusion_lambda_ortho = getattr(config, "fusion_lambda_ortho", 1.0)
+        self.fusion_lambda_nrsr = getattr(config, "fusion_lambda_nrsr", 1.0)
 
     def _process_geometry_features(self, image_embeds, geometry_encoder_inputs, return_aux_losses: bool = False):
         """Process geometry features using the geometry encoder."""
@@ -2149,9 +2152,10 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 
                 # Process 3D geometry features if enabled
                 if getattr(self.config, 'use_geometry_encoder', False) and geometry_encoder_inputs is not None:
+                    fusion_method = str(getattr(self.config, "feature_fusion_method", "add")).lower()
                     need_fusion_aux_losses = (
                         labels is not None
-                        and getattr(self.config, "feature_fusion_method", "add") in {"decompose_add", "decompose_concat"}
+                        and fusion_method in {"decompose_add", "decompose_concat", "nrsr_add", "nrsr_concat"}
                     )
                     if need_fusion_aux_losses:
                         image_embeds, fusion_aux_losses = self._process_geometry_features(
@@ -2279,6 +2283,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         logits = self.lm_head(hidden_states)
         loss = None
         loss_ortho = None
+        loss_nrsr_kl = None
         mine_unique_features = None
         mine_2d_features = None
         if labels is not None:
@@ -2298,10 +2303,15 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 loss_ortho_raw = fusion_aux_losses.get("loss_ortho")
                 if loss_ortho_raw is not None:
                     loss_ortho = loss_ortho_raw.to(loss.device, loss.dtype)
+                loss_nrsr_kl_raw = fusion_aux_losses.get("loss_nrsr_kl")
+                if loss_nrsr_kl_raw is not None:
+                    loss_nrsr_kl = loss_nrsr_kl_raw.to(loss.device, loss.dtype)
                 mine_unique_features = fusion_aux_losses.get("mine_unique_features")
                 mine_2d_features = fusion_aux_losses.get("mine_2d_features")
                 if loss_ortho is not None:
                     loss = loss + getattr(self, "fusion_lambda_ortho", 1.0) * loss_ortho
+                if loss_nrsr_kl is not None:
+                    loss = loss + getattr(self, "fusion_lambda_nrsr", 1.0) * loss_nrsr_kl
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -2315,6 +2325,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             attentions=outputs.attentions,
             rope_deltas=self.rope_deltas,
             loss_ortho=loss_ortho,
+            loss_nrsr_kl=loss_nrsr_kl,
             mine_unique_features=mine_unique_features,
             mine_2d_features=mine_2d_features,
         )

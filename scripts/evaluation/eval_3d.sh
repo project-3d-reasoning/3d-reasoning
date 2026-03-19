@@ -6,10 +6,10 @@ source "${SCRIPT_DIR}/../utils/select_available_gpus.sh"
 export NCCL_NVLS_ENABLE=0
 benchmark=scan2cap # choices: [scan2cap, scanrefer, scannet_4frames, scannet_6frames]
 output_path=logs/$(TZ="Asia/Shanghai" date "+%Y%m%d")
-model_path=/data7t-root/r1/dmgg/VG-LLM/3b-decompose-add-infonce-cosine-ffff
+model_path=/data7t-root/r1/dmgg/VG-LLM/3b-decompose-add-club
 FEATURE_FUSION_METHOD="decompose_add" # choices: add/concat/cross_attention/gated/weighted/decompose_add/decompose_concat
 FUSION_ORTHO_MODE="mine"
-FUSION_LAMBDA_ORTHO=0.002
+FUSION_LAMBDA_ORTHO=0.02
 USE_LEARNABLE_PREFIX=false
 LEARNABLE_PREFIX_LEN=0
 TUNE_MM_VISION=false
