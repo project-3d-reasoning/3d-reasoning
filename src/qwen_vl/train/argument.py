@@ -32,6 +32,17 @@ class ModelArguments:
     fusion_lambda_warmup: bool = field(default=False)  # Enable lambda warmup for decompose fusion methods
     fusion_lambda_warmup_steps: int = field(default=100)  # Warmup steps for fusion lambdas when enabled
 
+    # Dynamically balance fusion lambdas so weighted aux losses track CE ratios.
+    # Targets are: align=0.05 * loss_ce, ortho=0.05 * loss_ce, recon=0.1 * loss_ce.
+    fusion_lambda_auto_balance: bool = field(default=False)
+    fusion_lambda_target_align: float = field(default=0.05)
+    fusion_lambda_target_ortho: float = field(default=0.05)
+    fusion_lambda_target_recon: float = field(default=0.10)
+    fusion_lambda_auto_ema: float = field(default=0.10)  # EMA update rate in [0,1]
+    fusion_lambda_auto_min: float = field(default=0.0)
+    fusion_lambda_auto_max: float = field(default=1000.0)
+    fusion_lambda_auto_eps: float = field(default=1e-8)
+
 @dataclass
 class DataArguments:
     dataset_use: str = field(default="")

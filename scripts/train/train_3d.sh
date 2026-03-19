@@ -31,14 +31,19 @@ TUNE_MM_VISION=False
 TUNE_MM_VISION_LORA=False
 TUNE_GEOMETRY_ENCODER=False
 TUNE_GEOMETRY_ENCODER_LORA=False
-FEATURE_FUSION_METHOD="add"      # choices: add/concat/cross_attention/gated/weighted/decompose_add/decompose_concat
+FEATURE_FUSION_METHOD="decompose_add"      # choices: add/concat/cross_attention/gated/weighted/decompose_add/decompose_concat
 DECOMPOSE_HIDDEN_SIZE=2048                 # Set empty to follow hidden_size (e.g. DECOMPOSE_HIDDEN_SIZE="")
 FUSION_ALIGN_MODE="infonce"                 # choices: cosine/infonce
 FUSION_ORTHO_MODE="mine"                 # choices: cosine/mine
-FUSION_LAMBDA_ALIGN=0.02
-FUSION_LAMBDA_ORTHO=0.002
-FUSION_LAMBDA_RECON=0.005
-USE_LEARNABLE_PREFIX=true
+# NOTE: These three values are now *target ratios* w.r.t. loss_ce when auto-balance is enabled.
+# i.e. lambda_align * loss_align  ~=  FUSION_LAMBDA_ALIGN * loss_ce
+#      lambda_ortho * loss_ortho  ~=  FUSION_LAMBDA_ORTHO * loss_ce
+#      lambda_recon * loss_recon  ~=  FUSION_LAMBDA_RECON * loss_ce
+FUSION_LAMBDA_ALIGN=0.05
+FUSION_LAMBDA_ORTHO=0.05
+FUSION_LAMBDA_RECON=0.1
+FUSION_LAMBDA_AUTO_BALANCE=True            # Dynamically balance lambdas by CE ratios
+USE_LEARNABLE_PREFIX=false
 LEARNABLE_PREFIX_LEN=10
 OUTPUT_DIR="3b-add-prefix"                   # Directory for saving checkpoints
 CACHE_DIR="./cache"                        # [TrainingArguments] Cache directory for models
@@ -113,9 +118,13 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --decompose_hidden_size $DECOMPOSE_HIDDEN_SIZE \
             --fusion_align_mode $FUSION_ALIGN_MODE \
             --fusion_ortho_mode $FUSION_ORTHO_MODE \
-            --fusion_lambda_align $FUSION_LAMBDA_ALIGN \
-            --fusion_lambda_ortho $FUSION_LAMBDA_ORTHO \
-            --fusion_lambda_recon $FUSION_LAMBDA_RECON \
+            --fusion_lambda_align 1.0 \
+            --fusion_lambda_ortho 1.0 \
+            --fusion_lambda_recon 1.0 \
+            --fusion_lambda_auto_balance $FUSION_LAMBDA_AUTO_BALANCE \
+            --fusion_lambda_target_align $FUSION_LAMBDA_ALIGN \
+            --fusion_lambda_target_ortho $FUSION_LAMBDA_ORTHO \
+            --fusion_lambda_target_recon $FUSION_LAMBDA_RECON \
             --use_learnable_prefix $USE_LEARNABLE_PREFIX \
             --learnable_prefix_len $LEARNABLE_PREFIX_LEN \
             "$@" \

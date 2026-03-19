@@ -6,7 +6,7 @@
 # ======================
 MASTER_ADDR="127.0.0.1"                     # [Required] Master node IP for multi-GPU training
 MASTER_PORT=$(shuf -i 20000-29999 -n 1)     # Random port to avoid conflicts
-NUM_GPUS="${NUM_GPUS:-}"                    # Set e.g. "4" to use 4 GPUs; leave empty to use all local GPUs
+NUM_GPUS="${NUM_GPUS:-4}"                    # Set e.g. "4" to use 4 GPUs; leave empty to use all local GPUs
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../utils/select_available_gpus.sh"
 
@@ -19,13 +19,12 @@ fi
 select_available_gpus "$REQUESTED_GPUS" || exit 1
 NPROC_PER_NODE="$SELECTED_GPU_COUNT"
 
+
 # ======================
 # Path Configuration
 # ======================
-MODEL_PATH="Qwen/Qwen2.5-VL-7B-Instruct"   # [ModelArguments] Pretrained model path
+MODEL_PATH="/data7t-root/huggingface/hub/models--Qwen--Qwen2.5-VL-3B-Instruct/snapshots/66285546d2b821cf421d4f5eb2576359d3770cd3"   # [ModelArguments] Pretrained model path
 MODEL_PATH="${MODEL_PATH%/}"               # Safety: strip trailing slash for HF repo id validation
-
-
 GEOMETRY_ENCODER_TYPE="vggt"
 GEOMETRY_ENCODER_PATH="facebook/VGGT-1B"
 TUNE_MM_VISION=False
@@ -33,30 +32,24 @@ TUNE_MM_VISION_LORA=False
 TUNE_GEOMETRY_ENCODER=False
 TUNE_GEOMETRY_ENCODER_LORA=False
 FEATURE_FUSION_METHOD="decompose_add"      # choices: add/concat/cross_attention/gated/weighted/decompose_add/decompose_concat
-DECOMPOSE_HIDDEN_SIZE=2048                 # Set empty to follow hidden_size (e.g. DECOMPOSE_HIDDEN_SIZE="")
-FUSION_ALIGN_MODE="cosine"                 # choices: cosine/infonce
-FUSION_ORTHO_MODE="cosine"                 # choices: cosine/mine
-# NOTE: These three values are now *target ratios* w.r.t. loss_ce when auto-balance is enabled.
-FUSION_LAMBDA_ALIGN=0.05
-FUSION_LAMBDA_ORTHO=0.05
-FUSION_LAMBDA_RECON=0.1
-FUSION_LAMBDA_WARMUP=True
-FUSION_LAMBDA_WARMUP_STEPS=100
-FUSION_LAMBDA_AUTO_BALANCE=True            # Dynamically balance lambdas by CE ratios
+FUSION_ORTHO_MODE="mine"                 # choices: cosine/mine
+FUSION_LAMBDA_ORTHO=0.2
+FUSION_MINE_Q_WARMUP_STEPS=500            # q_net-only warmup updates per epoch when FUSION_ORTHO_MODE=mine
 USE_LEARNABLE_PREFIX=false
-LEARNABLE_PREFIX_LEN=0
-OUTPUT_DIR="PATH_TO_OUTPUT_DIR"                   # Directory for saving checkpoints
+LEARNABLE_PREFIX_LEN=10
+OUTPUT_DIR="3b-decompose-add-club"                   # Directory for saving checkpoints
 CACHE_DIR="./cache"                        # [TrainingArguments] Cache directory for models
 mkdir -p $OUTPUT_DIR
 
 # ======================
 # Model Configuration
 # ======================
-DATASETS="spar_234k,llava_hound_64k"                  # [DataArguments] Dataset with sampling rate
+DATASETS="scan2cap,scanrefer,scannet_det"                  # [DataArguments] Dataset with sampling rate
 
 # ======================
 # Training Hyperparameters
 # ======================
+export NCCL_NVLS_ENABLE=0
 LR=1e-5
 total_batch_size=64
 GRADIENT_ACCUMULATION_STEPS=$(($total_batch_size / $NPROC_PER_NODE))
@@ -99,7 +92,7 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --warmup_ratio 0.03 \
             --lr_scheduler_type "cosine" \
             --weight_decay 0.01 \
-            --logging_steps 50 \
+            --logging_steps 10 \
             --save_steps 1000 \
             --save_total_limit 1 \
             --deepspeed "scripts/zero2_opt.json" \
@@ -108,24 +101,16 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --group_by_modality_length true \
             --seed 0 \
             --report_to "none" \
-            --use_geometry_encoder true \
+            --use_geometry_encoder True \
             --tune_geometry_encoder $TUNE_GEOMETRY_ENCODER \
             --tune_geometry_encoder_lora $TUNE_GEOMETRY_ENCODER_LORA \
             --geometry_encoder_type $GEOMETRY_ENCODER_TYPE \
             --geometry_encoder_path $GEOMETRY_ENCODER_PATH \
             --feature_fusion_method $FEATURE_FUSION_METHOD \
-            --decompose_hidden_size $DECOMPOSE_HIDDEN_SIZE \
-            --fusion_align_mode $FUSION_ALIGN_MODE \
             --fusion_ortho_mode $FUSION_ORTHO_MODE \
-            --fusion_lambda_align 1.0 \
-            --fusion_lambda_ortho 1.0 \
-            --fusion_lambda_recon 1.0 \
-            --fusion_lambda_auto_balance $FUSION_LAMBDA_AUTO_BALANCE \
-            --fusion_lambda_target_align $FUSION_LAMBDA_ALIGN \
-            --fusion_lambda_target_ortho $FUSION_LAMBDA_ORTHO \
-            --fusion_lambda_target_recon $FUSION_LAMBDA_RECON \
-            --fusion_lambda_warmup $FUSION_LAMBDA_WARMUP \
-            --fusion_lambda_warmup_steps $FUSION_LAMBDA_WARMUP_STEPS \
+            --fusion_lambda_ortho $FUSION_LAMBDA_ORTHO \
+            --fusion_mine_q_warmup_steps $FUSION_MINE_Q_WARMUP_STEPS \
             --use_learnable_prefix $USE_LEARNABLE_PREFIX \
             --learnable_prefix_len $LEARNABLE_PREFIX_LEN \
+            "$@" \
             > ${OUTPUT_DIR}/train.log 2>&1

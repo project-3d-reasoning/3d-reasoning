@@ -402,6 +402,97 @@ class VGTrainer(Trainer):
             model = model.module
         return model
 
+    def _dist_mean(self, value: torch.Tensor) -> torch.Tensor:
+        """All-reduce mean for a scalar tensor (no-op if not distributed)."""
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return value
+        v = value.detach().clone()
+        torch.distributed.all_reduce(v, op=torch.distributed.ReduceOp.SUM)
+        v = v / float(torch.distributed.get_world_size())
+        return v
+
+    def _auto_balance_fusion_lambdas(
+        self, model: torch.nn.Module, loss: torch.Tensor, outputs: Any
+    ) -> None:
+        """Dynamically set fusion lambdas so weighted aux losses track CE ratios."""
+        if outputs is None or loss is None or (not model.training):
+            return
+
+        base_model = self._unwrap_model(model)
+        cfg = getattr(base_model, "config", None)
+        if cfg is None or not bool(getattr(cfg, "fusion_lambda_auto_balance", False)):
+            return
+
+        loss_align = self._get_output_field(outputs, "loss_align")
+        loss_ortho = self._get_output_field(outputs, "loss_ortho")
+        loss_recon = self._get_output_field(outputs, "loss_recon")
+        if loss_align is None and loss_ortho is None and loss_recon is None:
+            return
+
+        # Read current lambdas
+        lambda_align = float(getattr(base_model, "fusion_lambda_align", 1.0))
+        lambda_ortho = float(getattr(base_model, "fusion_lambda_ortho", 1.0))
+        lambda_recon = float(getattr(base_model, "fusion_lambda_recon", 1.0))
+
+        eps = float(getattr(cfg, "fusion_lambda_auto_eps", 1e-8))
+        min_lambda = float(getattr(cfg, "fusion_lambda_auto_min", 0.0))
+        max_lambda = float(getattr(cfg, "fusion_lambda_auto_max", 1000.0))
+        ema = float(getattr(cfg, "fusion_lambda_auto_ema", 0.10))
+        ema = max(0.0, min(1.0, ema))
+
+        target_align = float(getattr(cfg, "fusion_lambda_target_align", 0.05))
+        target_ortho = float(getattr(cfg, "fusion_lambda_target_ortho", 0.05))
+        target_recon = float(getattr(cfg, "fusion_lambda_target_recon", 0.10))
+
+        # Compute CE estimate from current total loss and current-weight aux losses.
+        weighted_aux = loss.new_zeros(())
+        if loss_align is not None:
+            weighted_aux = weighted_aux + float(lambda_align) * loss_align.to(loss.device, loss.dtype)
+        if loss_ortho is not None:
+            weighted_aux = weighted_aux + float(lambda_ortho) * loss_ortho.to(loss.device, loss.dtype)
+        if loss_recon is not None:
+            weighted_aux = weighted_aux + float(lambda_recon) * loss_recon.to(loss.device, loss.dtype)
+
+        ce_est = torch.clamp(loss - weighted_aux, min=eps)
+
+        # Use distributed-mean scalars to keep all ranks in sync.
+        ce_mean = self._dist_mean(ce_est.detach().float())
+        align_mean = self._dist_mean(
+            (loss_align.detach().float() if loss_align is not None else ce_mean.new_zeros(()))
+        )
+        ortho_mean = self._dist_mean(
+            (loss_ortho.detach().float() if loss_ortho is not None else ce_mean.new_zeros(()))
+        )
+        recon_mean = self._dist_mean(
+            (loss_recon.detach().float() if loss_recon is not None else ce_mean.new_zeros(()))
+        )
+
+        def _update(old: float, target_ratio: float, aux_value: torch.Tensor) -> float:
+            aux_safe = torch.clamp(aux_value, min=eps)
+            new_val = (target_ratio * ce_mean / aux_safe).item()
+            blended = (1.0 - ema) * float(old) + ema * float(new_val)
+            return float(max(min_lambda, min(max_lambda, blended)))
+
+        with torch.no_grad():
+            if loss_align is not None:
+                lambda_align = _update(lambda_align, target_align, align_mean)
+                setattr(base_model, "fusion_lambda_align", lambda_align)
+            if loss_ortho is not None:
+                lambda_ortho = _update(lambda_ortho, target_ortho, ortho_mean)
+                setattr(base_model, "fusion_lambda_ortho", lambda_ortho)
+            if loss_recon is not None:
+                lambda_recon = _update(lambda_recon, target_recon, recon_mean)
+                setattr(base_model, "fusion_lambda_recon", lambda_recon)
+
+        # For monitoring
+        self._aux_monitor_logs.update(
+            {
+                "fusion_lambda_align": float(lambda_align),
+                "fusion_lambda_ortho": float(lambda_ortho),
+                "fusion_lambda_recon": float(lambda_recon),
+            }
+        )
+
     def _get_feature_fusion_module(self, model: torch.nn.Module):
         unwrapped = self._unwrap_model(model)
         return getattr(unwrapped, "feature_fusion", None)
@@ -452,6 +543,9 @@ class VGTrainer(Trainer):
             "loss_ce_est": float(ce_est.detach().float().item()),
             "loss_aux_weighted": float(weighted_aux.detach().float().item()),
             "loss_aux_ratio": float(ratio.detach().float().item()),
+            "fusion_lambda_align": float(lambda_align),
+            "fusion_lambda_ortho": float(lambda_ortho),
+            "fusion_lambda_recon": float(lambda_recon),
         }
         if loss_align is not None:
             self._aux_monitor_logs["loss_align"] = float(loss_align.detach().float().item())
@@ -541,6 +635,7 @@ class VGTrainer(Trainer):
             loss, outputs = loss_outputs, None
 
         self._update_aux_monitor_logs(model, loss, outputs)
+        self._auto_balance_fusion_lambdas(model, loss, outputs)
 
         if should_cache_mine:
             self._cache_mine_features(outputs)
