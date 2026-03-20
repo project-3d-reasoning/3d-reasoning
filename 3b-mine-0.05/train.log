@@ -422,3 +422,16 @@ Total training samples: 245612
 Formatting inputs...Skip in lazy mode
 Total training samples: 245612
 Formatting inputs...Skip in lazy mode
+[FusionLambdaNRSR] Skip: fusion_method=decompose_add (only nrsr_* supported).
+  0%|          | 0/3837 [00:00<?, ?it/s]/data2/miniconda3/envs/vgllm/lib/python3.11/site-packages/torch/utils/checkpoint.py:87: UserWarning: None of the inputs have requires_grad=True. Gradients will be None
+  warnings.warn(
+/data2/miniconda3/envs/vgllm/lib/python3.11/site-packages/torch/utils/checkpoint.py:87: UserWarning: None of the inputs have requires_grad=True. Gradients will be None
+  warnings.warn(
+/data7t-root/r1/dmgg/VG-LLM/src/qwen_vl/model/geometry_encoders/vggt_encoder.py:46: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with torch.cuda.amp.autocast(dtype=dtype):
+/data7t-root/r1/dmgg/VG-LLM/src/qwen_vl/model/geometry_encoders/vggt_encoder.py:46: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with torch.cuda.amp.autocast(dtype=dtype):
+/data2/miniconda3/envs/vgllm/lib/python3.11/site-packages/torch/utils/checkpoint.py:87: UserWarning: None of the inputs have requires_grad=True. Gradients will be None
+  warnings.warn(
+/data7t-root/r1/dmgg/VG-LLM/src/qwen_vl/model/geometry_encoders/vggt_encoder.py:46: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with torch.cuda.amp.autocast(dtype=dtype):
