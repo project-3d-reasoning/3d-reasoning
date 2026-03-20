@@ -28,6 +28,7 @@ class ModelArguments:
     fusion_align_mode: str = field(default="cosine")  # Alignment loss mode ("cosine", "infonce")
     fusion_ortho_mode: str = field(default="cosine")  # Orthogonality mode ("cosine", "mine")
     fusion_lambda_ortho: float = field(default=1.0)  # Weight for orthogonality loss
+    fusion_ortho_target_ratio: Optional[float] = field(default=None)  # Target ratio for weighted orthogonality loss vs CE loss
     fusion_lambda_nrsr: float = field(default=1.0)  # Weight for NRSR KL loss
     fusion_lambda_nrsr_dynamic: bool = field(default=True)  # Enable 3-stage dynamic schedule for NRSR lambda
     fusion_lambda_nrsr_stage2_ratio: float = field(default=0.10)  # Forced weighted-KL ratio in stage 2

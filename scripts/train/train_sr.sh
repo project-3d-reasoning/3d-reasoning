@@ -34,7 +34,7 @@ TUNE_GEOMETRY_ENCODER=False
 TUNE_GEOMETRY_ENCODER_LORA=False
 FEATURE_FUSION_METHOD="decompose_add"      # choices: add/concat/cross_attention/gated/weighted/decompose_add/decompose_concat/nrsr_add/nrsr_concat
 FUSION_ORTHO_MODE="cosine"                 # choices: cosine/mine
-FUSION_LAMBDA_ORTHO=1.0
+FUSION_LAMBDA_ORTHO=1.0                    # target loss_ortho_weighted / loss_ce ratio; also used as initial lambda
 FUSION_LAMBDA_NRSR=1.0
 FUSION_LAMBDA_NRSR_DYNAMIC=True
 FUSION_LAMBDA_NRSR_STAGE2_RATIO=0.10
@@ -115,6 +115,7 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --feature_fusion_method $FEATURE_FUSION_METHOD \
             --fusion_ortho_mode $FUSION_ORTHO_MODE \
             --fusion_lambda_ortho $FUSION_LAMBDA_ORTHO \
+            --fusion_ortho_target_ratio $FUSION_LAMBDA_ORTHO \
             --fusion_lambda_nrsr $FUSION_LAMBDA_NRSR \
             --fusion_lambda_nrsr_dynamic $FUSION_LAMBDA_NRSR_DYNAMIC \
             --fusion_lambda_nrsr_stage2_ratio $FUSION_LAMBDA_NRSR_STAGE2_RATIO \

@@ -371,6 +371,7 @@ def train(attn_implementation="flash_attention_2"):
                 "fusion_align_mode",
                 "fusion_ortho_mode",
                 "fusion_lambda_ortho",
+                "fusion_ortho_target_ratio",
                 "fusion_lambda_nrsr",
                 "fusion_lambda_nrsr_dynamic",
                 "fusion_lambda_nrsr_stage2_ratio",
@@ -436,6 +437,8 @@ def train(attn_implementation="flash_attention_2"):
         padding_side="right",
         use_fast=False,
     )
+    if model_args.fusion_ortho_target_ratio is not None:
+        setattr(training_args, "fusion_ortho_target_ratio", float(model_args.fusion_ortho_target_ratio))
     set_model(model_args, model)
 
     if torch.distributed.get_rank() == 0:

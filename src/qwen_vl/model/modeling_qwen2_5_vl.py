@@ -1646,6 +1646,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         )
         self.feature_fusion = FeatureFusionModule(fusion_config)
         self.fusion_lambda_ortho = getattr(config, "fusion_lambda_ortho", 1.0)
+        self.fusion_ortho_target_ratio = getattr(config, "fusion_ortho_target_ratio", None)
         self.fusion_lambda_nrsr = getattr(config, "fusion_lambda_nrsr", 1.0)
 
     def _process_geometry_features(self, image_embeds, geometry_encoder_inputs, return_aux_losses: bool = False):
