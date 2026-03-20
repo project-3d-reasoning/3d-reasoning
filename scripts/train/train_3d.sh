@@ -39,13 +39,13 @@ FUSION_ORTHO_MODE="mine"                 # choices: cosine/mine
 # i.e. lambda_align * loss_align  ~=  FUSION_LAMBDA_ALIGN * loss_ce
 #      lambda_ortho * loss_ortho  ~=  FUSION_LAMBDA_ORTHO * loss_ce
 #      lambda_recon * loss_recon  ~=  FUSION_LAMBDA_RECON * loss_ce
-FUSION_LAMBDA_ALIGN=0.05
+FUSION_LAMBDA_ALIGN=0.02
 FUSION_LAMBDA_ORTHO=0.05
-FUSION_LAMBDA_RECON=0.1
+FUSION_LAMBDA_RECON=0.02
 FUSION_LAMBDA_AUTO_BALANCE=True            # Dynamically balance lambdas by CE ratios
-USE_LEARNABLE_PREFIX=false
+USE_LEARNABLE_PREFIX=True
 LEARNABLE_PREFIX_LEN=10
-OUTPUT_DIR="3b-add-prefix"                   # Directory for saving checkpoints
+OUTPUT_DIR="3b-decompose-add-mine-0.02-0.05-0.02"                   # Directory for saving checkpoints
 CACHE_DIR="./cache"                        # [TrainingArguments] Cache directory for models
 mkdir -p $OUTPUT_DIR
 
