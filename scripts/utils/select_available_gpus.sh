@@ -52,7 +52,8 @@ select_available_gpus() {
     idle_candidates=$(echo "$gpu_stats" | awk -F',' -v max_mem="$max_used_mem" -v max_util="$max_util" '
         {
             gsub(/ /, "", $1); gsub(/ /, "", $2); gsub(/ /, "", $3); gsub(/ /, "", $4);
-            idx=$1; used=$2; free=$3; util=$4;
+            # Force numeric comparison so values like 101926 are not compared lexically to 1024.
+            idx=$1 + 0; used=$2 + 0; free=$3 + 0; util=$4 + 0;
             # Force numeric comparison. Some drivers may report N/A; in awk, (value + 0)
             # safely coerces non-numeric strings to 0 instead of doing lexicographic compare.
             used_num=(used + 0); free_num=(free + 0); util_num=(util + 0);
@@ -79,7 +80,7 @@ select_available_gpus() {
         all_candidates=$(echo "$gpu_stats" | awk -F',' '
             {
                 gsub(/ /, "", $1); gsub(/ /, "", $2); gsub(/ /, "", $3); gsub(/ /, "", $4);
-                print $1 "," ($2 + 0) "," ($3 + 0) "," ($4 + 0);
+                print ($1 + 0) "," ($2 + 0) "," ($3 + 0) "," ($4 + 0);
             }
         ' | sort -t',' -k3,3nr -k4,4n -k2,2n)
 

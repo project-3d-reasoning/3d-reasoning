@@ -41,7 +41,7 @@ FUSION_LAMBDA_NRSR_STAGE3_RATIO=0.03
 FUSION_MINE_Q_WARMUP_STEPS=500            # q_net-only warmup updates per epoch when FUSION_ORTHO_MODE=mine
 USE_LEARNABLE_PREFIX=false
 LEARNABLE_PREFIX_LEN=10
-OUTPUT_DIR="3b-nsrs"                   # Directory for saving checkpoints
+OUTPUT_DIR="3b-mine-0.05"                   # Directory for saving checkpoints
 CACHE_DIR="./cache"                        # [TrainingArguments] Cache directory for models
 mkdir -p $OUTPUT_DIR
 

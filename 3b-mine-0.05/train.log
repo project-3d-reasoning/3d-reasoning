@@ -1,0 +1,25 @@
+W0320 05:44:56.462000 3173576 site-packages/torch/distributed/run.py:793] 
+W0320 05:44:56.462000 3173576 site-packages/torch/distributed/run.py:793] *****************************************
+W0320 05:44:56.462000 3173576 site-packages/torch/distributed/run.py:793] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0320 05:44:56.462000 3173576 site-packages/torch/distributed/run.py:793] *****************************************
+Trainer._get_train_sampler replaced with custom implementation.
+[2026-03-20 05:45:02,572] [INFO] [real_accelerator.py:222:get_accelerator] Setting ds_accelerator to cuda (auto detect)
+Trainer._get_train_sampler replaced with custom implementation.
+Trainer._get_train_sampler replaced with custom implementation.
+Trainer._get_train_sampler replaced with custom implementation.
+[2026-03-20 05:45:03,092] [INFO] [real_accelerator.py:222:get_accelerator] Setting ds_accelerator to cuda (auto detect)
+[2026-03-20 05:45:03,200] [INFO] [comm.py:658:init_distributed] cdb=None
+[2026-03-20 05:45:03,705] [INFO] [real_accelerator.py:222:get_accelerator] Setting ds_accelerator to cuda (auto detect)
+[2026-03-20 05:45:03,712] [INFO] [comm.py:658:init_distributed] cdb=None
+[2026-03-20 05:45:03,712] [INFO] [comm.py:689:init_distributed] Initializing TorchBackend in DeepSpeed with backend nccl
+[2026-03-20 05:45:03,796] [INFO] [real_accelerator.py:222:get_accelerator] Setting ds_accelerator to cuda (auto detect)
+Warning: FlashAttention 3 is not available, falling back to PyTorch's scaled_dot_product_attention
+You are attempting to use Flash Attention 2.0 with a model not initialized on GPU. Make sure to move the model to GPU after initializing it on CPU with `model.to('cuda')`.
+Warning: FlashAttention 3 is not available, falling back to PyTorch's scaled_dot_product_attention
+[2026-03-20 05:45:04,326] [INFO] [comm.py:658:init_distributed] cdb=None
+You are attempting to use Flash Attention 2.0 with a model not initialized on GPU. Make sure to move the model to GPU after initializing it on CPU with `model.to('cuda')`.
+[2026-03-20 05:45:04,626] [INFO] [comm.py:658:init_distributed] cdb=None
+Warning: FlashAttention 3 is not available, falling back to PyTorch's scaled_dot_product_attention
+You are attempting to use Flash Attention 2.0 with a model not initialized on GPU. Make sure to move the model to GPU after initializing it on CPU with `model.to('cuda')`.
+Warning: FlashAttention 3 is not available, falling back to PyTorch's scaled_dot_product_attention
+You are attempting to use Flash Attention 2.0 with a model not initialized on GPU. Make sure to move the model to GPU after initializing it on CPU with `model.to('cuda')`.
