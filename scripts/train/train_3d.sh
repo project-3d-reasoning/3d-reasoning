@@ -31,13 +31,13 @@ TUNE_MM_VISION=False
 TUNE_MM_VISION_LORA=False
 TUNE_GEOMETRY_ENCODER=False
 TUNE_GEOMETRY_ENCODER_LORA=False
-FEATURE_FUSION_METHOD="decompose_add"      # choices: add/concat/cross_attention/gated/weighted/decompose_add/decompose_concat/nrsr_add/nrsr_concat
+FEATURE_FUSION_METHOD="nrsr_concat"      # choices: add/concat/cross_attention/gated/weighted/decompose_add/decompose_concat/nrsr_add/nrsr_concat
 FUSION_ORTHO_MODE="mine"                 # choices: cosine/mine
 FUSION_LAMBDA_ORTHO=0.05
 FUSION_LAMBDA_NRSR=1.0
 FUSION_LAMBDA_NRSR_DYNAMIC=True
 FUSION_LAMBDA_NRSR_STAGE2_RATIO=0.05
-FUSION_LAMBDA_NRSR_STAGE3_RATIO=0.02
+FUSION_LAMBDA_NRSR_STAGE3_RATIO=0.03
 FUSION_MINE_Q_WARMUP_STEPS=500            # q_net-only warmup updates per epoch when FUSION_ORTHO_MODE=mine
 USE_LEARNABLE_PREFIX=false
 LEARNABLE_PREFIX_LEN=10
