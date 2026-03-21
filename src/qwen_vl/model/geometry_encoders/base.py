@@ -50,3 +50,7 @@ class BaseGeometryEncoder(ABC, nn.Module):
     def get_feature_dim(self) -> int:
         """Get the output feature dimension."""
         pass
+
+    def encode_with_aux(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Encode images and optionally return auxiliary dense geometry predictions."""
+        return {"features": self.encode(images)}

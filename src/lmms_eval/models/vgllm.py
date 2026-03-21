@@ -64,6 +64,9 @@ class VGLLM(lmms):
         fusion_ortho_mode: Optional[str] = None,
         fusion_lambda_ortho: Optional[float] = None,
         fusion_ortho_target_ratio: Optional[float] = None,
+        fusion_knn_k: Optional[int] = None,
+        fusion_knn_min_valid_ratio: Optional[float] = None,
+        fusion_knn_pos_mlp_hidden_size: Optional[int] = None,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -103,6 +106,12 @@ class VGLLM(lmms):
             setattr(config, "fusion_lambda_ortho", fusion_lambda_ortho)
         if fusion_ortho_target_ratio is not None:
             setattr(config, "fusion_ortho_target_ratio", fusion_ortho_target_ratio)
+        if fusion_knn_k is not None:
+            setattr(config, "fusion_knn_k", fusion_knn_k)
+        if fusion_knn_min_valid_ratio is not None:
+            setattr(config, "fusion_knn_min_valid_ratio", fusion_knn_min_valid_ratio)
+        if fusion_knn_pos_mlp_hidden_size is not None:
+            setattr(config, "fusion_knn_pos_mlp_hidden_size", fusion_knn_pos_mlp_hidden_size)
         if tune_mm_vision is not None:
             setattr(config, "tune_mm_vision", tune_mm_vision)
         if tune_mm_vision_lora is not None:

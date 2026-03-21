@@ -31,17 +31,21 @@ TUNE_MM_VISION=False
 TUNE_MM_VISION_LORA=False
 TUNE_GEOMETRY_ENCODER=False
 TUNE_GEOMETRY_ENCODER_LORA=False
-FEATURE_FUSION_METHOD="decompose_concat"      # choices: add/concat/cross_attention/gated/weighted/decompose_add/decompose_concat/nrsr_add/nrsr_concat
+FEATURE_FUSION_METHOD="knn_concat"      # choices: add/concat/cross_attention/gated/weighted/decompose_add/decompose_concat/nrsr_add/nrsr_concat/knn_concat
+FUSION_NUM_LAYERS=2                    # Number of Transformer-style CA blocks for cross_attention/knn_concat
+FUSION_KNN_K=5                         # Number of nearest neighbors from other frames for knn_concat; self token is added automatically
+FUSION_KNN_MIN_VALID_RATIO=0.5         # Minimum confidence mass ratio in the center patch window before a patch/token is marked valid
+FUSION_KNN_POS_MLP_HIDDEN_SIZE=3096     # Hidden width of the relative-position MLP for knn_concat
 FUSION_ORTHO_MODE="mine"                 # choices: cosine/mine
 FUSION_LAMBDA_ORTHO=0.05                 # target loss_ortho_weighted / loss_ce ratio; also used as initial lambda
 FUSION_LAMBDA_NRSR=1.0
 FUSION_LAMBDA_NRSR_DYNAMIC=True
-FUSION_LAMBDA_NRSR_STAGE2_RATIO=0.05
-FUSION_LAMBDA_NRSR_STAGE3_RATIO=0.03
+FUSION_LAMBDA_NRSR_STAGE2_RATIO=0.1
+FUSION_LAMBDA_NRSR_STAGE3_RATIO=0.05
 FUSION_MINE_Q_WARMUP_STEPS=500            # q_net-only warmup updates per epoch when FUSION_ORTHO_MODE=mine
 USE_LEARNABLE_PREFIX=false
 LEARNABLE_PREFIX_LEN=10
-OUTPUT_DIR="3b-mine-0.05"                   # Directory for saving checkpoints
+OUTPUT_DIR="3b-knn-tunemmlp"                   # Directory for saving checkpoints
 CACHE_DIR="./cache"                        # [TrainingArguments] Cache directory for models
 mkdir -p $OUTPUT_DIR
 
@@ -111,6 +115,10 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --geometry_encoder_type $GEOMETRY_ENCODER_TYPE \
             --geometry_encoder_path $GEOMETRY_ENCODER_PATH \
             --feature_fusion_method $FEATURE_FUSION_METHOD \
+            --fusion_num_layers $FUSION_NUM_LAYERS \
+            --fusion_knn_k $FUSION_KNN_K \
+            --fusion_knn_min_valid_ratio $FUSION_KNN_MIN_VALID_RATIO \
+            --fusion_knn_pos_mlp_hidden_size $FUSION_KNN_POS_MLP_HIDDEN_SIZE \
             --fusion_ortho_mode $FUSION_ORTHO_MODE \
             --fusion_lambda_ortho $FUSION_LAMBDA_ORTHO \
             --fusion_ortho_target_ratio $FUSION_LAMBDA_ORTHO \

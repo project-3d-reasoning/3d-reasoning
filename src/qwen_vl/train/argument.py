@@ -20,8 +20,8 @@ class ModelArguments:
     geometry_encoder_type: str = field(default="vggt")  # Type of geometry encoder ("vggt", "pi3")
     geometry_encoder_path: str = field(default="facebook/VGGT-1B/")  # Path to pre-trained geometry encoder model
     reference_frame: str = field(default="first")  # Reference frame for geometry encoding ("first", "last"), only available for vggt
-    feature_fusion_method: str = field(default="add")  # Method to fuse geometry and visual features ("add", "concat", "cross_attention", "gated", "decompose_add", "decompose_concat", "nrsr_add", "nrsr_concat")
-    fusion_num_layers: int = field(default=1)  # Number of layers in the cross-attention module when feature_fusion_method is "cross_attention"
+    feature_fusion_method: str = field(default="add")  # Method to fuse geometry and visual features ("add", "concat", "cross_attention", "gated", "decompose_add", "decompose_concat", "nrsr_add", "nrsr_concat", "knn_concat")
+    fusion_num_layers: int = field(default=1)  # Number of Transformer-style cross-attention blocks when feature_fusion_method is "cross_attention" or "knn_concat"
     geometry_merger_type: str = field(default="mlp")  # Type of geometry feature merger ("mlp", "avg")
     decompose_hidden_size: Optional[int] = field(default=None)  # Hidden size for shared/unique 3D decomposition MLPs
     nrsr_hidden_size: Optional[int] = field(default=None)  # Hidden size for NRSR VIB MLP
@@ -36,6 +36,9 @@ class ModelArguments:
     fusion_lambda_warmup: bool = field(default=False)  # Enable ortho lambda warmup for decompose fusion methods
     fusion_lambda_warmup_steps: int = field(default=100)  # Warmup steps for ortho lambda when enabled
     fusion_mine_q_warmup_steps: int = field(default=500)  # q_theta-only warmup updates at each epoch start when ortho mode is "mine"
+    fusion_knn_k: int = field(default=9)  # Number of nearest neighbors from other frames for knn_concat; self token is always added.
+    fusion_knn_min_valid_ratio: float = field(default=0.25)  # Minimum confidence mass ratio in the center window before a patch/token becomes valid.
+    fusion_knn_pos_mlp_hidden_size: Optional[int] = field(default=None)  # Hidden width of the relative-position MLP for knn_concat; defaults to hidden_size.
 
 @dataclass
 class DataArguments:

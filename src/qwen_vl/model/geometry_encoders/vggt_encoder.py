@@ -2,7 +2,7 @@
 
 import torch
 import torch.nn as nn
-from typing import Optional
+from typing import Dict
 
 from .base import BaseGeometryEncoder, GeometryEncoderConfig
 
@@ -12,13 +12,20 @@ class VGGTEncoder(BaseGeometryEncoder):
     
     def __init__(self, config: GeometryEncoderConfig):
         super().__init__(config)
-        
+
         # Lazy import to avoid circular dependencies
         from ..vggt.models.vggt import VGGT
 
+        self.enable_point_head = bool(config.encoder_kwargs.get("enable_point", False))
+
         # Initialize VGGT model
-        self.vggt = VGGT(enable_camera=False, enable_point=False, enable_depth=False, enable_track=False)
-        
+        self.vggt = VGGT(
+            enable_camera=False,
+            enable_point=self.enable_point_head,
+            enable_depth=False,
+            enable_track=False,
+        )
+
         # Freeze parameters if required
         if self.freeze_encoder:
             for param in self.vggt.parameters():
@@ -28,8 +35,8 @@ class VGGTEncoder(BaseGeometryEncoder):
         self.patch_size = 14
         
     
-    def encode(self, images: torch.Tensor) -> torch.Tensor:
-        """Encode images using VGGT."""
+    def _forward_impl(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Run the VGGT aggregator and optional dense geometry heads once."""
         grad_enabled = self.training and any(param.requires_grad for param in self.vggt.parameters())
         if grad_enabled:
             self.vggt.train()
@@ -47,11 +54,31 @@ class VGGTEncoder(BaseGeometryEncoder):
                 # Get aggregated tokens from VGGT
                 aggregated_tokens_list, patch_start_idx = self.vggt.aggregator(images[None])
                 features = aggregated_tokens_list[-2][0, :, patch_start_idx:]
-                
-        # Apply inverse reference frame transformation
-        features = self._apply_inverse_reference_frame_transform(features)
-        
-        return features
+
+                outputs = {"features": features}
+                if self.enable_point_head and self.vggt.point_head is not None:
+                    pts3d, pts3d_conf = self.vggt.point_head(
+                        aggregated_tokens_list,
+                        images=images[None],
+                        patch_start_idx=patch_start_idx,
+                    )
+                    outputs["world_points"] = pts3d[0]
+                    outputs["world_points_conf"] = pts3d_conf[0]
+
+        outputs["features"] = self._apply_inverse_reference_frame_transform(outputs["features"])
+        if "world_points" in outputs:
+            outputs["world_points"] = self._apply_inverse_reference_frame_transform(outputs["world_points"])
+        if "world_points_conf" in outputs:
+            outputs["world_points_conf"] = self._apply_inverse_reference_frame_transform(outputs["world_points_conf"])
+        return outputs
+
+    def encode(self, images: torch.Tensor) -> torch.Tensor:
+        """Encode images using VGGT."""
+        return self._forward_impl(images)["features"]
+
+    def encode_with_aux(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Encode images and return optional dense world point predictions."""
+        return self._forward_impl(images)
     
     def get_feature_dim(self) -> int:
         """Get VGGT feature dimension."""
@@ -77,8 +104,14 @@ class VGGTEncoder(BaseGeometryEncoder):
     def load_model(self, model_path: str) -> None:
         """Load pretrained VGGT model."""
         from ..vggt.models.vggt import VGGT
-        self.vggt = VGGT.from_pretrained(model_path, enable_camera=False, enable_point=False, enable_depth=False, enable_track=False)
-                
+        self.vggt = VGGT.from_pretrained(
+            model_path,
+            enable_camera=False,
+            enable_point=self.enable_point_head,
+            enable_depth=False,
+            enable_track=False,
+        )
+
         # Freeze parameters if required
         if self.freeze_encoder:
             for param in self.vggt.parameters():

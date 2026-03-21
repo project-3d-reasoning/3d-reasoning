@@ -32,7 +32,10 @@ TUNE_MM_VISION=False
 TUNE_MM_VISION_LORA=False
 TUNE_GEOMETRY_ENCODER=False
 TUNE_GEOMETRY_ENCODER_LORA=False
-FEATURE_FUSION_METHOD="decompose_add"      # choices: add/concat/cross_attention/gated/weighted/decompose_add/decompose_concat/nrsr_add/nrsr_concat
+FEATURE_FUSION_METHOD="decompose_add"      # choices: add/concat/cross_attention/gated/weighted/decompose_add/decompose_concat/nrsr_add/nrsr_concat/knn_concat
+FUSION_KNN_K=9                             # Number of nearest neighbors from other frames for knn_concat; self token is added automatically
+FUSION_KNN_MIN_VALID_RATIO=0.25            # Minimum confidence mass ratio in the center patch window before a patch/token is marked valid
+FUSION_KNN_POS_MLP_HIDDEN_SIZE=3584        # Hidden width of the relative-position MLP for knn_concat
 FUSION_ORTHO_MODE="cosine"                 # choices: cosine/mine
 FUSION_LAMBDA_ORTHO=1.0                    # target loss_ortho_weighted / loss_ce ratio; also used as initial lambda
 FUSION_LAMBDA_NRSR=1.0
@@ -113,6 +116,9 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --geometry_encoder_type $GEOMETRY_ENCODER_TYPE \
             --geometry_encoder_path $GEOMETRY_ENCODER_PATH \
             --feature_fusion_method $FEATURE_FUSION_METHOD \
+            --fusion_knn_k $FUSION_KNN_K \
+            --fusion_knn_min_valid_ratio $FUSION_KNN_MIN_VALID_RATIO \
+            --fusion_knn_pos_mlp_hidden_size $FUSION_KNN_POS_MLP_HIDDEN_SIZE \
             --fusion_ortho_mode $FUSION_ORTHO_MODE \
             --fusion_lambda_ortho $FUSION_LAMBDA_ORTHO \
             --fusion_ortho_target_ratio $FUSION_LAMBDA_ORTHO \

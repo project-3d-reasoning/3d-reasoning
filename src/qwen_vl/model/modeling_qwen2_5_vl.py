@@ -398,7 +398,33 @@ class Qwen2_5_VLPreTrainedModel(PreTrainedModel):
     def _init_weights(self, module):
         std = self.config.initializer_range
         if isinstance(module, (nn.Linear, nn.Conv3d)):
-            module.weight.data.normal_(mean=0.0, std=std)
+            identity_block_scales = getattr(module, "_fusion_identity_block_scales", None)
+            if identity_block_scales is not None:
+                module.weight.data.zero_()
+                noise_scale = float(getattr(module, "_fusion_identity_noise_scale", 0.0) or 0.0)
+                if noise_scale > 0.0:
+                    module.weight.data.normal_(mean=0.0, std=std * noise_scale)
+
+                out_features, in_features = module.weight.shape
+                num_blocks = len(identity_block_scales)
+                if in_features != out_features * num_blocks:
+                    raise ValueError(
+                        "Identity block init expects "
+                        f"in_features == out_features * num_blocks, got "
+                        f"{in_features} vs {out_features} * {num_blocks}."
+                    )
+
+                eye = torch.eye(
+                    out_features,
+                    device=module.weight.device,
+                    dtype=module.weight.dtype,
+                )
+                for block_idx, scale in enumerate(identity_block_scales):
+                    start = block_idx * out_features
+                    end = start + out_features
+                    module.weight.data[:, start:end].add_(float(scale) * eye)
+            else:
+                module.weight.data.normal_(mean=0.0, std=std)
             if module.bias is not None:
                 module.bias.data.zero_()
         elif isinstance(module, nn.Embedding):
@@ -1612,12 +1638,19 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
     def _init_geometry_encoder(self, config):
         """Initialize geometry encoder and related modules."""
         # Create geometry encoder configuration
+        fusion_method = str(getattr(config, "feature_fusion_method", "add")).lower()
+        geometry_encoder_type = getattr(config, "geometry_encoder_type", "vggt")
+        if fusion_method == "knn_concat" and geometry_encoder_type != "vggt":
+            raise ValueError("FEATURE_FUSION_METHOD='knn_concat' currently requires geometry_encoder_type='vggt'.")
 
         encoder_config = GeometryEncoderConfig(
-            encoder_type=getattr(config, "geometry_encoder_type", "vggt"),
+            encoder_type=geometry_encoder_type,
             model_path=getattr(config, "geometry_encoder_path", None),
             reference_frame=getattr(config, "reference_frame", "first"),
-            freeze_encoder=getattr(config, "geometry_encoder_freeze", True)
+            freeze_encoder=getattr(config, "geometry_encoder_freeze", True),
+            encoder_kwargs={
+                "enable_point": fusion_method == "knn_concat",
+            },
         )
         self.geometry_encoder = create_geometry_encoder(encoder_config)
         
@@ -1643,14 +1676,154 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             align_temperature=getattr(config, "fusion_align_temperature", 0.07),
             ortho_mode=getattr(config, "fusion_ortho_mode", "cosine"),
             mine_hidden_size=getattr(config, "fusion_mine_hidden_size", None),
+            knn_k=getattr(config, "fusion_knn_k", 9),
+            knn_min_valid_ratio=getattr(config, "fusion_knn_min_valid_ratio", 0.25),
+            knn_pos_mlp_hidden_size=getattr(config, "fusion_knn_pos_mlp_hidden_size", None),
         )
         self.feature_fusion = FeatureFusionModule(fusion_config)
         self.fusion_lambda_ortho = getattr(config, "fusion_lambda_ortho", 1.0)
         self.fusion_ortho_target_ratio = getattr(config, "fusion_ortho_target_ratio", None)
         self.fusion_lambda_nrsr = getattr(config, "fusion_lambda_nrsr", 1.0)
 
+    def _pool_world_points_to_token_grid(
+        self,
+        world_points: torch.Tensor,
+        world_points_conf: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Pool pixel-level world points into the same merged patch grid used by geometry features."""
+        patch_size = int(self.geometry_encoder.patch_size)
+        merge_size = int(self.geometry_merger.merge_size)
+        world_points = world_points.float()
+        world_points_conf = world_points_conf.float()
+
+        num_frames, height, width, _ = world_points.shape
+        h_patch = height // patch_size
+        w_patch = width // patch_size
+        height_crop = h_patch * patch_size
+        width_crop = w_patch * patch_size
+        world_points = world_points[:, :height_crop, :width_crop]
+        world_points_conf = world_points_conf[:, :height_crop, :width_crop]
+
+        world_points = world_points.reshape(num_frames, h_patch, patch_size, w_patch, patch_size, 3)
+        world_points = world_points.permute(0, 1, 3, 2, 4, 5).contiguous()
+        world_points_conf = world_points_conf.reshape(num_frames, h_patch, patch_size, w_patch, patch_size)
+        world_points_conf = world_points_conf.permute(0, 1, 3, 2, 4).contiguous()
+
+        center_size = max(int(round(patch_size * 0.5)), 1)
+        center_start = max((patch_size - center_size) // 2, 0)
+        center_end = center_start + center_size
+
+        center_world = world_points[:, :, :, center_start:center_end, center_start:center_end, :]
+        center_conf = world_points_conf[:, :, :, center_start:center_end, center_start:center_end]
+        finite_mask = torch.isfinite(center_world).all(dim=-1) & torch.isfinite(center_conf)
+        center_conf = torch.where(finite_mask, center_conf, torch.zeros_like(center_conf))
+        center_world = torch.where(
+            finite_mask.unsqueeze(-1),
+            center_world,
+            torch.zeros_like(center_world),
+        )
+
+        patch_weight = center_conf.sum(dim=(3, 4))
+        weighted_world = (center_world * center_conf.unsqueeze(-1)).sum(dim=(3, 4))
+        patch_world = weighted_world / patch_weight.clamp_min(1e-6).unsqueeze(-1)
+        min_valid_ratio = max(float(getattr(self.config, "fusion_knn_min_valid_ratio", 0.25)), 0.0)
+        min_valid_weight = float(center_size * center_size) * min_valid_ratio
+        patch_valid = patch_weight > min_valid_weight
+        patch_world = torch.where(patch_valid.unsqueeze(-1), patch_world, torch.zeros_like(patch_world))
+        patch_weight = torch.where(patch_valid, patch_weight, torch.zeros_like(patch_weight))
+
+        h_patch = (h_patch // merge_size) * merge_size
+        w_patch = (w_patch // merge_size) * merge_size
+        patch_world = patch_world[:, :h_patch, :w_patch]
+        patch_weight = patch_weight[:, :h_patch, :w_patch]
+
+        patch_world = patch_world.reshape(
+            num_frames,
+            h_patch // merge_size,
+            merge_size,
+            w_patch // merge_size,
+            merge_size,
+            3,
+        )
+        patch_world = patch_world.permute(0, 1, 3, 2, 4, 5).contiguous()
+        patch_weight = patch_weight.reshape(
+            num_frames,
+            h_patch // merge_size,
+            merge_size,
+            w_patch // merge_size,
+            merge_size,
+        )
+        patch_weight = patch_weight.permute(0, 1, 3, 2, 4).contiguous()
+
+        token_weight = patch_weight.sum(dim=(3, 4))
+        token_world = (patch_world * patch_weight.unsqueeze(-1)).sum(dim=(3, 4))
+        token_world = token_world / token_weight.clamp_min(1e-6).unsqueeze(-1)
+        token_valid = token_weight > min_valid_weight
+        token_world = torch.where(token_valid.unsqueeze(-1), token_world, torch.zeros_like(token_world))
+        return token_world, token_valid
+
+    def _process_geometry_features_knn(
+        self,
+        image_embeds: torch.Tensor,
+        geometry_encoder_inputs,
+    ) -> torch.Tensor:
+        """Fuse geometry features with cross-frame KNN attention for each sample separately."""
+        fused_samples = []
+        image_cursor = 0
+
+        for sample_inputs in geometry_encoder_inputs:
+            if sample_inputs.shape[0] == 0:
+                continue
+
+            n_image, _, height, width = sample_inputs.shape
+            geometry_outputs = self.geometry_encoder.encode_with_aux(sample_inputs)
+            if "world_points" not in geometry_outputs or "world_points_conf" not in geometry_outputs:
+                raise ValueError("knn_concat requires geometry encoder outputs with world points and confidences.")
+
+            features = geometry_outputs["features"].to(image_embeds.dtype)
+            features = features.reshape(
+                n_image,
+                height // self.geometry_encoder.patch_size,
+                width // self.geometry_encoder.patch_size,
+                -1,
+            )
+            geo_embeds = self.geometry_merger(features)
+            patch_world, patch_valid = self._pool_world_points_to_token_grid(
+                geometry_outputs["world_points"],
+                geometry_outputs["world_points_conf"],
+            )
+            if geo_embeds.shape[:3] != patch_world.shape[:3]:
+                raise ValueError(
+                    "Patch world grid shape does not align with geometry features: "
+                    f"{patch_world.shape[:3]} vs {geo_embeds.shape[:3]}"
+                )
+
+            sample_num_tokens = geo_embeds.shape[0] * geo_embeds.shape[1] * geo_embeds.shape[2]
+            sample_image_embeds = image_embeds[image_cursor:image_cursor + sample_num_tokens]
+            sample_image_embeds = sample_image_embeds.reshape(geo_embeds.shape)
+            image_cursor += sample_num_tokens
+
+            fused = self.feature_fusion(
+                sample_image_embeds,
+                geo_embeds,
+                patch_world=patch_world.to(sample_image_embeds.device),
+                patch_valid=patch_valid.to(sample_image_embeds.device),
+            )
+            fused_samples.append(fused.reshape(-1, fused.shape[-1]))
+
+        if image_cursor != image_embeds.shape[0]:
+            raise ValueError(
+                f"Processed image token count mismatch for knn_concat: {image_cursor} vs {image_embeds.shape[0]}"
+            )
+        return torch.cat(fused_samples, dim=0) if fused_samples else image_embeds
+
     def _process_geometry_features(self, image_embeds, geometry_encoder_inputs, return_aux_losses: bool = False):
         """Process geometry features using the geometry encoder."""
+        fusion_method = str(getattr(self.config, "feature_fusion_method", "add")).lower()
+        if fusion_method == "knn_concat":
+            if return_aux_losses:
+                return self._process_geometry_features_knn(image_embeds, geometry_encoder_inputs), None
+            return self._process_geometry_features_knn(image_embeds, geometry_encoder_inputs)
 
         batch_size = len(geometry_encoder_inputs)
         geo_embeds = []
