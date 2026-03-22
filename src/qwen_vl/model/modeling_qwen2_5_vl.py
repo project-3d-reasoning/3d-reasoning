@@ -1521,7 +1521,9 @@ class Qwen2_5_VLCausalLMOutputWithPast(ModelOutput):
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[torch.FloatTensor]] = None
     rope_deltas: Optional[torch.LongTensor] = None
+    loss_shared: Optional[torch.FloatTensor] = None
     loss_ortho: Optional[torch.FloatTensor] = None
+    loss_recon: Optional[torch.FloatTensor] = None
     loss_nrsr_kl: Optional[torch.FloatTensor] = None
     mine_unique_features: Optional[torch.FloatTensor] = None
     mine_2d_features: Optional[torch.FloatTensor] = None
@@ -1681,7 +1683,9 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             knn_pos_mlp_hidden_size=getattr(config, "fusion_knn_pos_mlp_hidden_size", None),
         )
         self.feature_fusion = FeatureFusionModule(fusion_config)
+        self.fusion_lambda_align = getattr(config, "fusion_lambda_align", 1.0)
         self.fusion_lambda_ortho = getattr(config, "fusion_lambda_ortho", 1.0)
+        self.fusion_lambda_recon = getattr(config, "fusion_lambda_recon", 1.0)
         self.fusion_ortho_target_ratio = getattr(config, "fusion_ortho_target_ratio", None)
         self.fusion_lambda_nrsr = getattr(config, "fusion_lambda_nrsr", 1.0)
 
@@ -2456,7 +2460,9 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
         loss = None
+        loss_shared = None
         loss_ortho = None
+        loss_recon = None
         loss_nrsr_kl = None
         mine_unique_features = None
         mine_2d_features = None
@@ -2474,16 +2480,26 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
             if fusion_aux_losses is not None:
+                loss_shared_raw = fusion_aux_losses.get("loss_shared")
+                if loss_shared_raw is not None:
+                    loss_shared = loss_shared_raw.to(loss.device, loss.dtype)
                 loss_ortho_raw = fusion_aux_losses.get("loss_ortho")
                 if loss_ortho_raw is not None:
                     loss_ortho = loss_ortho_raw.to(loss.device, loss.dtype)
+                loss_recon_raw = fusion_aux_losses.get("loss_recon")
+                if loss_recon_raw is not None:
+                    loss_recon = loss_recon_raw.to(loss.device, loss.dtype)
                 loss_nrsr_kl_raw = fusion_aux_losses.get("loss_nrsr_kl")
                 if loss_nrsr_kl_raw is not None:
                     loss_nrsr_kl = loss_nrsr_kl_raw.to(loss.device, loss.dtype)
                 mine_unique_features = fusion_aux_losses.get("mine_unique_features")
                 mine_2d_features = fusion_aux_losses.get("mine_2d_features")
+                if loss_shared is not None:
+                    loss = loss + getattr(self, "fusion_lambda_align", 1.0) * loss_shared
                 if loss_ortho is not None:
                     loss = loss + getattr(self, "fusion_lambda_ortho", 1.0) * loss_ortho
+                if loss_recon is not None:
+                    loss = loss + getattr(self, "fusion_lambda_recon", 1.0) * loss_recon
                 if loss_nrsr_kl is not None:
                     loss = loss + getattr(self, "fusion_lambda_nrsr", 1.0) * loss_nrsr_kl
 
@@ -2498,7 +2514,9 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             rope_deltas=self.rope_deltas,
+            loss_shared=loss_shared,
             loss_ortho=loss_ortho,
+            loss_recon=loss_recon,
             loss_nrsr_kl=loss_nrsr_kl,
             mine_unique_features=mine_unique_features,
             mine_2d_features=mine_2d_features,

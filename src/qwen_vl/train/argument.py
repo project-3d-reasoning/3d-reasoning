@@ -23,11 +23,21 @@ class ModelArguments:
     feature_fusion_method: str = field(default="add")  # Method to fuse geometry and visual features ("add", "concat", "cross_attention", "gated", "decompose_add", "decompose_concat", "nrsr_add", "nrsr_concat", "knn_concat")
     fusion_num_layers: int = field(default=1)  # Number of Transformer-style cross-attention blocks when feature_fusion_method is "cross_attention" or "knn_concat"
     geometry_merger_type: str = field(default="mlp")  # Type of geometry feature merger ("mlp", "avg")
-    decompose_hidden_size: Optional[int] = field(default=None)  # Hidden size for shared/unique 3D decomposition MLPs
+    decompose_hidden_size: Optional[int] = field(default=None)  # Bottleneck size for shared/unique decomposition branches; defaults to hidden_size when unset
     nrsr_hidden_size: Optional[int] = field(default=None)  # Hidden size for NRSR VIB MLP
     fusion_align_mode: str = field(default="cosine")  # Alignment loss mode ("cosine", "infonce")
-    fusion_ortho_mode: str = field(default="cosine")  # Orthogonality mode ("cosine", "mine")
+    fusion_ortho_mode: str = field(default="cosine")  # Orthogonality mode ("cosine", "hsic", "mine")
+    fusion_lambda_align: float = field(default=1.0)  # Weight for shared alignment loss in decompose fusion methods
+    fusion_align_target_ratio: Optional[float] = field(default=None)  # Target late-stage weighted loss_shared / loss_ce ratio; enables dynamic lambda adjustment when set
+    fusion_align_lambda_min: float = field(default=1e-8)  # Minimum dynamic lambda for shared alignment loss
+    fusion_align_lambda_max: float = field(default=5.0)  # Maximum dynamic lambda for shared alignment loss
     fusion_lambda_ortho: float = field(default=1.0)  # Weight for orthogonality loss
+    fusion_ortho_lambda_min: float = field(default=1e-8)  # Minimum dynamic lambda for orthogonality loss
+    fusion_ortho_lambda_max: float = field(default=0.2)  # Maximum dynamic lambda for orthogonality loss
+    fusion_lambda_recon: float = field(default=1.0)  # Weight for feature reconstruction loss in decompose fusion methods
+    fusion_recon_target_ratio: Optional[float] = field(default=None)  # Target late-stage weighted loss_recon / loss_ce ratio; enables dynamic lambda adjustment when set
+    fusion_recon_lambda_min: float = field(default=1e-8)  # Minimum dynamic lambda for reconstruction loss
+    fusion_recon_lambda_max: float = field(default=5.0)  # Maximum dynamic lambda for reconstruction loss
     fusion_ortho_target_ratio: Optional[float] = field(default=None)  # Target ratio for weighted orthogonality loss vs CE loss
     fusion_lambda_nrsr: float = field(default=1.0)  # Weight for NRSR KL loss
     fusion_lambda_nrsr_dynamic: bool = field(default=True)  # Enable 3-stage dynamic schedule for NRSR lambda

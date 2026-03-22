@@ -19,7 +19,7 @@ class FeatureFusionConfig:
     nrsr_hidden_size: Optional[int] = None
     align_mode: str = "cosine"  # "cosine"(default) or "infonce"
     align_temperature: float = 0.07
-    ortho_mode: str = "cosine"  # "cosine"(default) or "mine" (mine mode uses vCLUB)
+    ortho_mode: str = "cosine"  # "cosine"(default), "hsic", or "mine" (mine mode uses vCLUB)
     mine_hidden_size: Optional[int] = None  # Hidden size for q_theta in vCLUB
     knn_k: int = 9  # Number of nearest neighbors from other frames for knn_concat; self token is added separately.
     knn_min_valid_ratio: float = 0.25  # Minimum confidence mass ratio inside the patch center window to keep a patch/token valid.
@@ -235,9 +235,9 @@ class FeatureFusionModule(nn.Module):
         self.ortho_mode = config.ortho_mode.lower()
         if self.ortho_mode == "cos":
             self.ortho_mode = "cosine"
-        if self.ortho_mode not in {"cosine", "mine"}:
+        if self.ortho_mode not in {"cosine", "hsic", "mine"}:
             raise ValueError(
-                f"Unknown ortho_mode: {config.ortho_mode}. Supported values: cosine, mine."
+                f"Unknown ortho_mode: {config.ortho_mode}. Supported values: cosine, hsic, mine."
             )
         
         self._build_fusion_layers()
@@ -258,14 +258,95 @@ class FeatureFusionModule(nn.Module):
 
         return 1.0 - F.cosine_similarity(shared_3d_f, features_2d_f, dim=-1, eps=1e-6).mean()
 
-    def _build_decompose_mapper(self, hidden_dim: int) -> nn.Module:
-        """Build lightweight mapper for shared/unique 3D feature decomposition."""
-        return nn.Sequential(
-            nn.LayerNorm(self.hidden_size),
-            nn.Linear(self.hidden_size, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, self.hidden_size),
+    def _build_projection_mlp(
+        self,
+        input_dim: int,
+        output_dim: int,
+        hidden_dim: Optional[int] = None,
+        apply_norm: bool = True,
+    ) -> nn.Module:
+        hidden_dim = hidden_dim or max(input_dim, output_dim)
+        layers = []
+        if apply_norm:
+            layers.append(nn.LayerNorm(input_dim))
+        layers.extend(
+            [
+                nn.Linear(input_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, output_dim),
+            ]
         )
+        return nn.Sequential(*layers)
+
+    def _compute_linear_hsic_flat(
+        self, unique_flat: torch.Tensor, shared_flat: torch.Tensor
+    ) -> torch.Tensor:
+        if unique_flat.numel() == 0:
+            return unique_flat.new_zeros(())
+
+        if unique_flat.shape[0] != shared_flat.shape[0]:
+            raise ValueError(
+                f"Feature pair size mismatch for HSIC objective: "
+                f"{unique_flat.shape[0]} vs {shared_flat.shape[0]}"
+            )
+
+        unique_flat = unique_flat.float()
+        shared_flat = shared_flat.float()
+        unique_centered = unique_flat - unique_flat.mean(dim=0, keepdim=True)
+        shared_centered = shared_flat - shared_flat.mean(dim=0, keepdim=True)
+        denom = max(unique_centered.shape[0] - 1, 1)
+        cross_cov = torch.matmul(unique_centered.transpose(0, 1), shared_centered) / denom
+        return cross_cov.pow(2).sum() / max(min(cross_cov.shape), 1)
+
+    def _compute_ortho_loss_flat(
+        self, unique_flat: torch.Tensor, shared_flat: torch.Tensor
+    ) -> torch.Tensor:
+        if self.ortho_mode == "mine":
+            return self._compute_vclub_bound_flat(unique_flat, shared_flat)
+        if self.ortho_mode == "hsic":
+            return self._compute_linear_hsic_flat(unique_flat, shared_flat)
+        return F.cosine_similarity(unique_flat, shared_flat, dim=-1, eps=1e-6).abs().mean()
+
+    def _decompose_modal_features(
+        self, features_2d: torch.Tensor, features_3d: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        latent_2d = self.decompose_stem_2d(features_2d)
+        latent_3d = self.decompose_stem_3d(features_3d)
+
+        gate_2d = self.decompose_gate_2d(latent_2d)
+        gate_3d = self.decompose_gate_3d(latent_3d)
+
+        shared_2d = self.decompose_shared_head(latent_2d) * gate_2d
+        shared_3d = self.decompose_shared_head(latent_3d) * gate_3d
+        unique_3d = self.decompose_unique_head_3d(latent_3d) * (1.0 - gate_3d)
+        return shared_2d, shared_3d, unique_3d
+
+    def _guided_shared_fusion(
+        self, shared_2d: torch.Tensor, shared_3d: torch.Tensor, unique_3d: torch.Tensor
+    ) -> torch.Tensor:
+        film_scale = torch.sigmoid(self.decompose_film_gate).to(shared_2d.dtype)
+        gamma, beta = torch.chunk(self.decompose_film_generator(shared_3d), 2, dim=-1)
+        shared_2d_guided = self.decompose_shared_norm(shared_2d)
+        shared_2d_guided = shared_2d_guided * (1.0 + film_scale * torch.tanh(gamma))
+        shared_2d_guided = shared_2d_guided + film_scale * beta
+
+        shared_hidden = self.decompose_shared_to_hidden(shared_2d_guided)
+        unique_hidden = self.decompose_unique_to_hidden(unique_3d)
+        if self.fusion_method == "decompose_concat":
+            fused_delta = self.decompose_projection(
+                torch.cat(
+                    [
+                        self.decompose_norm_2d(shared_hidden),
+                        self.decompose_norm_unique(unique_hidden),
+                    ],
+                    dim=-1,
+                )
+            )
+        else:
+            fused_delta = shared_hidden + unique_hidden
+
+        fuse_scale = torch.sigmoid(self.decompose_fuse_gate).to(shared_hidden.dtype)
+        return fuse_scale * fused_delta
     
     def _build_fusion_layers(self):
         """Build fusion layers based on method."""
@@ -320,15 +401,79 @@ class FeatureFusionModule(nn.Module):
             ])
 
         elif self.fusion_method in {"decompose_add", "decompose_concat"}:
+            self.decompose_latent_size = int(self.config.decompose_hidden_size or self.hidden_size)
+            if self.decompose_latent_size <= 0:
+                raise ValueError("decompose_hidden_size must be positive when using decompose fusion methods.")
+            decompose_hidden = max(
+                self.decompose_latent_size,
+                min(self.hidden_size, self.decompose_latent_size * 2),
+            )
+            recon_hidden = max(
+                self.decompose_latent_size * 2,
+                min(self.hidden_size, self.decompose_latent_size * 4),
+            )
+            self.decompose_stem_2d = self._build_projection_mlp(
+                self.hidden_size,
+                self.decompose_latent_size,
+                hidden_dim=decompose_hidden,
+            )
+            self.decompose_stem_3d = self._build_projection_mlp(
+                self.hidden_size,
+                self.decompose_latent_size,
+                hidden_dim=decompose_hidden,
+            )
+            self.decompose_shared_head = self._build_projection_mlp(
+                self.decompose_latent_size,
+                self.decompose_latent_size,
+                hidden_dim=decompose_hidden,
+            )
+            self.decompose_unique_head_3d = self._build_projection_mlp(
+                self.decompose_latent_size,
+                self.decompose_latent_size,
+                hidden_dim=decompose_hidden,
+            )
+            self.decompose_gate_2d = nn.Sequential(
+                nn.LayerNorm(self.decompose_latent_size),
+                nn.Linear(self.decompose_latent_size, self.decompose_latent_size),
+                nn.Sigmoid(),
+            )
+            self.decompose_gate_3d = nn.Sequential(
+                nn.LayerNorm(self.decompose_latent_size),
+                nn.Linear(self.decompose_latent_size, self.decompose_latent_size),
+                nn.Sigmoid(),
+            )
+            self.decompose_reconstruct_3d = self._build_projection_mlp(
+                self.decompose_latent_size * 2,
+                self.hidden_size,
+                hidden_dim=recon_hidden,
+            )
+            self.decompose_shared_norm = nn.LayerNorm(self.decompose_latent_size)
+            self.decompose_film_generator = self._build_projection_mlp(
+                self.decompose_latent_size,
+                self.decompose_latent_size * 2,
+                hidden_dim=decompose_hidden,
+            )
+            self.decompose_shared_to_hidden = self._build_projection_mlp(
+                self.decompose_latent_size,
+                self.hidden_size,
+                hidden_dim=decompose_hidden,
+            )
+            self.decompose_unique_to_hidden = self._build_projection_mlp(
+                self.decompose_latent_size,
+                self.hidden_size,
+                hidden_dim=decompose_hidden,
+            )
+            self.decompose_film_gate = nn.Parameter(torch.tensor(-2.0))
+            self.decompose_fuse_gate = nn.Parameter(torch.tensor(-2.0))
             if self.ortho_mode == "mine":
-                mine_hidden = self.config.mine_hidden_size or self.hidden_size
+                mine_hidden = self.config.mine_hidden_size or self.decompose_latent_size
                 self.mine_statistics_network = nn.Sequential(
-                    nn.LayerNorm(self.hidden_size),
-                    nn.Linear(self.hidden_size, mine_hidden),
+                    nn.LayerNorm(self.decompose_latent_size),
+                    nn.Linear(self.decompose_latent_size, mine_hidden),
                     nn.GELU(),
-                    nn.Linear(mine_hidden, self.hidden_size),
+                    nn.Linear(mine_hidden, mine_hidden),
                     nn.GELU(),
-                    nn.Linear(mine_hidden, self.hidden_size),
+                    nn.Linear(mine_hidden, self.decompose_latent_size),
                 )
                 # Keep q_theta out of the main optimizer; we train it in a dedicated step.
                 self.set_mine_network_trainable(False)
@@ -336,8 +481,8 @@ class FeatureFusionModule(nn.Module):
                 self.decompose_norm_2d = nn.LayerNorm(self.hidden_size)
                 self.decompose_norm_unique = nn.LayerNorm(self.hidden_size)
                 self.decompose_projection = nn.Linear(self.hidden_size * 2, self.hidden_size)
-                # Seed the concat projection with a decompose_add-like prior during post_init.
-                self.decompose_projection._fusion_identity_block_scales = (2.0, 1.0)
+                # Start close to a shared+unique sum so concat stays stable early in training.
+                self.decompose_projection._fusion_identity_block_scales = (1.0, 1.0)
                 self.decompose_projection._fusion_identity_noise_scale = 0.01
         elif self.fusion_method in {"nrsr_add", "nrsr_concat"}:
             nrsr_hidden = self.config.nrsr_hidden_size or self.hidden_size
@@ -636,33 +781,33 @@ class FeatureFusionModule(nn.Module):
             return fused, aux_losses
 
         elif self.fusion_method in {"decompose_add", "decompose_concat"}:
-            unique_3d = features_3d - features_2d
+            shared_2d, shared_3d, unique_3d = self._decompose_modal_features(
+                features_2d, features_3d
+            )
 
-            if self.fusion_method == "decompose_concat":
-                # Match the regular concat branch and stabilize the projection inputs.
-                features_2d_proj = self.decompose_norm_2d(features_2d)
-                unique_3d_proj = self.decompose_norm_unique(unique_3d)
-                fused = self.decompose_projection(torch.cat([features_2d_proj, unique_3d_proj], dim=-1))
-            else:
-                fused = 2*features_2d + unique_3d
+            fused = features_2d + self._guided_shared_fusion(shared_2d, shared_3d, unique_3d)
 
             if not return_aux_losses:
                 return fused
 
+            shared_2d_f = shared_2d.float()
+            shared_3d_f = shared_3d.float()
             unique_3d_f = unique_3d.float()
-            features_2d_f = features_2d.float()
-            if self.ortho_mode == "mine":
-                unique_flat = unique_3d_f.reshape(-1, unique_3d_f.shape[-1])
-                features_2d_flat = features_2d_f.reshape(-1, features_2d_f.shape[-1])
-                ortho_loss = self._compute_vclub_bound_flat(unique_flat, features_2d_flat)
-            else:
-                ortho_loss = F.cosine_similarity(unique_3d_f, features_2d_f, dim=-1, eps=1e-6).abs().mean()
+            unique_flat = unique_3d_f.reshape(-1, unique_3d_f.shape[-1])
+            shared_flat = shared_2d_f.reshape(-1, shared_2d_f.shape[-1])
+            ortho_loss = self._compute_ortho_loss_flat(unique_flat, shared_flat)
+            align_loss = self._compute_align_loss(shared_3d_f, shared_2d_f)
+
+            recon_3d = self.decompose_reconstruct_3d(torch.cat([shared_3d, unique_3d], dim=-1))
+            recon_loss = F.mse_loss(recon_3d.float(), features_3d.float())
             aux_losses = {
+                "loss_shared": align_loss,
                 "loss_ortho": ortho_loss,
+                "loss_recon": recon_loss,
             }
             if self.ortho_mode == "mine":
                 aux_losses["mine_unique_features"] = unique_flat.detach()
-                aux_losses["mine_2d_features"] = features_2d_flat.detach()
+                aux_losses["mine_2d_features"] = shared_flat.detach()
             return fused, aux_losses
             
         else:

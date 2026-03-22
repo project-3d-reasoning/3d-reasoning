@@ -182,7 +182,7 @@ def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
 
 class FusionLambdaWarmupCallback(transformers.TrainerCallback):
     """
-    Linearly warm up fusion ortho lambda from 0 to target value.
+    Linearly warm up fusion aux lambdas from 0 to their target values.
 
     Only applies when:
     - `fusion_lambda_warmup` is enabled
@@ -214,13 +214,14 @@ class FusionLambdaWarmupCallback(transformers.TrainerCallback):
             return
         if not self.enabled:
             return
-        if not hasattr(model, "fusion_lambda_ortho"):
-            rank0_print("[FusionLambdaWarmup] Skip: fusion_lambda_ortho is not found on model.")
+        self.target_lambdas = {}
+        for key in ("fusion_lambda_align", "fusion_lambda_ortho", "fusion_lambda_recon"):
+            if hasattr(model, key):
+                self.target_lambdas[key] = float(getattr(model, key))
+        if not self.target_lambdas:
+            rank0_print("[FusionLambdaWarmup] Skip: no fusion lambdas were found on model.")
             return
 
-        self.target_lambdas = {
-            "fusion_lambda_ortho": float(model.fusion_lambda_ortho),
-        }
         self.active = True
         init_factor = min(max(state.global_step, 0) / float(self.warmup_steps), 1.0)
         self._apply_factor(model, init_factor)
@@ -370,7 +371,9 @@ def train(attn_implementation="flash_attention_2"):
                 "nrsr_hidden_size",
                 "fusion_align_mode",
                 "fusion_ortho_mode",
+                "fusion_lambda_align",
                 "fusion_lambda_ortho",
+                "fusion_lambda_recon",
                 "fusion_ortho_target_ratio",
                 "fusion_lambda_nrsr",
                 "fusion_lambda_nrsr_dynamic",
@@ -440,8 +443,20 @@ def train(attn_implementation="flash_attention_2"):
         padding_side="right",
         use_fast=False,
     )
-    if model_args.fusion_ortho_target_ratio is not None:
-        setattr(training_args, "fusion_ortho_target_ratio", float(model_args.fusion_ortho_target_ratio))
+    for attr in (
+        "fusion_align_target_ratio",
+        "fusion_align_lambda_min",
+        "fusion_align_lambda_max",
+        "fusion_ortho_target_ratio",
+        "fusion_ortho_lambda_min",
+        "fusion_ortho_lambda_max",
+        "fusion_recon_target_ratio",
+        "fusion_recon_lambda_min",
+        "fusion_recon_lambda_max",
+    ):
+        value = getattr(model_args, attr, None)
+        if value is not None:
+            setattr(training_args, attr, float(value))
     set_model(model_args, model)
 
     if torch.distributed.get_rank() == 0:

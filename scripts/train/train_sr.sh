@@ -36,8 +36,16 @@ FEATURE_FUSION_METHOD="decompose_add"      # choices: add/concat/cross_attention
 FUSION_KNN_K=9                             # Number of nearest neighbors from other frames for knn_concat; self token is added automatically
 FUSION_KNN_MIN_VALID_RATIO=0.25            # Minimum confidence mass ratio in the center patch window before a patch/token is marked valid
 FUSION_KNN_POS_MLP_HIDDEN_SIZE=3584        # Hidden width of the relative-position MLP for knn_concat
-FUSION_ORTHO_MODE="cosine"                 # choices: cosine/mine
-FUSION_LAMBDA_ORTHO=1.0                    # target loss_ortho_weighted / loss_ce ratio; also used as initial lambda
+FUSION_ORTHO_MODE="hsic"                   # choices: cosine/hsic/mine
+FUSION_LAMBDA_ALIGN=1.0                    # Initial lambda for shared alignment loss
+FUSION_ALIGN_TARGET_RATIO=0.05             # Late-stage target loss_shared_weighted / loss_ce ratio
+FUSION_ALIGN_LAMBDA_MAX=5.0                # Cap for dynamic shared alignment lambda
+FUSION_LAMBDA_ORTHO=1.0                    # Initial lambda for orthogonality loss
+FUSION_ORTHO_TARGET_RATIO=0.03             # Late-stage target loss_ortho_weighted / loss_ce ratio
+FUSION_ORTHO_LAMBDA_MAX=0.2                # Cap for dynamic orthogonality lambda
+FUSION_LAMBDA_RECON=1.0                    # Initial lambda for reconstruction loss
+FUSION_RECON_TARGET_RATIO=0.05             # Late-stage target loss_recon_weighted / loss_ce ratio
+FUSION_RECON_LAMBDA_MAX=5.0                # Cap for dynamic reconstruction lambda
 FUSION_LAMBDA_NRSR=1.0
 FUSION_LAMBDA_NRSR_DYNAMIC=True
 FUSION_LAMBDA_NRSR_STAGE2_RATIO=0.10
@@ -120,8 +128,15 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --fusion_knn_min_valid_ratio $FUSION_KNN_MIN_VALID_RATIO \
             --fusion_knn_pos_mlp_hidden_size $FUSION_KNN_POS_MLP_HIDDEN_SIZE \
             --fusion_ortho_mode $FUSION_ORTHO_MODE \
+            --fusion_lambda_align $FUSION_LAMBDA_ALIGN \
+            --fusion_align_target_ratio $FUSION_ALIGN_TARGET_RATIO \
+            --fusion_align_lambda_max $FUSION_ALIGN_LAMBDA_MAX \
             --fusion_lambda_ortho $FUSION_LAMBDA_ORTHO \
-            --fusion_ortho_target_ratio $FUSION_LAMBDA_ORTHO \
+            --fusion_ortho_target_ratio $FUSION_ORTHO_TARGET_RATIO \
+            --fusion_ortho_lambda_max $FUSION_ORTHO_LAMBDA_MAX \
+            --fusion_lambda_recon $FUSION_LAMBDA_RECON \
+            --fusion_recon_target_ratio $FUSION_RECON_TARGET_RATIO \
+            --fusion_recon_lambda_max $FUSION_RECON_LAMBDA_MAX \
             --fusion_lambda_nrsr $FUSION_LAMBDA_NRSR \
             --fusion_lambda_nrsr_dynamic $FUSION_LAMBDA_NRSR_DYNAMIC \
             --fusion_lambda_nrsr_stage2_ratio $FUSION_LAMBDA_NRSR_STAGE2_RATIO \

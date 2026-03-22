@@ -31,21 +31,31 @@ TUNE_MM_VISION=False
 TUNE_MM_VISION_LORA=False
 TUNE_GEOMETRY_ENCODER=False
 TUNE_GEOMETRY_ENCODER_LORA=False
-FEATURE_FUSION_METHOD="knn_concat"      # choices: add/concat/cross_attention/gated/weighted/decompose_add/decompose_concat/nrsr_add/nrsr_concat/knn_concat
+FEATURE_FUSION_METHOD="decompose_add"      # choices: add/concat/cross_attention/gated/weighted/decompose_add/decompose_concat/nrsr_add/nrsr_concat/knn_concat
 FUSION_NUM_LAYERS=2                    # Number of Transformer-style CA blocks for cross_attention/knn_concat
 FUSION_KNN_K=5                         # Number of nearest neighbors from other frames for knn_concat; self token is added automatically
 FUSION_KNN_MIN_VALID_RATIO=0.5         # Minimum confidence mass ratio in the center patch window before a patch/token is marked valid
 FUSION_KNN_POS_MLP_HIDDEN_SIZE=3096     # Hidden width of the relative-position MLP for knn_concat
-FUSION_ORTHO_MODE="mine"                 # choices: cosine/mine
-FUSION_LAMBDA_ORTHO=0.05                 # target loss_ortho_weighted / loss_ce ratio; also used as initial lambda
+FUSION_ORTHO_MODE="hsic"                 # choices: cosine/hsic/mine; only used by decompose_* methods
+FUSION_LAMBDA_ALIGN=1.0                  # Initial lambda for shared alignment loss in decompose_* methods
+FUSION_ALIGN_TARGET_RATIO=0.03           # Late-stage target loss_shared_weighted / loss_ce ratio
+FUSION_ALIGN_LAMBDA_MAX=5.0              # Cap for dynamic shared alignment lambda
+FUSION_LAMBDA_ORTHO=0.5                 # Initial lambda for orthogonality loss
+FUSION_ORTHO_TARGET_RATIO=0.03           # Late-stage target loss_ortho_weighted / loss_ce ratio
+FUSION_ORTHO_LAMBDA_MAX=5.0             # Cap for dynamic orthogonality lambda
+FUSION_LAMBDA_RECON=1.0                  # Initial lambda for reconstruction loss in decompose_* methods
+FUSION_RECON_TARGET_RATIO=0.05           # Late-stage target loss_recon_weighted / loss_ce ratio
+FUSION_RECON_LAMBDA_MAX=5.0              # Cap for dynamic reconstruction lambda
 FUSION_LAMBDA_NRSR=1.0
 FUSION_LAMBDA_NRSR_DYNAMIC=True
 FUSION_LAMBDA_NRSR_STAGE2_RATIO=0.1
 FUSION_LAMBDA_NRSR_STAGE3_RATIO=0.05
+FUSION_LAMBDA_WARMUP=True
+FUSION_LAMBDA_WARMUP_STEPS=500
 FUSION_MINE_Q_WARMUP_STEPS=500            # q_net-only warmup updates per epoch when FUSION_ORTHO_MODE=mine
 USE_LEARNABLE_PREFIX=false
 LEARNABLE_PREFIX_LEN=10
-OUTPUT_DIR="3b-knn-tunemmlp"                   # Directory for saving checkpoints
+OUTPUT_DIR="3b-hsic"                   # Directory for saving checkpoints
 CACHE_DIR="./cache"                        # [TrainingArguments] Cache directory for models
 mkdir -p $OUTPUT_DIR
 
@@ -76,7 +86,7 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --tune_mm_llm True \
             --tune_mm_vision $TUNE_MM_VISION \
             --tune_mm_vision_lora $TUNE_MM_VISION_LORA \
-            --tune_mm_mlp False \
+            --tune_mm_mlp True \
             --dataset_use $DATASETS \
             --output_dir $OUTPUT_DIR \
             --cache_dir $CACHE_DIR \
@@ -120,12 +130,21 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --fusion_knn_min_valid_ratio $FUSION_KNN_MIN_VALID_RATIO \
             --fusion_knn_pos_mlp_hidden_size $FUSION_KNN_POS_MLP_HIDDEN_SIZE \
             --fusion_ortho_mode $FUSION_ORTHO_MODE \
+            --fusion_lambda_align $FUSION_LAMBDA_ALIGN \
+            --fusion_align_target_ratio $FUSION_ALIGN_TARGET_RATIO \
+            --fusion_align_lambda_max $FUSION_ALIGN_LAMBDA_MAX \
             --fusion_lambda_ortho $FUSION_LAMBDA_ORTHO \
-            --fusion_ortho_target_ratio $FUSION_LAMBDA_ORTHO \
+            --fusion_ortho_target_ratio $FUSION_ORTHO_TARGET_RATIO \
+            --fusion_ortho_lambda_max $FUSION_ORTHO_LAMBDA_MAX \
+            --fusion_lambda_recon $FUSION_LAMBDA_RECON \
+            --fusion_recon_target_ratio $FUSION_RECON_TARGET_RATIO \
+            --fusion_recon_lambda_max $FUSION_RECON_LAMBDA_MAX \
             --fusion_lambda_nrsr $FUSION_LAMBDA_NRSR \
             --fusion_lambda_nrsr_dynamic $FUSION_LAMBDA_NRSR_DYNAMIC \
             --fusion_lambda_nrsr_stage2_ratio $FUSION_LAMBDA_NRSR_STAGE2_RATIO \
             --fusion_lambda_nrsr_stage3_ratio $FUSION_LAMBDA_NRSR_STAGE3_RATIO \
+            --fusion_lambda_warmup $FUSION_LAMBDA_WARMUP \
+            --fusion_lambda_warmup_steps $FUSION_LAMBDA_WARMUP_STEPS \
             --fusion_mine_q_warmup_steps $FUSION_MINE_Q_WARMUP_STEPS \
             --use_learnable_prefix $USE_LEARNABLE_PREFIX \
             --learnable_prefix_len $LEARNABLE_PREFIX_LEN \
