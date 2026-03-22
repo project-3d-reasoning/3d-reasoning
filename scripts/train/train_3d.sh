@@ -38,13 +38,13 @@ FUSION_KNN_MIN_VALID_RATIO=0.5         # Minimum confidence mass ratio in the ce
 FUSION_KNN_POS_MLP_HIDDEN_SIZE=3096     # Hidden width of the relative-position MLP for knn_concat
 FUSION_ORTHO_MODE="hsic"                 # choices: cosine/hsic/mine; only used by decompose_* methods
 FUSION_LAMBDA_ALIGN=1.0                  # Initial lambda for shared alignment loss in decompose_* methods
-FUSION_ALIGN_TARGET_RATIO=0.03           # Late-stage target loss_shared_weighted / loss_ce ratio
+FUSION_ALIGN_TARGET_RATIO=0.02           # Late-stage target loss_shared_weighted / loss_ce ratio
 FUSION_ALIGN_LAMBDA_MAX=5.0              # Cap for dynamic shared alignment lambda
 FUSION_LAMBDA_ORTHO=0.5                 # Initial lambda for orthogonality loss
-FUSION_ORTHO_TARGET_RATIO=0.03           # Late-stage target loss_ortho_weighted / loss_ce ratio
+FUSION_ORTHO_TARGET_RATIO=0.01           # Late-stage target loss_ortho_weighted / loss_ce ratio
 FUSION_ORTHO_LAMBDA_MAX=5.0             # Cap for dynamic orthogonality lambda
 FUSION_LAMBDA_RECON=1.0                  # Initial lambda for reconstruction loss in decompose_* methods
-FUSION_RECON_TARGET_RATIO=0.05           # Late-stage target loss_recon_weighted / loss_ce ratio
+FUSION_RECON_TARGET_RATIO=0.04           # Late-stage target loss_recon_weighted / loss_ce ratio
 FUSION_RECON_LAMBDA_MAX=5.0              # Cap for dynamic reconstruction lambda
 FUSION_LAMBDA_NRSR=1.0
 FUSION_LAMBDA_NRSR_DYNAMIC=True
@@ -86,7 +86,7 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --tune_mm_llm True \
             --tune_mm_vision $TUNE_MM_VISION \
             --tune_mm_vision_lora $TUNE_MM_VISION_LORA \
-            --tune_mm_mlp True \
+            --tune_mm_mlp False \
             --dataset_use $DATASETS \
             --output_dir $OUTPUT_DIR \
             --cache_dir $CACHE_DIR \

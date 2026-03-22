@@ -480,6 +480,38 @@ class VGTrainer(Trainer):
         warmup_steps = int(getattr(self.args, "fusion_lambda_warmup_steps", 0) or 0)
         return (not warmup_enabled) or (self.state.global_step >= warmup_steps)
 
+    def _get_aux_lambda_bases(self, base_model: torch.nn.Module) -> Dict[str, float]:
+        lambda_bases = getattr(base_model, "_fusion_aux_lambda_bases", None)
+        if lambda_bases is None:
+            lambda_bases = {}
+            for lambda_attr in ("fusion_lambda_align", "fusion_lambda_ortho", "fusion_lambda_recon"):
+                if hasattr(base_model, lambda_attr):
+                    lambda_bases[lambda_attr] = float(getattr(base_model, lambda_attr))
+            setattr(base_model, "_fusion_aux_lambda_bases", lambda_bases)
+        return lambda_bases
+
+    def _set_aux_lambda_base(self, base_model: torch.nn.Module, lambda_attr: str, value: float) -> None:
+        lambda_bases = self._get_aux_lambda_bases(base_model)
+        lambda_bases[lambda_attr] = float(value)
+
+    def _get_aux_schedule_factor(self, loss_name: str) -> float:
+        progress = self._training_progress()
+        warmup_enabled = bool(getattr(self.args, "fusion_lambda_warmup", False))
+        warmup_steps = max(int(getattr(self.args, "fusion_lambda_warmup_steps", 0) or 0), 1)
+        warmup_factor = 1.0
+        if warmup_enabled:
+            warmup_factor = float(min(max(self.state.global_step, 0) / float(warmup_steps), 1.0))
+
+        if loss_name == "loss_recon":
+            if progress >= 0.5:
+                return 0.0
+            return warmup_factor
+        if loss_name == "loss_ortho":
+            if progress <= 0.5:
+                return 0.0
+            return float(min(max((progress - 0.5) / 0.5, 0.0), 1.0))
+        return warmup_factor
+
     def _is_nrsr_dynamic_enabled(self, model: torch.nn.Module) -> bool:
         if not bool(getattr(self.args, "fusion_lambda_nrsr_dynamic", False)):
             return False
@@ -652,21 +684,30 @@ class VGTrainer(Trainer):
             config = self._dynamic_aux_configs.get(loss_name)
             lambda_value = float(getattr(base_model, lambda_attr, 1.0))
             loss_value_log = loss_value_raw
+            schedule_factor = self._get_aux_schedule_factor(loss_name)
             if config is not None and config.get("target_ratio") is not None:
                 previous_ema = self._aux_loss_emas.get(loss_name)
                 self._aux_loss_emas[loss_name] = self._update_ema(previous_ema, loss_value_raw)
                 loss_value_log = float(self._aux_loss_emas[loss_name])
-                if should_adjust_dynamic and self._loss_ce_ema is not None:
-                    lambda_target = float(config["target_ratio"]) * float(self._loss_ce_ema) / (
+                scheduled_target_ratio = float(config["target_ratio"]) * float(schedule_factor)
+                if should_adjust_dynamic and self._loss_ce_ema is not None and schedule_factor > 0.0:
+                    lambda_target = scheduled_target_ratio * float(self._loss_ce_ema) / (
                         loss_value_log + self._ema_eps
                     )
-                    lambda_value = max(
+                    lambda_target = max(
                         float(config["lambda_min"]),
                         min(float(config["lambda_max"]), float(lambda_target)),
                     )
-                    setattr(base_model, str(config["lambda_attr"]), lambda_value)
+                    self._set_aux_lambda_base(
+                        base_model,
+                        str(config["lambda_attr"]),
+                        float(lambda_target) / float(schedule_factor),
+                    )
+                    lambda_value = float(lambda_target)
+                elif schedule_factor <= 0.0:
+                    lambda_value = 0.0
                 aux_logs[f"{lambda_attr}_dyn"] = float(lambda_value)
-                aux_logs[f"{loss_name}_ratio_target"] = float(config["target_ratio"])
+                aux_logs[f"{loss_name}_ratio_target"] = float(scheduled_target_ratio)
 
             aux_logs.update(
                 {

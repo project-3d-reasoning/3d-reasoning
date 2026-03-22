@@ -182,23 +182,56 @@ def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
 
 class FusionLambdaWarmupCallback(transformers.TrainerCallback):
     """
-    Linearly warm up fusion aux lambdas from 0 to their target values.
+    Apply staged scheduling to decompose fusion aux lambdas.
 
-    Only applies when:
-    - `fusion_lambda_warmup` is enabled
-    - fusion method is `decompose_add` or `decompose_concat`
+    Behavior:
+    - `align`: optional early warmup, then stays on.
+    - `recon`: optional early warmup, active only during the first half of training.
+    - `ortho`: stays off in the first half, then linearly ramps up from the midpoint.
     """
+
+    AUX_KEYS = ("fusion_lambda_align", "fusion_lambda_ortho", "fusion_lambda_recon")
 
     def __init__(self, enabled: bool, warmup_steps: int):
         self.enabled = enabled
         self.warmup_steps = max(int(warmup_steps), 1)
         self.active = False
-        self.target_lambdas = {}
+        self.lambda_bases = {}
 
-    def _apply_factor(self, model: torch.nn.Module, factor: float) -> None:
-        factor = float(max(0.0, min(1.0, factor)))
-        for key, target in self.target_lambdas.items():
-            setattr(model, key, target * factor)
+    def _training_progress(self, args, state) -> float:
+        max_steps = int(getattr(state, "max_steps", 0) or 0)
+        if max_steps > 0:
+            return float(max(0.0, min(1.0, state.global_step / float(max_steps))))
+
+        epoch = getattr(state, "epoch", None)
+        num_train_epochs = getattr(args, "num_train_epochs", None)
+        if epoch is not None and num_train_epochs is not None and float(num_train_epochs) > 0:
+            return float(max(0.0, min(1.0, float(epoch) / float(num_train_epochs))))
+        return 0.0
+
+    def _warmup_factor(self, state) -> float:
+        if not self.enabled:
+            return 1.0
+        return float(min(max(state.global_step, 0) / float(self.warmup_steps), 1.0))
+
+    def _schedule_factor(self, lambda_attr: str, progress: float, warmup_factor: float) -> float:
+        if lambda_attr == "fusion_lambda_recon":
+            if progress >= 0.5:
+                return 0.0
+            return warmup_factor
+        if lambda_attr == "fusion_lambda_ortho":
+            if progress <= 0.5:
+                return 0.0
+            return float(min(max((progress - 0.5) / 0.5, 0.0), 1.0))
+        return warmup_factor
+
+    def _apply_schedule(self, model: torch.nn.Module, args, state) -> None:
+        progress = self._training_progress(args, state)
+        warmup_factor = self._warmup_factor(state)
+        lambda_bases = getattr(model, "_fusion_aux_lambda_bases", self.lambda_bases)
+        for key, base_value in lambda_bases.items():
+            factor = self._schedule_factor(key, progress, warmup_factor)
+            setattr(model, key, float(base_value) * float(factor))
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
         if model is None:
@@ -212,36 +245,35 @@ class FusionLambdaWarmupCallback(transformers.TrainerCallback):
                     f"[FusionLambdaWarmup] Skip: fusion_method={fusion_method} (only decompose_* supported)."
                 )
             return
-        if not self.enabled:
-            return
-        self.target_lambdas = {}
-        for key in ("fusion_lambda_align", "fusion_lambda_ortho", "fusion_lambda_recon"):
+        self.lambda_bases = {}
+        for key in self.AUX_KEYS:
             if hasattr(model, key):
-                self.target_lambdas[key] = float(getattr(model, key))
-        if not self.target_lambdas:
+                self.lambda_bases[key] = float(getattr(model, key))
+        if not self.lambda_bases:
             rank0_print("[FusionLambdaWarmup] Skip: no fusion lambdas were found on model.")
             return
 
+        setattr(model, "_fusion_aux_lambda_bases", dict(self.lambda_bases))
         self.active = True
-        init_factor = min(max(state.global_step, 0) / float(self.warmup_steps), 1.0)
-        self._apply_factor(model, init_factor)
+        self._apply_schedule(model, args, state)
         rank0_print(
-            "[FusionLambdaWarmup] Enabled for "
-            f"{self.warmup_steps} steps, target={self.target_lambdas}, init_factor={init_factor:.4f}"
+            "[FusionLambdaWarmup] Enabled with staged schedule, "
+            f"warmup_steps={self.warmup_steps}, base_lambdas={self.lambda_bases}"
         )
 
     def on_step_begin(self, args, state, control, model=None, **kwargs):
         if not self.active or model is None:
             return
         model = _unwrap_model(model)
-        factor = min(max(state.global_step, 0) / float(self.warmup_steps), 1.0)
-        self._apply_factor(model, factor)
+        self._apply_schedule(model, args, state)
 
     def on_train_end(self, args, state, control, model=None, **kwargs):
         if not self.active or model is None:
             return
         model = _unwrap_model(model)
-        self._apply_factor(model, 1.0)
+        lambda_bases = getattr(model, "_fusion_aux_lambda_bases", self.lambda_bases)
+        for key, base_value in lambda_bases.items():
+            setattr(model, key, float(base_value))
 
 
 class FusionLambdaNRSRCallback(transformers.TrainerCallback):
