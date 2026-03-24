@@ -21,6 +21,7 @@ class FeatureFusionConfig:
     align_temperature: float = 0.07
     ortho_mode: str = "cosine"  # "cosine"(default), "hsic", or "mine" (mine mode uses vCLUB)
     mine_hidden_size: Optional[int] = None  # Hidden size for q_theta in vCLUB
+    prefix_len: int = 0  # Number of dynamic prefix tokens to summarize decompose hidden states.
     knn_k: int = 9  # Number of nearest neighbors from other frames for knn_concat; self token is added separately.
     knn_min_valid_ratio: float = 0.25  # Minimum confidence mass ratio inside the patch center window to keep a patch/token valid.
     knn_pos_mlp_hidden_size: Optional[int] = None  # Hidden width for the relative position MLP in knn_concat.
@@ -362,9 +363,9 @@ class FeatureFusionModule(nn.Module):
         unique_3d = self.decompose_unique_head_3d(latent_3d) * (1.0 - gate_3d)
         return shared_2d, shared_3d, unique_3d
 
-    def _guided_shared_fusion(
+    def _guided_hidden_states(
         self, shared_2d: torch.Tensor, shared_3d: torch.Tensor, unique_3d: torch.Tensor
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         film_scale = torch.sigmoid(self.decompose_film_gate).to(shared_2d.dtype)
         gamma, beta = torch.chunk(self.decompose_film_generator(shared_3d), 2, dim=-1)
         shared_2d_guided = self.decompose_shared_norm(shared_2d)
@@ -373,6 +374,12 @@ class FeatureFusionModule(nn.Module):
 
         shared_hidden = self.decompose_shared_to_hidden(shared_2d_guided)
         unique_hidden = self.decompose_unique_to_hidden(unique_3d)
+        return shared_hidden, unique_hidden
+
+    def _guided_shared_fusion(
+        self, shared_2d: torch.Tensor, shared_3d: torch.Tensor, unique_3d: torch.Tensor
+    ) -> torch.Tensor:
+        shared_hidden, unique_hidden = self._guided_hidden_states(shared_2d, shared_3d, unique_3d)
         if self.fusion_method == "decompose_concat":
             fused_delta = self.decompose_projection(
                 torch.cat(
@@ -388,6 +395,18 @@ class FeatureFusionModule(nn.Module):
 
         fuse_scale = torch.sigmoid(self.decompose_fuse_gate).to(shared_hidden.dtype)
         return fuse_scale * fused_delta
+
+    def _compress_decompose_prefix(
+        self, shared_hidden: torch.Tensor, unique_hidden: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        prefix_len = getattr(self, "decompose_prefix_len", 0)
+        if prefix_len <= 0:
+            return None
+
+        prefix_source = torch.cat([shared_hidden, unique_hidden], dim=-1)
+        prefix_source = prefix_source.reshape(1, -1, prefix_source.shape[-1])
+        prefix_pooled = self.decompose_prefix_pool(prefix_source.transpose(1, 2)).transpose(1, 2)
+        return self.decompose_prefix_projection(prefix_pooled).squeeze(0)
     
     def _build_fusion_layers(self):
         """Build fusion layers based on method."""
@@ -443,6 +462,7 @@ class FeatureFusionModule(nn.Module):
 
         elif self.fusion_method in {"decompose_add", "decompose_concat"}:
             self.decompose_latent_size = int(self.config.decompose_hidden_size or self.hidden_size)
+            self.decompose_prefix_len = max(int(getattr(self.config, "prefix_len", 0) or 0), 0)
             if self.decompose_latent_size <= 0:
                 raise ValueError("decompose_hidden_size must be positive when using decompose fusion methods.")
             decompose_hidden = max(
@@ -504,6 +524,14 @@ class FeatureFusionModule(nn.Module):
                 self.hidden_size,
                 hidden_dim=decompose_hidden,
             )
+            if self.decompose_prefix_len > 0:
+                prefix_hidden = max(self.hidden_size, min(self.hidden_size * 2, recon_hidden))
+                self.decompose_prefix_pool = nn.AdaptiveAvgPool1d(self.decompose_prefix_len)
+                self.decompose_prefix_projection = self._build_projection_mlp(
+                    self.hidden_size * 2,
+                    self.hidden_size,
+                    hidden_dim=prefix_hidden,
+                )
             self.decompose_film_gate = nn.Parameter(torch.tensor(-2.0))
             self.decompose_fuse_gate = nn.Parameter(torch.tensor(-2.0))
             if self.ortho_mode == "mine":
@@ -755,6 +783,7 @@ class FeatureFusionModule(nn.Module):
         patch_world: Optional[torch.Tensor] = None,
         patch_valid: Optional[torch.Tensor] = None,
         return_aux_losses: bool = False,
+        return_details: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         _, h_grid, w_grid, _ = features_3d.shape
         if self.fusion_method == "add":
@@ -809,7 +838,7 @@ class FeatureFusionModule(nn.Module):
             else:
                 fused = features_2d + unique_3d
 
-            if not return_aux_losses:
+            if not return_aux_losses and not return_details:
                 return fused
 
             mu_f = mu.float()
@@ -825,10 +854,18 @@ class FeatureFusionModule(nn.Module):
             shared_2d, shared_3d, unique_3d = self._decompose_modal_features(
                 features_2d, features_3d
             )
+            shared_hidden, unique_hidden = self._guided_hidden_states(shared_2d, shared_3d, unique_3d)
+            prefix_embeddings = None
+            if return_details:
+                prefix_embeddings = self._compress_decompose_prefix(shared_hidden, unique_hidden)
 
-            fused = features_2d + self._guided_shared_fusion(shared_2d, shared_3d, unique_3d)
+            if prefix_embeddings is not None:
+                fused = features_2d + features_3d
+            else:
+                fused_delta = self._guided_shared_fusion(shared_2d, shared_3d, unique_3d)
+                fused = features_2d + fused_delta
 
-            if not return_aux_losses:
+            if not return_aux_losses and not return_details:
                 return fused
 
             shared_2d_f = shared_2d.float()
@@ -848,6 +885,8 @@ class FeatureFusionModule(nn.Module):
                 "loss_ortho": ortho_loss,
                 "loss_recon": recon_loss,
             }
+            if prefix_embeddings is not None:
+                aux_losses["prefix_embeddings"] = prefix_embeddings
             if self.ortho_mode == "mine":
                 aux_losses["mine_unique_features"] = unique_flat.detach()
                 aux_losses["mine_2d_features"] = shared_2d_flat.detach()

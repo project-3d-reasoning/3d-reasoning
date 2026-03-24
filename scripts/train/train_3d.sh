@@ -42,7 +42,7 @@ FUSION_LAMBDA_ALIGN=1.0                  # Initial lambda for shared alignment l
 FUSION_ALIGN_TARGET_RATIO=0.02           # Late-stage target loss_shared_weighted / loss_ce ratio
 FUSION_ALIGN_LAMBDA_MAX=5.0              # Cap for dynamic shared alignment lambda
 FUSION_LAMBDA_ORTHO=0.5                 # Initial lambda for orthogonality loss
-FUSION_ORTHO_TARGET_RATIO=0.01           # Late-stage target loss_ortho_weighted / loss_ce ratio
+FUSION_ORTHO_TARGET_RATIO=0.02           # Late-stage target loss_ortho_weighted / loss_ce ratio
 FUSION_ORTHO_LAMBDA_MAX=5.0             # Cap for dynamic orthogonality lambda
 FUSION_LAMBDA_RECON=1.0                  # Initial lambda for reconstruction loss in decompose_* methods
 FUSION_RECON_TARGET_RATIO=0.04           # Late-stage target loss_recon_weighted / loss_ce ratio
@@ -54,7 +54,7 @@ FUSION_LAMBDA_NRSR_STAGE3_RATIO=0.05
 FUSION_LAMBDA_WARMUP=True
 FUSION_LAMBDA_WARMUP_STEPS=500
 FUSION_MINE_Q_WARMUP_STEPS=500            # q_net-only warmup updates per epoch when FUSION_ORTHO_MODE=mine
-USE_LEARNABLE_PREFIX=false
+USE_LEARNABLE_PREFIX=true
 LEARNABLE_PREFIX_LEN=10
 OUTPUT_DIR="3b-hsic"                   # Directory for saving checkpoints
 CACHE_DIR="./cache"                        # [TrainingArguments] Cache directory for models

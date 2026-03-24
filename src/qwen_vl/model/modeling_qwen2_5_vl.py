@@ -1678,6 +1678,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             align_temperature=getattr(config, "fusion_align_temperature", 0.07),
             ortho_mode=getattr(config, "fusion_ortho_mode", "cosine"),
             mine_hidden_size=getattr(config, "fusion_mine_hidden_size", None),
+            prefix_len=int(getattr(config, "learnable_prefix_len", 0) or 0),
             knn_k=getattr(config, "fusion_knn_k", 9),
             knn_min_valid_ratio=getattr(config, "fusion_knn_min_valid_ratio", 0.25),
             knn_pos_mlp_hidden_size=getattr(config, "fusion_knn_pos_mlp_hidden_size", None),
@@ -1821,46 +1822,120 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             )
         return torch.cat(fused_samples, dim=0) if fused_samples else image_embeds
 
-    def _process_geometry_features(self, image_embeds, geometry_encoder_inputs, return_aux_losses: bool = False):
+    def _process_geometry_features(
+        self,
+        image_embeds,
+        geometry_encoder_inputs,
+        return_aux_losses: bool = False,
+        return_prefix_embeddings: bool = False,
+    ):
         """Process geometry features using the geometry encoder."""
         fusion_method = str(getattr(self.config, "feature_fusion_method", "add")).lower()
         if fusion_method == "knn_concat":
             if return_aux_losses:
-                return self._process_geometry_features_knn(image_embeds, geometry_encoder_inputs), None
-            return self._process_geometry_features_knn(image_embeds, geometry_encoder_inputs)
+                fused = self._process_geometry_features_knn(image_embeds, geometry_encoder_inputs)
+                if return_prefix_embeddings:
+                    return fused, None, None
+                return fused, None
+            fused = self._process_geometry_features_knn(image_embeds, geometry_encoder_inputs)
+            if return_prefix_embeddings:
+                return fused, None
+            return fused
 
         batch_size = len(geometry_encoder_inputs)
-        geo_embeds = []
-        for bn in range(batch_size):
-            if geometry_encoder_inputs[bn].shape[0] > 0:
-
-                n_image, _, height, width = geometry_encoder_inputs[bn].shape
-                # Encode geometry features
-                features = self.geometry_encoder.encode(geometry_encoder_inputs[bn]).to(image_embeds.dtype)
-
-                # [n_image, h_patch_size, w_patch_size, feature_dim]
-                features = features.reshape(n_image, height // self.geometry_encoder.patch_size, width // self.geometry_encoder.patch_size, -1)
-
-                # Reshape for merger
-                features = self.geometry_merger(features)
-                geo_embeds.append(features)
-
-        geo_embeds = torch.cat(geo_embeds, dim=0) if geo_embeds else None
         fusion_aux_losses = None
-        if geo_embeds is not None:
-            image_embeds = image_embeds.view(geo_embeds.shape)
-            if return_aux_losses:
-                fused_outputs = self.feature_fusion(image_embeds, geo_embeds, return_aux_losses=True)
-                if isinstance(fused_outputs, tuple):
-                    image_embeds, fusion_aux_losses = fused_outputs
-                else:
-                    image_embeds = fused_outputs
-            else:
-                image_embeds = self.feature_fusion(image_embeds, geo_embeds)
-            image_embeds = image_embeds.view(-1, image_embeds.shape[-1])
+        prefix_embeddings = [] if return_prefix_embeddings else None
+        fused_samples = []
+        image_cursor = 0
+        aux_sums = {}
+        aux_weight = None
+        mine_unique_features = []
+        mine_2d_features = []
 
+        for bn in range(batch_size):
+            sample_inputs = geometry_encoder_inputs[bn]
+            sample_prefix = None
+
+            if sample_inputs.shape[0] > 0:
+                n_image, _, height, width = sample_inputs.shape
+                features = self.geometry_encoder.encode(sample_inputs).to(image_embeds.dtype)
+                features = features.reshape(
+                    n_image,
+                    height // self.geometry_encoder.patch_size,
+                    width // self.geometry_encoder.patch_size,
+                    -1,
+                )
+                geo_embeds = self.geometry_merger(features)
+                sample_num_tokens = geo_embeds.shape[0] * geo_embeds.shape[1] * geo_embeds.shape[2]
+                sample_image_embeds = image_embeds[image_cursor:image_cursor + sample_num_tokens]
+                sample_image_embeds = sample_image_embeds.reshape(geo_embeds.shape)
+                image_cursor += sample_num_tokens
+
+                need_details = return_aux_losses or return_prefix_embeddings
+                if need_details:
+                    sample_fused, sample_details = self.feature_fusion(
+                        sample_image_embeds,
+                        geo_embeds,
+                        return_aux_losses=return_aux_losses,
+                        return_details=return_prefix_embeddings,
+                    )
+                    sample_details = sample_details or {}
+                    sample_prefix = sample_details.pop("prefix_embeddings", None)
+                else:
+                    sample_fused = self.feature_fusion(sample_image_embeds, geo_embeds)
+                    sample_details = {}
+
+                fused_samples.append(sample_fused.reshape(-1, sample_fused.shape[-1]))
+
+                if return_aux_losses:
+                    sample_weight = sample_fused.new_tensor(float(sample_num_tokens))
+                    aux_weight = sample_weight if aux_weight is None else aux_weight + sample_weight
+                    for key in ("loss_shared", "loss_ortho", "loss_recon", "loss_nrsr_kl"):
+                        value = sample_details.get(key)
+                        if value is None:
+                            continue
+                        value = value.to(sample_weight.device, sample_weight.dtype)
+                        if key not in aux_sums:
+                            aux_sums[key] = value * sample_weight
+                        else:
+                            aux_sums[key] = aux_sums[key] + (value * sample_weight)
+                    if sample_details.get("mine_unique_features") is not None:
+                        mine_unique_features.append(sample_details["mine_unique_features"])
+                    if sample_details.get("mine_2d_features") is not None:
+                        mine_2d_features.append(sample_details["mine_2d_features"])
+
+            if return_prefix_embeddings:
+                if sample_prefix is None and self.learnable_prefix_len > 0:
+                    sample_prefix = image_embeds.new_zeros((self.learnable_prefix_len, image_embeds.shape[-1]))
+                prefix_embeddings.append(sample_prefix)
+
+        if image_cursor != image_embeds.shape[0]:
+            raise ValueError(
+                f"Processed image token count mismatch for geometry fusion: {image_cursor} vs {image_embeds.shape[0]}"
+            )
+
+        image_embeds = torch.cat(fused_samples, dim=0) if fused_samples else image_embeds
+
+        if return_aux_losses and aux_weight is not None:
+            fusion_aux_losses = {
+                key: value / aux_weight.clamp_min(1.0)
+                for key, value in aux_sums.items()
+            }
+            if mine_unique_features:
+                fusion_aux_losses["mine_unique_features"] = torch.cat(mine_unique_features, dim=0)
+            if mine_2d_features:
+                fusion_aux_losses["mine_2d_features"] = torch.cat(mine_2d_features, dim=0)
+
+        stacked_prefix_embeddings = None
+        if return_prefix_embeddings and prefix_embeddings:
+            stacked_prefix_embeddings = torch.stack(prefix_embeddings, dim=0)
+
+        if return_aux_losses and return_prefix_embeddings:
+            return image_embeds, fusion_aux_losses, stacked_prefix_embeddings
         if return_aux_losses:
             return image_embeds, fusion_aux_losses
+        if return_prefix_embeddings:
+            return image_embeds, stacked_prefix_embeddings
         return image_embeds
 
 
@@ -2088,6 +2163,102 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             if int(cache_position[0]) != 0:
                 return False
         return True
+
+    def _should_apply_dynamic_visual_prefix(
+        self,
+        prefix_embeddings: Optional[torch.Tensor],
+        past_key_values: Optional[List[torch.FloatTensor]],
+        cache_position: Optional[torch.LongTensor],
+    ) -> bool:
+        if prefix_embeddings is None:
+            return False
+        if not getattr(self.config, "use_learnable_prefix", False):
+            return False
+        if self.learnable_prefix_len <= 0:
+            return False
+        past_len = 0
+        if past_key_values is not None and hasattr(past_key_values, "get_seq_length"):
+            past_len = past_key_values.get_seq_length()
+        if past_len > 0:
+            return False
+        if cache_position is not None and cache_position.numel() > 0:
+            if int(cache_position[0]) != 0:
+                return False
+        return True
+
+    def _apply_dynamic_visual_prefix(
+        self,
+        input_ids: torch.LongTensor,
+        inputs_embeds: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        labels: Optional[torch.Tensor],
+        prefix_embeddings: torch.Tensor,
+    ) -> Tuple[torch.LongTensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if attention_mask is not None and attention_mask.dim() == 1:
+            raise ValueError("Dynamic visual prefix does not support packed 1D attention masks.")
+
+        batch_size = inputs_embeds.size(0)
+        prefix_len = prefix_embeddings.size(1)
+        prefix_embeddings = prefix_embeddings.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+
+        if attention_mask is None:
+            attention_mask = input_ids.new_ones(input_ids.shape, device=input_ids.device)
+
+        prefix_token_id = getattr(self.config, "pad_token_id", None)
+        if prefix_token_id is None:
+            prefix_token_id = 0
+
+        prefix_mask = attention_mask.new_ones(prefix_len)
+        new_input_ids = []
+        new_embeds = []
+        new_masks = []
+        new_labels = [] if labels is not None else None
+
+        for idx in range(batch_size):
+            sample_input_ids = input_ids[idx]
+            sample_embeds = inputs_embeds[idx]
+            sample_mask = attention_mask[idx]
+            sample_prefix = prefix_embeddings[idx]
+
+            vision_start_positions = torch.nonzero(
+                sample_input_ids == self.config.vision_start_token_id, as_tuple=False
+            ).squeeze(-1)
+            if vision_start_positions.numel() > 0:
+                insert_pos = int(vision_start_positions[0].item())
+            else:
+                image_positions = torch.nonzero(
+                    sample_input_ids == self.config.image_token_id, as_tuple=False
+                ).squeeze(-1)
+                if image_positions.numel() > 0:
+                    insert_pos = int(image_positions[0].item())
+                else:
+                    valid_positions = torch.nonzero(sample_mask > 0, as_tuple=False).squeeze(-1)
+                    insert_pos = int(valid_positions[0].item()) if valid_positions.numel() > 0 else 0
+
+            prefix_ids = sample_input_ids.new_full((prefix_len,), int(prefix_token_id))
+            new_input_ids.append(
+                torch.cat([sample_input_ids[:insert_pos], prefix_ids, sample_input_ids[insert_pos:]], dim=0)
+            )
+            new_embeds.append(
+                torch.cat([sample_embeds[:insert_pos], sample_prefix, sample_embeds[insert_pos:]], dim=0)
+            )
+            new_masks.append(
+                torch.cat([sample_mask[:insert_pos], prefix_mask, sample_mask[insert_pos:]], dim=0)
+            )
+
+            if labels is not None:
+                sample_labels = labels[idx]
+                prefix_labels = sample_labels.new_full((prefix_len,), -100)
+                new_labels.append(
+                    torch.cat([sample_labels[:insert_pos], prefix_labels, sample_labels[insert_pos:]], dim=0)
+                )
+
+        input_ids = torch.stack(new_input_ids, dim=0)
+        inputs_embeds = torch.stack(new_embeds, dim=0)
+        attention_mask = torch.stack(new_masks, dim=0)
+        if labels is not None:
+            labels = torch.stack(new_labels, dim=0)
+        return input_ids, inputs_embeds, attention_mask, labels
 
     def _apply_learnable_prefix(
         self,
@@ -2321,6 +2492,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         fusion_aux_losses = None
+        dynamic_prefix_embeddings = None
 
         if inputs_embeds is None:
             inputs_embeds = self.model.embed_tokens(input_ids)
@@ -2335,9 +2507,25 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                         labels is not None
                         and fusion_method in {"decompose_add", "decompose_concat", "nrsr_add", "nrsr_concat"}
                     )
-                    if need_fusion_aux_losses:
+                    need_dynamic_visual_prefix = (
+                        self.use_learnable_prefix
+                        and self.learnable_prefix_len > 0
+                        and fusion_method == "decompose_add"
+                    )
+                    if need_fusion_aux_losses and need_dynamic_visual_prefix:
+                        image_embeds, fusion_aux_losses, dynamic_prefix_embeddings = self._process_geometry_features(
+                            image_embeds,
+                            geometry_encoder_inputs,
+                            return_aux_losses=True,
+                            return_prefix_embeddings=True,
+                        )
+                    elif need_fusion_aux_losses:
                         image_embeds, fusion_aux_losses = self._process_geometry_features(
                             image_embeds, geometry_encoder_inputs, return_aux_losses=True
+                        )
+                    elif need_dynamic_visual_prefix:
+                        image_embeds, dynamic_prefix_embeddings = self._process_geometry_features(
+                            image_embeds, geometry_encoder_inputs, return_prefix_embeddings=True
                         )
                     else:
                         image_embeds = self._process_geometry_features(image_embeds, geometry_encoder_inputs)
@@ -2378,8 +2566,26 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             if attention_mask is not None:
                 attention_mask = attention_mask.to(inputs_embeds.device)
 
+        if self._should_apply_dynamic_visual_prefix(dynamic_prefix_embeddings, past_key_values, cache_position):
+            if input_ids is None:
+                raise ValueError("Dynamic visual prefix requires input_ids to compute insertion positions.")
+            input_ids, inputs_embeds, attention_mask, labels = self._apply_dynamic_visual_prefix(
+                input_ids,
+                inputs_embeds,
+                attention_mask,
+                labels,
+                dynamic_prefix_embeddings,
+            )
+            position_ids = None
+            self.rope_deltas = None
+            if cache_position is not None and cache_position.numel() != inputs_embeds.shape[1]:
+                cache_position = None
+
         base_attention_mask = attention_mask
-        if self._should_apply_learnable_prefix(past_key_values, cache_position):
+        if (
+            dynamic_prefix_embeddings is None
+            and self._should_apply_learnable_prefix(past_key_values, cache_position)
+        ):
             base_rope_deltas = None
             if position_ids is None and (base_attention_mask is None or base_attention_mask.ndim == 2):
                 if input_ids is not None:

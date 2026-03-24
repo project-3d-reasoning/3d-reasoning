@@ -187,8 +187,7 @@ class FusionLambdaWarmupCallback(transformers.TrainerCallback):
     Behavior:
     - `align`: optional early warmup, then stays on.
     - `recon`: optional early warmup, active only during the first half of training.
-    - `ortho`: stays off in the first half, linearly ramps up from 50% to 60%,
-      then stays at the target value.
+    - `ortho`: optional early warmup, then stays on from the beginning.
     """
 
     AUX_KEYS = ("fusion_lambda_align", "fusion_lambda_ortho", "fusion_lambda_recon")
@@ -221,9 +220,7 @@ class FusionLambdaWarmupCallback(transformers.TrainerCallback):
                 return 0.0
             return warmup_factor
         if lambda_attr == "fusion_lambda_ortho":
-            if progress <= 0.5:
-                return 0.0
-            return float(min(max((progress - 0.5) / 0.1, 0.0), 1.0))
+            return warmup_factor
         return warmup_factor
 
     def _apply_schedule(self, model: torch.nn.Module, args, state) -> None:
