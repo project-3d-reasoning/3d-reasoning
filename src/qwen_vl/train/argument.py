@@ -20,11 +20,12 @@ class ModelArguments:
     geometry_encoder_type: str = field(default="vggt")  # Type of geometry encoder ("vggt", "pi3")
     geometry_encoder_path: str = field(default="facebook/VGGT-1B/")  # Path to pre-trained geometry encoder model
     reference_frame: str = field(default="first")  # Reference frame for geometry encoding ("first", "last"), only available for vggt
-    feature_fusion_method: str = field(default="add")  # Method to fuse geometry and visual features ("add", "concat", "cross_attention", "gated", "decompose_add", "decompose_concat", "nrsr_add", "nrsr_concat", "knn_concat")
+    feature_fusion_method: str = field(default="add")  # Method to fuse geometry and visual features ("add", "concat", "cross_attention", "gated", "adver", "adver_ortho", "decompose_add", "decompose_concat", "nrsr_add", "nrsr_concat", "knn_concat")
     fusion_num_layers: int = field(default=1)  # Number of Transformer-style cross-attention blocks when feature_fusion_method is "cross_attention" or "knn_concat"
     geometry_merger_type: str = field(default="mlp")  # Type of geometry feature merger ("mlp", "avg")
     decompose_hidden_size: Optional[int] = field(default=None)  # Bottleneck size for shared/unique decomposition branches; defaults to hidden_size when unset
     nrsr_hidden_size: Optional[int] = field(default=None)  # Hidden size for NRSR VIB MLP
+    fusion_recon_mask_ratio: float = field(default=0.3)  # Feature-dimension mask ratio used by masked reconstruction in adver mode
     fusion_align_mode: str = field(default="cosine")  # Alignment loss mode ("cosine", "infonce")
     fusion_ortho_mode: str = field(default="cosine")  # Orthogonality mode ("cosine", "hsic", "mine")
     fusion_lambda_align: float = field(default=1.0)  # Weight for shared alignment loss in decompose fusion methods

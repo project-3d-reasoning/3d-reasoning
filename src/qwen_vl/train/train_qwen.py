@@ -182,12 +182,12 @@ def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
 
 class FusionLambdaWarmupCallback(transformers.TrainerCallback):
     """
-    Apply staged scheduling to decompose fusion aux lambdas.
+    Apply warmup-only scheduling to fusion aux lambdas.
 
     Behavior:
-    - `align`: optional early warmup, then stays on.
-    - `recon`: optional early warmup, active only during the first half of training.
-    - `ortho`: optional early warmup, then stays on from the beginning.
+    - `align`: optional early warmup, then stays on for the full training run.
+    - `recon`: optional early warmup, then stays on for the full training run.
+    - `ortho`: optional early warmup, then stays on for the full training run.
     """
 
     AUX_KEYS = ("fusion_lambda_align", "fusion_lambda_ortho", "fusion_lambda_recon")
@@ -215,12 +215,6 @@ class FusionLambdaWarmupCallback(transformers.TrainerCallback):
         return float(min(max(state.global_step, 0) / float(self.warmup_steps), 1.0))
 
     def _schedule_factor(self, lambda_attr: str, progress: float, warmup_factor: float) -> float:
-        if lambda_attr == "fusion_lambda_recon":
-            if progress >= 0.5:
-                return 0.0
-            return warmup_factor
-        if lambda_attr == "fusion_lambda_ortho":
-            return warmup_factor
         return warmup_factor
 
     def _apply_schedule(self, model: torch.nn.Module, args, state) -> None:
@@ -237,10 +231,10 @@ class FusionLambdaWarmupCallback(transformers.TrainerCallback):
         model = _unwrap_model(model)
         fusion_method = getattr(getattr(model, "config", None), "feature_fusion_method", None)
         fusion_method = str(fusion_method).lower() if fusion_method is not None else None
-        if fusion_method not in {"decompose_add", "decompose_concat"}:
+        if fusion_method not in {"adver", "adver_ortho", "decompose_add", "decompose_concat"}:
             if self.enabled:
                 rank0_print(
-                    f"[FusionLambdaWarmup] Skip: fusion_method={fusion_method} (only decompose_* supported)."
+                    f"[FusionLambdaWarmup] Skip: fusion_method={fusion_method} (only adver/adver_ortho/decompose_* supported)."
                 )
             return
         self.lambda_bases = {}
@@ -255,7 +249,7 @@ class FusionLambdaWarmupCallback(transformers.TrainerCallback):
         self.active = True
         self._apply_schedule(model, args, state)
         rank0_print(
-            "[FusionLambdaWarmup] Enabled with staged schedule, "
+            "[FusionLambdaWarmup] Enabled with warmup-only schedule, "
             f"warmup_steps={self.warmup_steps}, base_lambdas={self.lambda_bases}"
         )
 
@@ -399,6 +393,7 @@ def train(attn_implementation="flash_attention_2"):
                 "geometry_merger_type",
                 "decompose_hidden_size",
                 "nrsr_hidden_size",
+                "fusion_recon_mask_ratio",
                 "fusion_align_mode",
                 "fusion_ortho_mode",
                 "fusion_lambda_align",

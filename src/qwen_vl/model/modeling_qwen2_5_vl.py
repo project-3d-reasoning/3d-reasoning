@@ -1674,6 +1674,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             num_layers=getattr(config, "fusion_num_layers", 1),
             decompose_hidden_size=getattr(config, "decompose_hidden_size", None),
             nrsr_hidden_size=getattr(config, "nrsr_hidden_size", None),
+            recon_mask_ratio=getattr(config, "fusion_recon_mask_ratio", 0.3),
             align_mode=getattr(config, "fusion_align_mode", "cosine"),
             align_temperature=getattr(config, "fusion_align_temperature", 0.07),
             ortho_mode=getattr(config, "fusion_ortho_mode", "cosine"),
@@ -2505,12 +2506,12 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                     fusion_method = str(getattr(self.config, "feature_fusion_method", "add")).lower()
                     need_fusion_aux_losses = (
                         labels is not None
-                        and fusion_method in {"decompose_add", "decompose_concat", "nrsr_add", "nrsr_concat"}
+                        and fusion_method in {"adver", "adver_ortho", "decompose_add", "decompose_concat", "nrsr_add", "nrsr_concat"}
                     )
                     need_dynamic_visual_prefix = (
                         self.use_learnable_prefix
                         and self.learnable_prefix_len > 0
-                        and fusion_method == "decompose_add"
+                        and fusion_method in {"decompose_add", "adver_ortho"}
                     )
                     if need_fusion_aux_losses and need_dynamic_visual_prefix:
                         image_embeds, fusion_aux_losses, dynamic_prefix_embeddings = self._process_geometry_features(

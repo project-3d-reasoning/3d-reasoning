@@ -31,11 +31,12 @@ TUNE_MM_VISION=False
 TUNE_MM_VISION_LORA=False
 TUNE_GEOMETRY_ENCODER=False
 TUNE_GEOMETRY_ENCODER_LORA=False
-FEATURE_FUSION_METHOD="decompose_add"      # choices: add/concat/cross_attention/gated/weighted/decompose_add/decompose_concat/nrsr_add/nrsr_concat/knn_concat
-FUSION_NUM_LAYERS=2                    # Number of Transformer-style CA blocks for cross_attention/knn_concat
-FUSION_KNN_K=5                         # Number of nearest neighbors from other frames for knn_concat; self token is added automatically
-FUSION_KNN_MIN_VALID_RATIO=0.5         # Minimum confidence mass ratio in the center patch window before a patch/token is marked valid
-FUSION_KNN_POS_MLP_HIDDEN_SIZE=3096     # Hidden width of the relative-position MLP for knn_concat
+FEATURE_FUSION_METHOD="adver_ortho"      # choices: add/concat/cross_attention/gated/weighted/adver/adver_ortho/decompose_add/decompose_concat/nrsr_add/nrsr_concat/knn_concat
+FUSION_NUM_LAYERS=2                    # 没用Number of Transformer-style CA blocks for cross_attention/knn_concat
+FUSION_KNN_K=5                         # 没用Number of nearest neighbors from other frames for knn_concat; self token is added automatically
+FUSION_KNN_MIN_VALID_RATIO=0.5         #  没用Minimum confidence mass ratio in the center patch window before a patch/token is marked valid
+FUSION_KNN_POS_MLP_HIDDEN_SIZE=3096     # 没用Hidden width of the relative-position MLP for knn_concat
+FUSION_RECON_MASK_RATIO=0.3              # Feature-dimension mask ratio for masked reconstruction in adver mode
 FUSION_ALIGN_MODE="infonce"               # choices: cosine/infonce
 FUSION_ORTHO_MODE="hsic"                 # choices: cosine/hsic/mine; only used by decompose_* methods
 FUSION_LAMBDA_ALIGN=1.0                  # Initial lambda for shared alignment loss in decompose_* methods
@@ -47,12 +48,12 @@ FUSION_ORTHO_LAMBDA_MAX=5.0             # Cap for dynamic orthogonality lambda
 FUSION_LAMBDA_RECON=1.0                  # Initial lambda for reconstruction loss in decompose_* methods
 FUSION_RECON_TARGET_RATIO=0.04           # Late-stage target loss_recon_weighted / loss_ce ratio
 FUSION_RECON_LAMBDA_MAX=5.0              # Cap for dynamic reconstruction lambda
-FUSION_LAMBDA_NRSR=1.0
-FUSION_LAMBDA_NRSR_DYNAMIC=True
-FUSION_LAMBDA_NRSR_STAGE2_RATIO=0.1
-FUSION_LAMBDA_NRSR_STAGE3_RATIO=0.05
-FUSION_LAMBDA_WARMUP=True
-FUSION_LAMBDA_WARMUP_STEPS=500
+FUSION_LAMBDA_NRSR=1.0                  # 没用
+FUSION_LAMBDA_NRSR_DYNAMIC=True        # 没用
+FUSION_LAMBDA_NRSR_STAGE2_RATIO=0.1    # 没用
+FUSION_LAMBDA_NRSR_STAGE3_RATIO=0.05    # 没用
+FUSION_LAMBDA_WARMUP=True               
+FUSION_LAMBDA_WARMUP_STEPS=500           
 FUSION_MINE_Q_WARMUP_STEPS=500            # q_net-only warmup updates per epoch when FUSION_ORTHO_MODE=mine
 USE_LEARNABLE_PREFIX=true
 LEARNABLE_PREFIX_LEN=10
@@ -130,6 +131,7 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --fusion_knn_k $FUSION_KNN_K \
             --fusion_knn_min_valid_ratio $FUSION_KNN_MIN_VALID_RATIO \
             --fusion_knn_pos_mlp_hidden_size $FUSION_KNN_POS_MLP_HIDDEN_SIZE \
+            --fusion_recon_mask_ratio $FUSION_RECON_MASK_RATIO \
             --fusion_align_mode $FUSION_ALIGN_MODE \
             --fusion_ortho_mode $FUSION_ORTHO_MODE \
             --fusion_lambda_align $FUSION_LAMBDA_ALIGN \

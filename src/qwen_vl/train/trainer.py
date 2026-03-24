@@ -495,19 +495,12 @@ class VGTrainer(Trainer):
         lambda_bases[lambda_attr] = float(value)
 
     def _get_aux_schedule_factor(self, loss_name: str) -> float:
-        progress = self._training_progress()
         warmup_enabled = bool(getattr(self.args, "fusion_lambda_warmup", False))
         warmup_steps = max(int(getattr(self.args, "fusion_lambda_warmup_steps", 0) or 0), 1)
         warmup_factor = 1.0
         if warmup_enabled:
             warmup_factor = float(min(max(self.state.global_step, 0) / float(warmup_steps), 1.0))
 
-        if loss_name == "loss_recon":
-            if progress >= 0.5:
-                return 0.0
-            return warmup_factor
-        if loss_name == "loss_ortho":
-            return warmup_factor
         return warmup_factor
 
     def _is_nrsr_dynamic_enabled(self, model: torch.nn.Module) -> bool:

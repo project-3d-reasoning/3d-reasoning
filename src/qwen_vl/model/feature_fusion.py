@@ -10,13 +10,14 @@ from dataclasses import dataclass
 @dataclass
 class FeatureFusionConfig:
     """Configuration for feature fusion."""
-    fusion_method: str = "add"  # "add", "concat", "gated", "weighted", "cross_attention", "decompose_add", "decompose_concat", "nrsr_add", "nrsr_concat", "knn_concat"
+    fusion_method: str = "add"  # "add", "concat", "gated", "weighted", "cross_attention", "adver", "adver_ortho", "decompose_add", "decompose_concat", "nrsr_add", "nrsr_concat", "knn_concat"
     hidden_size: int = 3584
     num_heads: int = 8
     dropout: float = 0.1
     num_layers: int = 1
     decompose_hidden_size: Optional[int] = None
     nrsr_hidden_size: Optional[int] = None
+    recon_mask_ratio: float = 0.3  # Feature-dimension mask ratio for masked reconstruction in adver mode.
     align_mode: str = "cosine"  # "cosine"(default) or "infonce"
     align_temperature: float = 0.07
     ortho_mode: str = "cosine"  # "cosine"(default), "hsic", or "mine" (mine mode uses vCLUB)
@@ -233,6 +234,7 @@ class FeatureFusionModule(nn.Module):
                 f"Unknown align_mode: {config.align_mode}. Supported values: cosine, infonce."
             )
         self.align_temperature = max(float(config.align_temperature), 1e-6)
+        self.recon_mask_ratio = float(min(max(getattr(config, "recon_mask_ratio", 0.3), 0.0), 1.0))
         self.ortho_mode = config.ortho_mode.lower()
         if self.ortho_mode == "cos":
             self.ortho_mode = "cosine"
@@ -363,6 +365,43 @@ class FeatureFusionModule(nn.Module):
         unique_3d = self.decompose_unique_head_3d(latent_3d) * (1.0 - gate_3d)
         return shared_2d, shared_3d, unique_3d
 
+    def _build_masked_recon_inputs(
+        self, features: torch.Tensor
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        mask_ratio = float(self.recon_mask_ratio)
+        if (not self.training) or mask_ratio <= 0.0:
+            return features, None
+
+        keep_prob = max(1.0 - mask_ratio, 0.0)
+        if keep_prob <= 0.0:
+            keep_mask = torch.zeros(features.shape, device=features.device, dtype=features.dtype)
+            masked_features = torch.zeros_like(features)
+            masked_positions = torch.ones_like(features)
+            return masked_features, masked_positions
+
+        keep_mask = (
+            torch.rand(features.shape, device=features.device) < keep_prob
+        ).to(features.dtype)
+        masked_features = features * keep_mask / keep_prob
+        masked_positions = 1.0 - keep_mask
+        return masked_features, masked_positions
+
+    def _compute_masked_recon_loss(
+        self,
+        recon_features: torch.Tensor,
+        target_features: torch.Tensor,
+        masked_positions: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        diff_sq = (recon_features.float() - target_features.float()).pow(2)
+        if masked_positions is None:
+            return diff_sq.mean()
+
+        masked_positions = masked_positions.to(diff_sq.dtype)
+        masked_weight = masked_positions.sum()
+        if masked_weight.item() <= 0:
+            return diff_sq.mean()
+        return (diff_sq * masked_positions).sum() / masked_weight
+
     def _guided_hidden_states(
         self, shared_2d: torch.Tensor, shared_3d: torch.Tensor, unique_3d: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -396,6 +435,28 @@ class FeatureFusionModule(nn.Module):
         fuse_scale = torch.sigmoid(self.decompose_fuse_gate).to(shared_hidden.dtype)
         return fuse_scale * fused_delta
 
+    def _compress_prefix_segments(
+        self,
+        prefix_source: torch.Tensor,
+        prefix_len: int,
+    ) -> Optional[torch.Tensor]:
+        if prefix_len <= 0:
+            return None
+
+        prefix_source = prefix_source.reshape(-1, prefix_source.shape[-1])
+        seq_len = prefix_source.shape[0]
+        if seq_len == 0:
+            return prefix_source.new_zeros((prefix_len, prefix_source.shape[-1]))
+
+        pooled_segments = []
+        for idx in range(prefix_len):
+            start = (idx * seq_len) // prefix_len
+            end = ((idx + 1) * seq_len + prefix_len - 1) // prefix_len
+            end = max(end, start + 1)
+            end = min(end, seq_len)
+            pooled_segments.append(prefix_source[start:end].mean(dim=0))
+        return torch.stack(pooled_segments, dim=0)
+
     def _compress_decompose_prefix(
         self, shared_hidden: torch.Tensor, unique_hidden: torch.Tensor
     ) -> Optional[torch.Tensor]:
@@ -404,9 +465,38 @@ class FeatureFusionModule(nn.Module):
             return None
 
         prefix_source = torch.cat([shared_hidden, unique_hidden], dim=-1)
-        prefix_source = prefix_source.reshape(1, -1, prefix_source.shape[-1])
-        prefix_pooled = self.decompose_prefix_pool(prefix_source.transpose(1, 2)).transpose(1, 2)
-        return self.decompose_prefix_projection(prefix_pooled).squeeze(0)
+        prefix_pooled = self._compress_prefix_segments(prefix_source, prefix_len)
+        return self.decompose_prefix_projection(prefix_pooled)
+
+    def _compress_adver_prefix(
+        self, unique_hidden: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        prefix_len = getattr(self, "adver_prefix_len", 0)
+        if prefix_len <= 0:
+            return None
+
+        prefix_memory = unique_hidden.reshape(1, -1, unique_hidden.shape[-1])
+        if prefix_memory.shape[1] == 0:
+            return unique_hidden.new_zeros((prefix_len, self.hidden_size))
+
+        prefix_queries = self.adver_prefix_queries.unsqueeze(0).to(
+            device=unique_hidden.device,
+            dtype=unique_hidden.dtype,
+        )
+        query_states = prefix_queries.expand(prefix_memory.shape[0], -1, -1)
+        attn_query = self.adver_prefix_query_norm(query_states)
+        attn_memory = self.adver_prefix_memory_norm(prefix_memory)
+        attn_output, _ = self.adver_prefix_cross_attention(
+            query=attn_query,
+            key=attn_memory,
+            value=attn_memory,
+            need_weights=False,
+        )
+        prefix_hidden = query_states + attn_output
+        prefix_hidden = prefix_hidden + self.adver_prefix_mlp(
+            self.adver_prefix_output_norm(prefix_hidden)
+        )
+        return self.adver_prefix_projection(prefix_hidden.squeeze(0))
     
     def _build_fusion_layers(self):
         """Build fusion layers based on method."""
@@ -459,6 +549,79 @@ class FeatureFusionModule(nn.Module):
                 )
                 for _ in range(knn_num_layers)
             ])
+
+        elif self.fusion_method in {"adver", "adver_ortho"}:
+            adver_align_size = int(self.config.decompose_hidden_size or self.hidden_size)
+            if adver_align_size <= 0:
+                raise ValueError("decompose_hidden_size must be positive when using adver/adver_ortho fusion.")
+            adver_hidden = max(
+                self.hidden_size,
+                min(self.hidden_size * 2, max(adver_align_size, self.hidden_size)),
+            )
+            recon_hidden = max(self.hidden_size, min(self.hidden_size * 2, adver_align_size * 2))
+            self.adver_prefix_len = max(int(getattr(self.config, "prefix_len", 0) or 0), 0)
+            self.adver_shared_encoder = self._build_projection_mlp(
+                self.hidden_size,
+                self.hidden_size,
+                hidden_dim=adver_hidden,
+            )
+            self.adver_align_proj_2d = self._build_projection_mlp(
+                self.hidden_size,
+                adver_align_size,
+                hidden_dim=adver_hidden,
+            )
+            self.adver_align_proj_3d = self._build_projection_mlp(
+                self.hidden_size,
+                adver_align_size,
+                hidden_dim=adver_hidden,
+            )
+            self.adver_reconstruct_3d = self._build_projection_mlp(
+                self.hidden_size,
+                self.hidden_size,
+                hidden_dim=recon_hidden,
+            )
+            if self.fusion_method == "adver_ortho":
+                self.adver_unique_encoder = self._build_projection_mlp(
+                    self.hidden_size,
+                    self.hidden_size,
+                    hidden_dim=adver_hidden,
+                )
+                self.adver_joint_reconstruct_3d = self._build_projection_mlp(
+                    self.hidden_size * 2,
+                    self.hidden_size,
+                    hidden_dim=max(self.hidden_size * 2, recon_hidden),
+                    apply_norm=True,
+                )
+                if self.adver_prefix_len > 0:
+                    if self.hidden_size % self.config.num_heads != 0:
+                        raise ValueError(
+                            f"hidden_size ({self.hidden_size}) must be divisible by num_heads "
+                            f"({self.config.num_heads}) for adver_ortho dynamic prefix."
+                        )
+                    self.adver_prefix_queries = nn.Parameter(
+                        torch.randn(self.adver_prefix_len, self.hidden_size) * 0.02
+                    )
+                    self.adver_prefix_query_norm = nn.LayerNorm(self.hidden_size)
+                    self.adver_prefix_memory_norm = nn.LayerNorm(self.hidden_size)
+                    self.adver_prefix_cross_attention = nn.MultiheadAttention(
+                        embed_dim=self.hidden_size,
+                        num_heads=self.config.num_heads,
+                        dropout=self.config.dropout,
+                        batch_first=True,
+                    )
+                    self.adver_prefix_output_norm = nn.LayerNorm(self.hidden_size)
+                    self.adver_prefix_mlp = nn.Sequential(
+                        nn.Linear(self.hidden_size, adver_hidden),
+                        nn.GELU(),
+                        nn.Dropout(self.config.dropout),
+                        nn.Linear(adver_hidden, self.hidden_size),
+                        nn.Dropout(self.config.dropout),
+                    )
+                    self.adver_prefix_projection = self._build_projection_mlp(
+                        self.hidden_size,
+                        self.hidden_size,
+                        hidden_dim=adver_hidden,
+                    )
 
         elif self.fusion_method in {"decompose_add", "decompose_concat"}:
             self.decompose_latent_size = int(self.config.decompose_hidden_size or self.hidden_size)
@@ -526,7 +689,6 @@ class FeatureFusionModule(nn.Module):
             )
             if self.decompose_prefix_len > 0:
                 prefix_hidden = max(self.hidden_size, min(self.hidden_size * 2, recon_hidden))
-                self.decompose_prefix_pool = nn.AdaptiveAvgPool1d(self.decompose_prefix_len)
                 self.decompose_prefix_projection = self._build_projection_mlp(
                     self.hidden_size * 2,
                     self.hidden_size,
@@ -821,6 +983,66 @@ class FeatureFusionModule(nn.Module):
             if patch_world is None:
                 raise ValueError("patch_world must be provided for knn_concat fusion.")
             return self._knn_cross_attention(features_2d, features_3d, patch_world, patch_valid)
+
+        elif self.fusion_method == "adver":
+            shared_3d_hidden = self.adver_shared_encoder(features_3d)
+            fused = features_2d + shared_3d_hidden
+
+            if not return_aux_losses and not return_details:
+                return fused
+
+            align_2d = self.adver_align_proj_2d(features_2d)
+            align_3d = self.adver_align_proj_3d(shared_3d_hidden)
+            align_loss = self._compute_align_loss(align_3d.float(), align_2d.float())
+
+            masked_features_3d, masked_positions = self._build_masked_recon_inputs(features_3d)
+            masked_shared_3d_hidden = self.adver_shared_encoder(masked_features_3d)
+            recon_3d = self.adver_reconstruct_3d(masked_shared_3d_hidden)
+            recon_loss = self._compute_masked_recon_loss(recon_3d, features_3d, masked_positions)
+
+            aux_losses = {
+                "loss_shared": align_loss,
+                "loss_recon": recon_loss,
+            }
+            return fused, aux_losses
+
+        elif self.fusion_method == "adver_ortho":
+            shared_3d_hidden = self.adver_shared_encoder(features_3d)
+            unique_3d_hidden = self.adver_unique_encoder(features_3d)
+            fused = features_2d + shared_3d_hidden
+
+            prefix_embeddings = None
+            if return_details:
+                prefix_embeddings = self._compress_adver_prefix(unique_3d_hidden)
+
+            if not return_aux_losses and not return_details:
+                return fused
+
+            aux_losses = {}
+            if return_aux_losses:
+                align_2d = self.adver_align_proj_2d(features_2d)
+                align_3d = self.adver_align_proj_3d(shared_3d_hidden)
+                align_loss = self._compute_align_loss(align_3d.float(), align_2d.float())
+
+                shared_flat = shared_3d_hidden.float().reshape(-1, shared_3d_hidden.shape[-1])
+                unique_flat = unique_3d_hidden.float().reshape(-1, unique_3d_hidden.shape[-1])
+                ortho_loss = self._compute_rbf_hsic_flat(unique_flat, shared_flat)
+
+                recon_3d = self.adver_joint_reconstruct_3d(
+                    torch.cat([shared_3d_hidden, unique_3d_hidden], dim=-1)
+                )
+                recon_loss = F.mse_loss(recon_3d.float(), features_3d.float())
+
+                aux_losses.update(
+                    {
+                        "loss_shared": align_loss,
+                        "loss_ortho": ortho_loss,
+                        "loss_recon": recon_loss,
+                    }
+                )
+            if prefix_embeddings is not None:
+                aux_losses["prefix_embeddings"] = prefix_embeddings
+            return fused, aux_losses
 
         elif self.fusion_method in {"nrsr_add", "nrsr_concat"}:
             stats = self.nrsr_encoder(features_3d)
