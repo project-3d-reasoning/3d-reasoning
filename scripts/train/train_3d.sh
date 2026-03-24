@@ -36,6 +36,7 @@ FUSION_NUM_LAYERS=2                    # Number of Transformer-style CA blocks f
 FUSION_KNN_K=5                         # Number of nearest neighbors from other frames for knn_concat; self token is added automatically
 FUSION_KNN_MIN_VALID_RATIO=0.5         # Minimum confidence mass ratio in the center patch window before a patch/token is marked valid
 FUSION_KNN_POS_MLP_HIDDEN_SIZE=3096     # Hidden width of the relative-position MLP for knn_concat
+FUSION_ALIGN_MODE="infonce"               # choices: cosine/infonce
 FUSION_ORTHO_MODE="hsic"                 # choices: cosine/hsic/mine; only used by decompose_* methods
 FUSION_LAMBDA_ALIGN=1.0                  # Initial lambda for shared alignment loss in decompose_* methods
 FUSION_ALIGN_TARGET_RATIO=0.02           # Late-stage target loss_shared_weighted / loss_ce ratio
@@ -111,7 +112,7 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --lr_scheduler_type "cosine" \
             --weight_decay 0.01 \
             --logging_steps 10 \
-            --save_steps 1000 \
+            --save_steps 100 \
             --save_total_limit 1 \
             --deepspeed "scripts/zero2_opt.json" \
             --gradient_checkpointing \
@@ -129,6 +130,7 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --fusion_knn_k $FUSION_KNN_K \
             --fusion_knn_min_valid_ratio $FUSION_KNN_MIN_VALID_RATIO \
             --fusion_knn_pos_mlp_hidden_size $FUSION_KNN_POS_MLP_HIDDEN_SIZE \
+            --fusion_align_mode $FUSION_ALIGN_MODE \
             --fusion_ortho_mode $FUSION_ORTHO_MODE \
             --fusion_lambda_align $FUSION_LAMBDA_ALIGN \
             --fusion_align_target_ratio $FUSION_ALIGN_TARGET_RATIO \

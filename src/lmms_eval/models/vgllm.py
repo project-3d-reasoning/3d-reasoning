@@ -52,6 +52,9 @@ class VGLLM(lmms):
         max_image_size: Optional[int] = None,  # Only applicable if use_custom_video_loader is True
         max_length: Optional[int] = None,
         add_frame_index: bool=False,
+        use_geometry_encoder: Optional[bool] = None,
+        geometry_encoder_type: Optional[str] = None,
+        reference_frame: Optional[str] = None,
         tune_mm_vision: Optional[bool] = None,
         tune_mm_vision_lora: Optional[bool] = None,
         tune_geometry_encoder: Optional[bool] = None,
@@ -59,11 +62,23 @@ class VGLLM(lmms):
         use_learnable_prefix: Optional[bool] = None,
         learnable_prefix_len: Optional[int] = None,
         feature_fusion_method: Optional[str] = None,
+        fusion_num_layers: Optional[int] = None,
+        geometry_merger_type: Optional[str] = None,
         decompose_hidden_size: Optional[int] = None,
+        nrsr_hidden_size: Optional[int] = None,
         fusion_align_mode: Optional[str] = None,
         fusion_ortho_mode: Optional[str] = None,
+        fusion_lambda_align: Optional[float] = None,
         fusion_lambda_ortho: Optional[float] = None,
+        fusion_lambda_recon: Optional[float] = None,
         fusion_ortho_target_ratio: Optional[float] = None,
+        fusion_lambda_nrsr: Optional[float] = None,
+        fusion_lambda_nrsr_dynamic: Optional[bool] = None,
+        fusion_lambda_nrsr_stage2_ratio: Optional[float] = None,
+        fusion_lambda_nrsr_stage3_ratio: Optional[float] = None,
+        fusion_lambda_warmup: Optional[bool] = None,
+        fusion_lambda_warmup_steps: Optional[int] = None,
+        fusion_mine_q_warmup_steps: Optional[int] = None,
         fusion_knn_k: Optional[int] = None,
         fusion_knn_min_valid_ratio: Optional[float] = None,
         fusion_knn_pos_mlp_hidden_size: Optional[int] = None,
@@ -94,18 +109,48 @@ class VGLLM(lmms):
             self.device_map = f"cuda:{accelerator.local_process_index}"
 
         config = AutoConfig.from_pretrained(pretrained)
+        if use_geometry_encoder is not None:
+            setattr(config, "use_geometry_encoder", use_geometry_encoder)
+        if geometry_encoder_type is not None:
+            setattr(config, "geometry_encoder_type", geometry_encoder_type)
+        if reference_frame is not None:
+            setattr(config, "reference_frame", reference_frame)
         if feature_fusion_method is not None:
             setattr(config, "feature_fusion_method", feature_fusion_method)
+        if fusion_num_layers is not None:
+            setattr(config, "fusion_num_layers", fusion_num_layers)
+        if geometry_merger_type is not None:
+            setattr(config, "geometry_merger_type", geometry_merger_type)
         if decompose_hidden_size is not None:
             setattr(config, "decompose_hidden_size", decompose_hidden_size)
+        if nrsr_hidden_size is not None:
+            setattr(config, "nrsr_hidden_size", nrsr_hidden_size)
         if fusion_align_mode is not None:
             setattr(config, "fusion_align_mode", fusion_align_mode)
         if fusion_ortho_mode is not None:
             setattr(config, "fusion_ortho_mode", fusion_ortho_mode)
+        if fusion_lambda_align is not None:
+            setattr(config, "fusion_lambda_align", fusion_lambda_align)
         if fusion_lambda_ortho is not None:
             setattr(config, "fusion_lambda_ortho", fusion_lambda_ortho)
+        if fusion_lambda_recon is not None:
+            setattr(config, "fusion_lambda_recon", fusion_lambda_recon)
         if fusion_ortho_target_ratio is not None:
             setattr(config, "fusion_ortho_target_ratio", fusion_ortho_target_ratio)
+        if fusion_lambda_nrsr is not None:
+            setattr(config, "fusion_lambda_nrsr", fusion_lambda_nrsr)
+        if fusion_lambda_nrsr_dynamic is not None:
+            setattr(config, "fusion_lambda_nrsr_dynamic", fusion_lambda_nrsr_dynamic)
+        if fusion_lambda_nrsr_stage2_ratio is not None:
+            setattr(config, "fusion_lambda_nrsr_stage2_ratio", fusion_lambda_nrsr_stage2_ratio)
+        if fusion_lambda_nrsr_stage3_ratio is not None:
+            setattr(config, "fusion_lambda_nrsr_stage3_ratio", fusion_lambda_nrsr_stage3_ratio)
+        if fusion_lambda_warmup is not None:
+            setattr(config, "fusion_lambda_warmup", fusion_lambda_warmup)
+        if fusion_lambda_warmup_steps is not None:
+            setattr(config, "fusion_lambda_warmup_steps", fusion_lambda_warmup_steps)
+        if fusion_mine_q_warmup_steps is not None:
+            setattr(config, "fusion_mine_q_warmup_steps", fusion_mine_q_warmup_steps)
         if fusion_knn_k is not None:
             setattr(config, "fusion_knn_k", fusion_knn_k)
         if fusion_knn_min_valid_ratio is not None:

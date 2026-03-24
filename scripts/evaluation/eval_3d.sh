@@ -4,15 +4,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../utils/select_available_gpus.sh"
 
 export NCCL_NVLS_ENABLE=0
-benchmark=scanrefer # choices: [scan2cap, scanrefer, scannet_4frames, scannet_6frames]
+benchmark=scan2cap # choices: [scan2cap, scanrefer, scannet_4frames, scannet_6frames]
 output_path=logs/$(TZ="Asia/Shanghai" date "+%Y%m%d")
-model_path=/data7t-root/r1/dmgg/VG-LLM/3b-knn-tunemmlp
-FEATURE_FUSION_METHOD="knn_concat" # choices: add/concat/cross_attention/gated/weighted/decompose_add/decompose_concat/nrsr_add/nrsr_concat/knn_concat
+model_path=/data7t-root/r1/dmgg/VG-LLM/3b-hsic
+FEATURE_FUSION_METHOD="decompose_add" # choices: add/concat/cross_attention/gated/weighted/decompose_add/decompose_concat/nrsr_add/nrsr_concat/knn_concat
 FUSION_NUM_LAYERS=2
 FUSION_KNN_K=9
 FUSION_KNN_MIN_VALID_RATIO=0.5
 FUSION_KNN_POS_MLP_HIDDEN_SIZE=1024
-FUSION_ORTHO_MODE="mine"
+FUSION_ORTHO_MODE="hsic"
 FUSION_LAMBDA_ORTHO=0.02 # target loss_ortho_weighted / loss_ce ratio; reused as eval-time lambda for config compatibility
 USE_LEARNABLE_PREFIX=false
 LEARNABLE_PREFIX_LEN=0

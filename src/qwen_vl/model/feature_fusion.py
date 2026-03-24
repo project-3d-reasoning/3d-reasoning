@@ -278,7 +278,33 @@ class FeatureFusionModule(nn.Module):
         )
         return nn.Sequential(*layers)
 
-    def _compute_linear_hsic_flat(
+    def _compute_pairwise_sq_dist(self, features: torch.Tensor) -> torch.Tensor:
+        features = features.float()
+        sq_norm = (features ** 2).sum(dim=-1, keepdim=True)
+        sq_dist = sq_norm + sq_norm.transpose(0, 1) - (2.0 * torch.matmul(features, features.transpose(0, 1)))
+        return sq_dist.clamp_min_(0.0)
+
+    def _compute_rbf_kernel(self, features: torch.Tensor) -> torch.Tensor:
+        sq_dist = self._compute_pairwise_sq_dist(features)
+        num_samples = sq_dist.shape[0]
+        if num_samples <= 1:
+            return torch.ones_like(sq_dist)
+
+        with torch.no_grad():
+            diag_mask = torch.eye(num_samples, dtype=torch.bool, device=sq_dist.device)
+            off_diag_sq_dist = sq_dist.masked_select(~diag_mask)
+            positive_sq_dist = off_diag_sq_dist[off_diag_sq_dist > 0]
+            if positive_sq_dist.numel() > 0:
+                bandwidth_sq = positive_sq_dist.median()
+            elif off_diag_sq_dist.numel() > 0:
+                bandwidth_sq = off_diag_sq_dist.mean()
+            else:
+                bandwidth_sq = sq_dist.new_tensor(1.0)
+            bandwidth_sq = bandwidth_sq.clamp_min(1e-6)
+
+        return torch.exp(-sq_dist / (2.0 * bandwidth_sq))
+
+    def _compute_rbf_hsic_flat(
         self, unique_flat: torch.Tensor, shared_flat: torch.Tensor
     ) -> torch.Tensor:
         if unique_flat.numel() == 0:
@@ -290,13 +316,28 @@ class FeatureFusionModule(nn.Module):
                 f"{unique_flat.shape[0]} vs {shared_flat.shape[0]}"
             )
 
-        unique_flat = unique_flat.float()
-        shared_flat = shared_flat.float()
-        unique_centered = unique_flat - unique_flat.mean(dim=0, keepdim=True)
-        shared_centered = shared_flat - shared_flat.mean(dim=0, keepdim=True)
-        denom = max(unique_centered.shape[0] - 1, 1)
-        cross_cov = torch.matmul(unique_centered.transpose(0, 1), shared_centered) / denom
-        return cross_cov.pow(2).sum() / max(min(cross_cov.shape), 1)
+        num_samples = unique_flat.shape[0]
+        if num_samples <= 1:
+            return unique_flat.new_zeros(())
+
+        kernel_unique = self._compute_rbf_kernel(unique_flat)
+        kernel_shared = self._compute_rbf_kernel(shared_flat)
+
+        kernel_unique_centered = (
+            kernel_unique
+            - kernel_unique.mean(dim=0, keepdim=True)
+            - kernel_unique.mean(dim=1, keepdim=True)
+            + kernel_unique.mean()
+        )
+        kernel_shared_centered = (
+            kernel_shared
+            - kernel_shared.mean(dim=0, keepdim=True)
+            - kernel_shared.mean(dim=1, keepdim=True)
+            + kernel_shared.mean()
+        )
+        hsic = (kernel_unique_centered * kernel_shared_centered).sum()
+        hsic = hsic / float((num_samples - 1) ** 2)
+        return torch.clamp(hsic, min=0.0)
 
     def _compute_ortho_loss_flat(
         self, unique_flat: torch.Tensor, shared_flat: torch.Tensor
@@ -304,7 +345,7 @@ class FeatureFusionModule(nn.Module):
         if self.ortho_mode == "mine":
             return self._compute_vclub_bound_flat(unique_flat, shared_flat)
         if self.ortho_mode == "hsic":
-            return self._compute_linear_hsic_flat(unique_flat, shared_flat)
+            return self._compute_rbf_hsic_flat(unique_flat, shared_flat)
         return F.cosine_similarity(unique_flat, shared_flat, dim=-1, eps=1e-6).abs().mean()
 
     def _decompose_modal_features(
@@ -794,8 +835,10 @@ class FeatureFusionModule(nn.Module):
             shared_3d_f = shared_3d.float()
             unique_3d_f = unique_3d.float()
             unique_flat = unique_3d_f.reshape(-1, unique_3d_f.shape[-1])
-            shared_flat = shared_2d_f.reshape(-1, shared_2d_f.shape[-1])
-            ortho_loss = self._compute_ortho_loss_flat(unique_flat, shared_flat)
+            shared_2d_flat = shared_2d_f.reshape(-1, shared_2d_f.shape[-1])
+            shared_3d_flat = shared_3d_f.reshape(-1, shared_3d_f.shape[-1])
+            ortho_target_flat = shared_3d_flat if self.ortho_mode == "hsic" else shared_2d_flat
+            ortho_loss = self._compute_ortho_loss_flat(unique_flat, ortho_target_flat)
             align_loss = self._compute_align_loss(shared_3d_f, shared_2d_f)
 
             recon_3d = self.decompose_reconstruct_3d(torch.cat([shared_3d, unique_3d], dim=-1))
@@ -807,7 +850,7 @@ class FeatureFusionModule(nn.Module):
             }
             if self.ortho_mode == "mine":
                 aux_losses["mine_unique_features"] = unique_flat.detach()
-                aux_losses["mine_2d_features"] = shared_flat.detach()
+                aux_losses["mine_2d_features"] = shared_2d_flat.detach()
             return fused, aux_losses
             
         else:

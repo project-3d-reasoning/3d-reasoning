@@ -509,7 +509,7 @@ class VGTrainer(Trainer):
         if loss_name == "loss_ortho":
             if progress <= 0.5:
                 return 0.0
-            return float(min(max((progress - 0.5) / 0.5, 0.0), 1.0))
+            return float(min(max((progress - 0.5) / 0.1, 0.0), 1.0))
         return warmup_factor
 
     def _is_nrsr_dynamic_enabled(self, model: torch.nn.Module) -> bool:
