@@ -551,14 +551,16 @@ class FeatureFusionModule(nn.Module):
             ])
 
         elif self.fusion_method in {"adver", "adver_ortho"}:
-            adver_align_size = int(self.config.decompose_hidden_size or self.hidden_size)
-            if adver_align_size <= 0:
+            adver_latent_size = int(self.config.decompose_hidden_size or self.hidden_size)
+            if adver_latent_size <= 0:
                 raise ValueError("decompose_hidden_size must be positive when using adver/adver_ortho fusion.")
+            adver_align_size = 1800
+            adver_align_hidden = 1800
             adver_hidden = max(
                 self.hidden_size,
-                min(self.hidden_size * 2, max(adver_align_size, self.hidden_size)),
+                min(self.hidden_size * 2, max(adver_latent_size, self.hidden_size)),
             )
-            recon_hidden = max(self.hidden_size, min(self.hidden_size * 2, adver_align_size * 2))
+            recon_hidden = max(self.hidden_size, min(self.hidden_size * 2, adver_latent_size * 2))
             self.adver_prefix_len = max(int(getattr(self.config, "prefix_len", 0) or 0), 0)
             self.adver_shared_encoder = self._build_projection_mlp(
                 self.hidden_size,
@@ -568,12 +570,12 @@ class FeatureFusionModule(nn.Module):
             self.adver_align_proj_2d = self._build_projection_mlp(
                 self.hidden_size,
                 adver_align_size,
-                hidden_dim=adver_hidden,
+                hidden_dim=adver_align_hidden,
             )
             self.adver_align_proj_3d = self._build_projection_mlp(
                 self.hidden_size,
                 adver_align_size,
-                hidden_dim=adver_hidden,
+                hidden_dim=adver_align_hidden,
             )
             self.adver_reconstruct_3d = self._build_projection_mlp(
                 self.hidden_size,
