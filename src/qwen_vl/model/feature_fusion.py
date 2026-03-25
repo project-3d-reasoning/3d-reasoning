@@ -1078,16 +1078,8 @@ class FeatureFusionModule(nn.Module):
             shared_2d, shared_3d, unique_3d = self._decompose_modal_features(
                 features_2d, features_3d
             )
-            shared_hidden, unique_hidden = self._guided_hidden_states(shared_2d, shared_3d, unique_3d)
-            prefix_embeddings = None
-            if return_details:
-                prefix_embeddings = self._compress_decompose_prefix(shared_hidden, unique_hidden)
-
-            if prefix_embeddings is not None:
-                fused = features_2d + features_3d
-            else:
-                fused_delta = self._guided_shared_fusion(shared_2d, shared_3d, unique_3d)
-                fused = features_2d + fused_delta
+            fused_delta = self._guided_shared_fusion(shared_2d, shared_3d, unique_3d)
+            fused = features_2d + fused_delta
 
             if not return_aux_losses and not return_details:
                 return fused
@@ -1109,8 +1101,6 @@ class FeatureFusionModule(nn.Module):
                 "loss_ortho": ortho_loss,
                 "loss_recon": recon_loss,
             }
-            if prefix_embeddings is not None:
-                aux_losses["prefix_embeddings"] = prefix_embeddings
             if self.ortho_mode == "mine":
                 aux_losses["mine_unique_features"] = unique_flat.detach()
                 aux_losses["mine_2d_features"] = shared_2d_flat.detach()

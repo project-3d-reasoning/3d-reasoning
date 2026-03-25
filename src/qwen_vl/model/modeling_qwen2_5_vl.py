@@ -2511,7 +2511,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                     need_dynamic_visual_prefix = (
                         self.use_learnable_prefix
                         and self.learnable_prefix_len > 0
-                        and fusion_method in {"decompose_add", "adver_ortho"}
+                        and fusion_method == "adver_ortho"
                     )
                     if need_fusion_aux_losses and need_dynamic_visual_prefix:
                         image_embeds, fusion_aux_losses, dynamic_prefix_embeddings = self._process_geometry_features(
