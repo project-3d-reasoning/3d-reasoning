@@ -987,17 +987,16 @@ class FeatureFusionModule(nn.Module):
             return self._knn_cross_attention(features_2d, features_3d, patch_world, patch_valid)
 
         elif self.fusion_method == "adver":
-            shared_3d_hidden = self.adver_shared_encoder(features_3d)
-            fused = features_2d + shared_3d_hidden
+            detached_features_3d = features_3d.detach()
+            shared_3d_hidden = self.adver_shared_encoder(detached_features_3d)
+            fused = features_3d + features_2d + shared_3d_hidden
 
             if not return_aux_losses and not return_details:
                 return fused
 
-            align_2d = self.adver_align_proj_2d(features_2d)
-            align_3d = self.adver_align_proj_3d(shared_3d_hidden)
-            align_loss = self._compute_align_loss(align_3d.float(), align_2d.float())
+            align_loss = self._compute_align_loss(shared_3d_hidden.float(), features_2d.float())
 
-            masked_features_3d, masked_positions = self._build_masked_recon_inputs(features_3d)
+            masked_features_3d, masked_positions = self._build_masked_recon_inputs(detached_features_3d)
             masked_shared_3d_hidden = self.adver_shared_encoder(masked_features_3d)
             recon_3d = self.adver_reconstruct_3d(masked_shared_3d_hidden)
             recon_loss = self._compute_masked_recon_loss(recon_3d, features_3d, masked_positions)
@@ -1009,9 +1008,10 @@ class FeatureFusionModule(nn.Module):
             return fused, aux_losses
 
         elif self.fusion_method == "adver_ortho":
-            shared_3d_hidden = self.adver_shared_encoder(features_3d)
-            unique_3d_hidden = self.adver_unique_encoder(features_3d)
-            fused = features_2d + shared_3d_hidden
+            detached_features_3d = features_3d.detach()
+            shared_3d_hidden = self.adver_shared_encoder(detached_features_3d)
+            unique_3d_hidden = self.adver_unique_encoder(detached_features_3d)
+            fused = features_3d + features_2d + shared_3d_hidden
 
             prefix_embeddings = None
             if return_details:
@@ -1022,9 +1022,7 @@ class FeatureFusionModule(nn.Module):
 
             aux_losses = {}
             if return_aux_losses:
-                align_2d = self.adver_align_proj_2d(features_2d)
-                align_3d = self.adver_align_proj_3d(shared_3d_hidden)
-                align_loss = self._compute_align_loss(align_3d.float(), align_2d.float())
+                align_loss = self._compute_align_loss(shared_3d_hidden.float(), features_2d.float())
 
                 shared_flat = shared_3d_hidden.float().reshape(-1, shared_3d_hidden.shape[-1])
                 unique_flat = unique_3d_hidden.float().reshape(-1, unique_3d_hidden.shape[-1])
