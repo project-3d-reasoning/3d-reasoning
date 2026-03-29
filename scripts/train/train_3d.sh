@@ -36,17 +36,17 @@ FUSION_NUM_LAYERS=2                    # 没用Number of Transformer-style CA bl
 FUSION_KNN_K=5                         # 没用Number of nearest neighbors from other frames for knn_concat; self token is added automatically
 FUSION_KNN_MIN_VALID_RATIO=0.5         #  没用Minimum confidence mass ratio in the center patch window before a patch/token is marked valid
 FUSION_KNN_POS_MLP_HIDDEN_SIZE=3096     # 没用Hidden width of the relative-position MLP for knn_concat
-FUSION_RECON_MASK_RATIO=0.6              # Patch/token mask ratio for masked reconstruction in adver mode
+FUSION_RECON_MASK_RATIO=0.3              # Patch/token mask ratio for masked reconstruction in adver mode
 FUSION_ALIGN_MODE="infonce"               # choices: cosine/infonce
 FUSION_ORTHO_MODE="hsic"                 # choices: cosine/hsic/mine; only used by decompose_* methods
-FUSION_LAMBDA_ALIGN=1.0                  # Initial lambda for shared alignment loss in decompose_* methods
-FUSION_ALIGN_TARGET_RATIO=0.0           # Late-stage target loss_shared_weighted / loss_ce ratio
+FUSION_LAMBDA_ALIGN=0                 # Initial lambda for shared alignment loss in decompose_* methods
+FUSION_ALIGN_TARGET_RATIO=0         # Late-stage target loss_shared_weighted / loss_ce ratio
 FUSION_ALIGN_LAMBDA_MAX=5.0              # Cap for dynamic shared alignment lambda
-FUSION_LAMBDA_ORTHO=0.5                 # Initial lambda for orthogonality loss
-FUSION_ORTHO_TARGET_RATIO=0.0           # Late-stage target loss_ortho_weighted / loss_ce ratio
+FUSION_LAMBDA_ORTHO=0                 # Initial lambda for orthogonality loss
+FUSION_ORTHO_TARGET_RATIO=0          # Late-stage target loss_ortho_weighted / loss_ce ratio
 FUSION_ORTHO_LAMBDA_MAX=5.0             # Cap for dynamic orthogonality lambda
-FUSION_LAMBDA_RECON=1.0                  # Initial lambda for reconstruction loss in decompose_* methods
-FUSION_RECON_TARGET_RATIO=0          # Late-stage target loss_recon_weighted / loss_ce ratio
+FUSION_LAMBDA_RECON=0                  # Initial lambda for reconstruction loss in decompose_* methods
+FUSION_RECON_TARGET_RATIO=0.04          # Late-stage target loss_recon_weighted / loss_ce ratio
 FUSION_RECON_LAMBDA_MAX=5.0              # Cap for dynamic reconstruction lambda
 FUSION_LAMBDA_NRSR=1.0                  # 没用
 FUSION_LAMBDA_NRSR_DYNAMIC=True        # 没用
@@ -57,7 +57,8 @@ FUSION_LAMBDA_WARMUP_STEPS=500
 FUSION_MINE_Q_WARMUP_STEPS=500            # q_net-only warmup updates per epoch when FUSION_ORTHO_MODE=mine
 USE_LEARNABLE_PREFIX=false
 LEARNABLE_PREFIX_LEN=0
-OUTPUT_DIR="7b-adver"                   # Directory for saving checkpoints
+TEXT_GATE_BERT_NAME_OR_PATH="/data7t-root/huggingface/hub/bert"
+OUTPUT_DIR="7b-adver-gate"                   # Directory for saving checkpoints
 CACHE_DIR="./cache"                        # [TrainingArguments] Cache directory for models
 mkdir -p $OUTPUT_DIR
 
@@ -113,7 +114,7 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --lr_scheduler_type "cosine" \
             --weight_decay 0.01 \
             --logging_steps 10 \
-            --save_steps 100 \
+            --save_steps 500 \
             --save_total_limit 1 \
             --deepspeed "scripts/zero2_opt.json" \
             --gradient_checkpointing \
@@ -152,5 +153,6 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --fusion_mine_q_warmup_steps $FUSION_MINE_Q_WARMUP_STEPS \
             --use_learnable_prefix $USE_LEARNABLE_PREFIX \
             --learnable_prefix_len $LEARNABLE_PREFIX_LEN \
+            --text_gate_bert_name_or_path $TEXT_GATE_BERT_NAME_OR_PATH \
             "$@" \
             > ${OUTPUT_DIR}/train.log 2>&1

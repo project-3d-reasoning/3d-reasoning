@@ -392,6 +392,9 @@ class VGTrainer(Trainer):
     """Trainer with optional extra q_theta updates for vCLUB in ortho mine mode."""
     NRSR_STAGE1_END = 0.1
     NRSR_STAGE2_END = 0.5
+    ADVER_DISABLE_START = 2.0 / 3.0
+    ADVER_ORTHO_STAGE1_END = 1.0 / 3.0
+    ADVER_ORTHO_STAGE2_END = 2.0 / 3.0
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -400,6 +403,8 @@ class VGTrainer(Trainer):
         self._mine_update_steps: int = 5
         self._mine_warmup_done_epochs: Set[int] = set()
         self._aux_monitor_logs: Dict[str, float] = {}
+        self._aux_monitor_sums: Dict[str, float] = {}
+        self._aux_monitor_counts: Dict[str, int] = {}
         # EMA for monitoring and dynamic lambda adjustment of decompose auxiliary losses.
         self._loss_ce_ema: Optional[float] = None
         self._aux_loss_emas: Dict[str, float] = {}
@@ -469,6 +474,10 @@ class VGTrainer(Trainer):
             return None
         return float(value)
 
+    def _get_fusion_method(self) -> str:
+        base_model = self._unwrap_model(self.model)
+        return str(getattr(getattr(base_model, "config", None), "feature_fusion_method", "add")).lower()
+
     def _update_ema(self, previous: Optional[float], new_value: float) -> float:
         if previous is None:
             return float(new_value)
@@ -494,12 +503,50 @@ class VGTrainer(Trainer):
         lambda_bases = self._get_aux_lambda_bases(base_model)
         lambda_bases[lambda_attr] = float(value)
 
+    def _accumulate_aux_monitor_logs(self, logs: Dict[str, float]) -> None:
+        for key, value in logs.items():
+            self._aux_monitor_sums[key] = self._aux_monitor_sums.get(key, 0.0) + float(value)
+            self._aux_monitor_counts[key] = self._aux_monitor_counts.get(key, 0) + 1
+
+    def _flush_aux_monitor_logs(self) -> Dict[str, float]:
+        if not self._aux_monitor_sums:
+            return {}
+        averaged_logs = {
+            key: float(self._aux_monitor_sums[key]) / float(max(self._aux_monitor_counts.get(key, 1), 1))
+            for key in self._aux_monitor_sums
+        }
+        self._aux_monitor_sums = {}
+        self._aux_monitor_counts = {}
+        return averaged_logs
+
     def _get_aux_schedule_factor(self, loss_name: str) -> float:
         warmup_enabled = bool(getattr(self.args, "fusion_lambda_warmup", False))
         warmup_steps = max(int(getattr(self.args, "fusion_lambda_warmup_steps", 0) or 0), 1)
         warmup_factor = 1.0
         if warmup_enabled:
             warmup_factor = float(min(max(self.state.global_step, 0) / float(warmup_steps), 1.0))
+
+        fusion_method = self._get_fusion_method()
+        if fusion_method == "adver":
+            progress = self._training_progress()
+            if progress < self.ADVER_DISABLE_START:
+                stage_factor = 1.0 if loss_name in {"loss_shared", "loss_recon"} else 0.0
+            else:
+                stage_factor = 0.0
+            if stage_factor <= 0.0:
+                return 0.0
+            return float(stage_factor) * float(warmup_factor)
+        if fusion_method == "adver_ortho":
+            progress = self._training_progress()
+            if progress < self.ADVER_ORTHO_STAGE1_END:
+                stage_factor = 1.0 if loss_name in {"loss_shared", "loss_recon"} else 0.0
+            elif progress < self.ADVER_ORTHO_STAGE2_END:
+                stage_factor = 1.0
+            else:
+                stage_factor = 0.0
+            if stage_factor <= 0.0:
+                return 0.0
+            return float(stage_factor) * float(warmup_factor)
 
         return warmup_factor
 
@@ -589,7 +636,6 @@ class VGTrainer(Trainer):
         return loss_new
 
     def _update_aux_monitor_logs(self, model: torch.nn.Module, loss: torch.Tensor, outputs: Any) -> None:
-        self._aux_monitor_logs = {}
         if outputs is None or loss is None:
             return
 
@@ -616,10 +662,11 @@ class VGTrainer(Trainer):
 
         if not aux_terms:
             loss_ce = loss.detach().float()
-            self._aux_monitor_logs = {
+            self._accumulate_aux_monitor_logs(
+                {
                 "loss_ce": float(loss_ce.item()),
-                "loss_ce_est": float(loss_ce.item()),
-            }
+                }
+            )
             return
 
         loss_ce = loss
@@ -650,16 +697,10 @@ class VGTrainer(Trainer):
         ]
         if dynamic_aux_names:
             self._loss_ce_ema = self._update_ema(self._loss_ce_ema, loss_ce_val_f)
-            loss_ce_log = float(self._loss_ce_ema)
-        else:
-            loss_ce_log = loss_ce_val_f
 
         aux_logs: Dict[str, float] = {
-            "loss_ce": loss_ce_log,
-            "loss_ce_est": loss_ce_log,
+            "loss_ce": loss_ce_val_f,
         }
-        if dynamic_aux_names:
-            aux_logs["loss_ce_raw"] = loss_ce_val_f
 
         aux_log_specs = (
             ("loss_shared", "fusion_lambda_align"),
@@ -674,16 +715,14 @@ class VGTrainer(Trainer):
 
             config = self._dynamic_aux_configs.get(loss_name)
             lambda_value = float(getattr(base_model, lambda_attr, 1.0))
-            loss_value_log = loss_value_raw
             schedule_factor = self._get_aux_schedule_factor(loss_name)
             if config is not None and config.get("target_ratio") is not None:
                 previous_ema = self._aux_loss_emas.get(loss_name)
                 self._aux_loss_emas[loss_name] = self._update_ema(previous_ema, loss_value_raw)
-                loss_value_log = float(self._aux_loss_emas[loss_name])
                 scheduled_target_ratio = float(config["target_ratio"]) * float(schedule_factor)
                 if should_adjust_dynamic and self._loss_ce_ema is not None and schedule_factor > 0.0:
                     lambda_target = scheduled_target_ratio * float(self._loss_ce_ema) / (
-                        loss_value_log + self._ema_eps
+                        float(self._aux_loss_emas[loss_name]) + self._ema_eps
                     )
                     lambda_target = max(
                         float(config["lambda_min"]),
@@ -702,9 +741,8 @@ class VGTrainer(Trainer):
 
             aux_logs.update(
                 {
-                    loss_name: float(loss_value_log),
-                    f"{loss_name}_raw": float(loss_value_raw),
-                    f"{loss_name}_weighted": float(lambda_value) * float(loss_value_log),
+                    loss_name: float(loss_value_raw),
+                    f"{loss_name}_weighted": float(lambda_value) * float(loss_value_raw),
                 }
             )
 
@@ -726,7 +764,16 @@ class VGTrainer(Trainer):
                 }
             )
 
-        self._aux_monitor_logs = aux_logs
+        gate_shared_ratio = self._get_output_field(outputs, "gate_shared_ratio")
+        if gate_shared_ratio is not None:
+            gate_shared_ratio = gate_shared_ratio.to(loss.device, loss.dtype).detach().float()
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                world_size = torch.distributed.get_world_size()
+                torch.distributed.all_reduce(gate_shared_ratio, op=torch.distributed.ReduceOp.SUM)
+                gate_shared_ratio = gate_shared_ratio / world_size
+            aux_logs["gate_shared_ratio"] = float(gate_shared_ratio.item())
+
+        self._accumulate_aux_monitor_logs(aux_logs)
 
     def _cache_mine_features(self, outputs: Any) -> None:
         unique_features = self._get_output_field(outputs, "mine_unique_features")
@@ -935,9 +982,10 @@ class VGTrainer(Trainer):
         return loss
 
     def log(self, logs: Dict[str, float], *args, **kwargs) -> None:
-        if self._aux_monitor_logs:
+        averaged_aux_logs = self._flush_aux_monitor_logs()
+        if averaged_aux_logs:
             logs = dict(logs)
-            logs.update(self._aux_monitor_logs)
+            logs.update(averaged_aux_logs)
         super().log(logs, *args, **kwargs)
 
 

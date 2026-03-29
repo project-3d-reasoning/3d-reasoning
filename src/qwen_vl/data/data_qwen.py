@@ -18,7 +18,10 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
-from decord import VideoReader
+try:
+    from decord import VideoReader
+except ImportError:
+    VideoReader = None
 import transformers
 
 from . import data_list
@@ -37,6 +40,14 @@ local_rank = None
 def rank0_print(*args):
     if local_rank == 0:
         print(*args)
+
+
+def _require_decord() -> None:
+    if VideoReader is None:
+        raise ImportError(
+            "decord is required only when loading video samples, but it is not installed. "
+            "Install `decord` or make sure the current training batch contains image-only data."
+        )
 
 
 def read_jsonl(path, max_samples: int=-1):
@@ -129,6 +140,41 @@ def preprocess_qwen_2_visual(
         input_ids=input_ids,
         labels=targets,
     )
+
+
+def extract_question_text_from_conversations(conversations) -> str:
+    roles = {"human": "user", "gpt": "assistant"}
+    question_segments = []
+    for conv in conversations:
+        role = conv.get("role", conv.get("from"))
+        content = conv.get("content", conv.get("value", ""))
+        role = roles.get(role, role)
+        if role != "user":
+            continue
+
+        if isinstance(content, list):
+            text_parts = []
+            for item in content:
+                if isinstance(item, dict):
+                    if item.get("type") == "text":
+                        text_parts.append(str(item.get("text", "")))
+                elif isinstance(item, str):
+                    text_parts.append(item)
+            content = " ".join(text_parts)
+        else:
+            content = str(content)
+
+        content = (
+            content.replace(DEFAULT_IMAGE_TOKEN, " ")
+            .replace(DEFAULT_VIDEO_TOKEN, " ")
+            .replace("<image>", " ")
+            .replace("<video>", " ")
+        )
+        content = " ".join(content.split())
+        if content:
+            question_segments.append(content)
+
+    return " ".join(question_segments)
 
 
 class LazySupervisedDataset(Dataset):
@@ -267,6 +313,7 @@ class LazySupervisedDataset(Dataset):
     def process_video(self, video_file):
         if not os.path.exists(video_file):
             print(f"File not exist: {video_file}")
+        _require_decord()
         vr = VideoReader(video_file, num_threads=4)
         total_frames = len(vr)
         avg_fps = vr.get_avg_fps()
@@ -364,6 +411,7 @@ class LazySupervisedDataset(Dataset):
             images = [frame_files[i] for i in frame_idx]
             images = [Image.open(frame).convert("RGB") for frame in images]
         elif any([video_file.endswith(ext) for ext in [".mp4", ".avi", ".mov"]]):
+            _require_decord()
             vr = VideoReader(video_file, num_threads=4)
             total_frames = len(vr)
             avg_fps = vr.get_avg_fps()
@@ -493,6 +541,7 @@ class LazySupervisedDataset(Dataset):
                 input_ids=data_dict["input_ids"][0],
                 labels=data_dict["labels"][0],
                 position_ids=position_ids,
+                question_text=extract_question_text_from_conversations(self.list_data_dict[i]["conversations"]),
             )
 
         if "image" in self.list_data_dict[i]:
@@ -528,6 +577,28 @@ class DataCollatorForSupervisedDataset(object):
     """Collate examples for supervised fine-tuning."""
 
     tokenizer: transformers.PreTrainedTokenizer
+    bert_tokenizer: Optional[transformers.PreTrainedTokenizer] = None
+    bert_max_length: int = 64
+
+    def _maybe_add_bert_question_inputs(
+        self,
+        batch: Dict[str, torch.Tensor],
+        instances: Sequence[Dict],
+    ) -> Dict[str, torch.Tensor]:
+        if self.bert_tokenizer is None:
+            return batch
+
+        question_texts = [instance.get("question_text", "") for instance in instances]
+        bert_batch = self.bert_tokenizer(
+            question_texts,
+            padding=True,
+            truncation=True,
+            max_length=self.bert_max_length,
+            return_tensors="pt",
+        )
+        batch["bert_question_input_ids"] = bert_batch["input_ids"]
+        batch["bert_question_attention_mask"] = bert_batch["attention_mask"]
+        return batch
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         input_ids, labels, position_ids = tuple(
@@ -611,7 +682,7 @@ class DataCollatorForSupervisedDataset(object):
             batch["geometry_encoder_inputs"] = geometry_encoder_inputs
             assert len(set([instance["tag"] for instance in instances])) == 1, "all data in a batch should have the same tag"
             batch["tag"] = instances[0]["tag"]
-        return batch
+        return self._maybe_add_bert_question_inputs(batch, instances)
 
 
 @dataclass
@@ -700,20 +771,31 @@ class FlattenedDataCollatorForSupervisedDataset(DataCollatorForSupervisedDataset
         if "geometry_encoder_inputs" in instances[0]:
             raise NotImplementedError("FlattenedDataCollatorForSupervisedDataset does not support geometry_encoder_inputs")
 
-        return batch
+        return self._maybe_add_bert_question_inputs(batch, instances)
 
 
 def make_supervised_data_module(
-    tokenizer: transformers.PreTrainedTokenizer, data_args
+    tokenizer: transformers.PreTrainedTokenizer,
+    data_args,
+    bert_tokenizer: Optional[transformers.PreTrainedTokenizer] = None,
+    bert_max_length: int = 64,
 ) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
     train_dataset = LazySupervisedDataset(tokenizer=tokenizer, data_args=data_args)
     if data_args.data_flatten:
-        data_collator = FlattenedDataCollatorForSupervisedDataset(tokenizer=tokenizer)
+        data_collator = FlattenedDataCollatorForSupervisedDataset(
+            tokenizer=tokenizer,
+            bert_tokenizer=bert_tokenizer,
+            bert_max_length=bert_max_length,
+        )
         return dict(
             train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator
         )
-    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+    data_collator = DataCollatorForSupervisedDataset(
+        tokenizer=tokenizer,
+        bert_tokenizer=bert_tokenizer,
+        bert_max_length=bert_max_length,
+    )
     return dict(
         train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator
     )

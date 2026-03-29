@@ -182,21 +182,26 @@ def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
 
 class FusionLambdaWarmupCallback(transformers.TrainerCallback):
     """
-    Apply warmup-only scheduling to fusion aux lambdas.
+    Apply fusion aux scheduling to fusion lambdas.
 
     Behavior:
-    - `align`: optional early warmup, then stays on for the full training run.
-    - `recon`: optional early warmup, then stays on for the full training run.
-    - `ortho`: optional early warmup, then stays on for the full training run.
+    - `adver`: first 2/3 enables align+recon, last 1/3 disables all aux losses.
+    - `adver_ortho`: first 1/3 enables align+recon, middle 1/3 enables
+      align+recon+ortho, last 1/3 disables all aux losses.
+    - other supported fusion modes keep the original warmup-only behavior.
     """
 
     AUX_KEYS = ("fusion_lambda_align", "fusion_lambda_ortho", "fusion_lambda_recon")
+    ADVER_DISABLE_START = 2.0 / 3.0
+    ADVER_ORTHO_STAGE1_END = 1.0 / 3.0
+    ADVER_ORTHO_STAGE2_END = 2.0 / 3.0
 
     def __init__(self, enabled: bool, warmup_steps: int):
         self.enabled = enabled
         self.warmup_steps = max(int(warmup_steps), 1)
         self.active = False
         self.lambda_bases = {}
+        self.fusion_method = None
 
     def _training_progress(self, args, state) -> float:
         max_steps = int(getattr(state, "max_steps", 0) or 0)
@@ -214,8 +219,27 @@ class FusionLambdaWarmupCallback(transformers.TrainerCallback):
             return 1.0
         return float(min(max(state.global_step, 0) / float(self.warmup_steps), 1.0))
 
+    def _adver_stage_factor(self, lambda_attr: str, progress: float) -> float:
+        if progress < self.ADVER_DISABLE_START:
+            return 1.0 if lambda_attr in {"fusion_lambda_align", "fusion_lambda_recon"} else 0.0
+        return 0.0
+
+    def _adver_ortho_stage_factor(self, lambda_attr: str, progress: float) -> float:
+        if progress < self.ADVER_ORTHO_STAGE1_END:
+            return 1.0 if lambda_attr in {"fusion_lambda_align", "fusion_lambda_recon"} else 0.0
+        if progress < self.ADVER_ORTHO_STAGE2_END:
+            return 1.0
+        return 0.0
+
     def _schedule_factor(self, lambda_attr: str, progress: float, warmup_factor: float) -> float:
-        return warmup_factor
+        stage_factor = 1.0
+        if self.fusion_method == "adver":
+            stage_factor = self._adver_stage_factor(lambda_attr, progress)
+        elif self.fusion_method == "adver_ortho":
+            stage_factor = self._adver_ortho_stage_factor(lambda_attr, progress)
+        if stage_factor <= 0.0:
+            return 0.0
+        return float(stage_factor) * float(warmup_factor)
 
     def _apply_schedule(self, model: torch.nn.Module, args, state) -> None:
         progress = self._training_progress(args, state)
@@ -231,6 +255,7 @@ class FusionLambdaWarmupCallback(transformers.TrainerCallback):
         model = _unwrap_model(model)
         fusion_method = getattr(getattr(model, "config", None), "feature_fusion_method", None)
         fusion_method = str(fusion_method).lower() if fusion_method is not None else None
+        self.fusion_method = fusion_method
         if fusion_method not in {"adver", "adver_ortho", "decompose_add", "decompose_concat"}:
             if self.enabled:
                 rank0_print(
@@ -248,10 +273,24 @@ class FusionLambdaWarmupCallback(transformers.TrainerCallback):
         setattr(model, "_fusion_aux_lambda_bases", dict(self.lambda_bases))
         self.active = True
         self._apply_schedule(model, args, state)
-        rank0_print(
-            "[FusionLambdaWarmup] Enabled with warmup-only schedule, "
-            f"warmup_steps={self.warmup_steps}, base_lambdas={self.lambda_bases}"
-        )
+        if fusion_method == "adver":
+            rank0_print(
+                "[FusionLambdaWarmup] Enabled adver aux schedule, "
+                f"disable_start={self.ADVER_DISABLE_START:.3f}, "
+                f"warmup_steps={self.warmup_steps}, base_lambdas={self.lambda_bases}"
+            )
+        elif fusion_method == "adver_ortho":
+            rank0_print(
+                "[FusionLambdaWarmup] Enabled adver_ortho 3-stage aux schedule, "
+                f"stage1_end={self.ADVER_ORTHO_STAGE1_END:.3f}, "
+                f"stage2_end={self.ADVER_ORTHO_STAGE2_END:.3f}, "
+                f"warmup_steps={self.warmup_steps}, base_lambdas={self.lambda_bases}"
+            )
+        else:
+            rank0_print(
+                "[FusionLambdaWarmup] Enabled with warmup-only schedule, "
+                f"warmup_steps={self.warmup_steps}, base_lambdas={self.lambda_bases}"
+            )
 
     def on_step_begin(self, args, state, control, model=None, **kwargs):
         if not self.active or model is None:
@@ -416,8 +455,11 @@ def train(attn_implementation="flash_attention_2"):
                 "tune_geometry_encoder_lora",
                 "use_learnable_prefix",
                 "learnable_prefix_len",
+                "text_gate_bert_name_or_path",
+                "text_gate_bert_max_length",
             ]:
                 setattr(config, k, getattr(model_args, k))
+            setattr(config, "text_gate_bert_cache_dir", training_args.cache_dir)
 
             if model_args.use_geometry_encoder:
                 assert model_args.geometry_encoder_path is not None, \
@@ -468,6 +510,19 @@ def train(attn_implementation="flash_attention_2"):
         padding_side="right",
         use_fast=False,
     )
+    bert_tokenizer = None
+    if (
+        model_args.use_geometry_encoder
+        and str(model_args.feature_fusion_method).lower() in {"adver", "adver_ortho"}
+        and getattr(model_args, "text_gate_bert_name_or_path", None)
+    ):
+        bert_tokenizer = transformers.AutoTokenizer.from_pretrained(
+            model_args.text_gate_bert_name_or_path,
+            cache_dir=training_args.cache_dir,
+            model_max_length=model_args.text_gate_bert_max_length,
+            padding_side="right",
+            use_fast=True,
+        )
     for attr in (
         "fusion_align_target_ratio",
         "fusion_align_lambda_min",
@@ -491,7 +546,12 @@ def train(attn_implementation="flash_attention_2"):
     print(model.config)
     if model_args.use_geometry_encoder:
         setattr(data_args, "use_geometry_encoder", model_args.use_geometry_encoder)
-    data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
+    data_module = make_supervised_data_module(
+        tokenizer=tokenizer,
+        data_args=data_args,
+        bert_tokenizer=bert_tokenizer,
+        bert_max_length=model_args.text_gate_bert_max_length,
+    )
     fusion_lambda_warmup_callback = FusionLambdaWarmupCallback(
         enabled=model_args.fusion_lambda_warmup,
         warmup_steps=model_args.fusion_lambda_warmup_steps,

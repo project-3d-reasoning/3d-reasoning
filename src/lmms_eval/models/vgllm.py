@@ -61,6 +61,7 @@ class VGLLM(lmms):
         tune_geometry_encoder_lora: Optional[bool] = None,
         use_learnable_prefix: Optional[bool] = None,
         learnable_prefix_len: Optional[int] = None,
+        text_gate_bert_name_or_path: Optional[str] = None,
         feature_fusion_method: Optional[str] = None,
         fusion_num_layers: Optional[int] = None,
         geometry_merger_type: Optional[str] = None,
@@ -169,6 +170,8 @@ class VGLLM(lmms):
             setattr(config, "use_learnable_prefix", use_learnable_prefix)
         if learnable_prefix_len is not None:
             setattr(config, "learnable_prefix_len", learnable_prefix_len)
+        if text_gate_bert_name_or_path is not None:
+            setattr(config, "text_gate_bert_name_or_path", text_gate_bert_name_or_path)
 
         if (
             getattr(config, "use_geometry_encoder", False)
@@ -196,6 +199,17 @@ class VGLLM(lmms):
         self.max_num_frames = max_num_frames
         self.processor = AutoProcessor.from_pretrained(pretrained, max_pixels=max_pixels, min_pixels=min_pixels, padding_side="left")
         self._tokenizer = AutoTokenizer.from_pretrained(pretrained, padding_side="left")
+        self._text_gate_bert_tokenizer = None
+        if (
+            getattr(config, "use_geometry_encoder", False)
+            and str(getattr(config, "feature_fusion_method", "add")).lower() in {"adver", "adver_ortho"}
+            and getattr(config, "text_gate_bert_name_or_path", None)
+        ):
+            self._text_gate_bert_tokenizer = AutoTokenizer.from_pretrained(
+                config.text_gate_bert_name_or_path,
+                padding_side="right",
+                use_fast=True,
+            )
 
         if max_length is not None:
             eval_logger.warning(f"Setting max_length to {max_length}")
@@ -415,6 +429,16 @@ class VGLLM(lmms):
                 return_tensors="pt",
                 do_rescale=False
             )
+            if self._text_gate_bert_tokenizer is not None:
+                bert_batch = self._text_gate_bert_tokenizer(
+                    list(contexts),
+                    padding=True,
+                    truncation=True,
+                    max_length=getattr(self.model.config, "text_gate_bert_max_length", 64),
+                    return_tensors="pt",
+                )
+                inputs["bert_question_input_ids"] = bert_batch["input_ids"]
+                inputs["bert_question_attention_mask"] = bert_batch["attention_mask"]
             device = "cuda" if self.device_map == "auto" else self.device
             if getattr(self.model.config, "use_geometry_encoder", False) or getattr(self.model.config, "use_vggt_feature", False):
                 inputs["geometry_encoder_inputs"] = [feat.to(device) for feat in geometry_encoder_inputs]

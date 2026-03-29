@@ -34,6 +34,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
 
+from transformers import BertModel
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache, SlidingWindowCache, StaticCache
 from transformers.generation import GenerationMixin
@@ -1525,6 +1526,7 @@ class Qwen2_5_VLCausalLMOutputWithPast(ModelOutput):
     loss_ortho: Optional[torch.FloatTensor] = None
     loss_recon: Optional[torch.FloatTensor] = None
     loss_nrsr_kl: Optional[torch.FloatTensor] = None
+    gate_shared_ratio: Optional[torch.FloatTensor] = None
     mine_unique_features: Optional[torch.FloatTensor] = None
     mine_2d_features: Optional[torch.FloatTensor] = None
 
@@ -1613,6 +1615,8 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
     def __init__(self, config):
         super().__init__(config)
         self.visual = Qwen2_5_VisionTransformerPretrainedModel._from_config(config.vision_config)
+        self.text_gate_bert = None
+        self.text_gate_projection = None
         
         # Initialize geometry encoder if enabled
         if getattr(config, 'use_geometry_encoder', False):
@@ -1636,6 +1640,18 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         if self.learnable_prefix_embeddings is not None:
             with torch.no_grad():
                 self.learnable_prefix_embeddings.zero_()
+        if (
+            getattr(config, "use_geometry_encoder", False)
+            and str(getattr(config, "feature_fusion_method", "add")).lower() in {"adver", "adver_ortho"}
+            and getattr(config, "text_gate_bert_name_or_path", None)
+        ):
+            self._init_text_gate_bert(config)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.text_gate_bert is not None:
+            self.text_gate_bert.eval()
+        return self
     
     def _init_geometry_encoder(self, config):
         """Initialize geometry encoder and related modules."""
@@ -1690,6 +1706,26 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         self.fusion_lambda_recon = getattr(config, "fusion_lambda_recon", 1.0)
         self.fusion_ortho_target_ratio = getattr(config, "fusion_ortho_target_ratio", None)
         self.fusion_lambda_nrsr = getattr(config, "fusion_lambda_nrsr", 1.0)
+
+    def _init_text_gate_bert(self, config):
+        bert_name_or_path = getattr(config, "text_gate_bert_name_or_path", None)
+        if not bert_name_or_path:
+            return
+
+        self.text_gate_bert = BertModel.from_pretrained(
+            bert_name_or_path,
+            add_pooling_layer=False,
+            cache_dir=getattr(config, "text_gate_bert_cache_dir", None),
+        )
+        for param in self.text_gate_bert.parameters():
+            param.requires_grad = False
+        self.text_gate_bert.eval()
+
+        bert_hidden_size = int(self.text_gate_bert.config.hidden_size)
+        self.text_gate_projection = nn.Linear(bert_hidden_size, config.hidden_size)
+        self.text_gate_projection.weight.data.normal_(mean=0.0, std=config.initializer_range)
+        if self.text_gate_projection.bias is not None:
+            self.text_gate_projection.bias.data.zero_()
 
     def _pool_world_points_to_token_grid(
         self,
@@ -1823,10 +1859,123 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             )
         return torch.cat(fused_samples, dim=0) if fused_samples else image_embeds
 
+    def _extract_question_summaries(
+        self,
+        input_ids: Optional[torch.LongTensor],
+        inputs_embeds: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        labels: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if input_ids is None or inputs_embeds is None:
+            return None
+        if attention_mask is not None and attention_mask.dim() != 2:
+            return None
+        if labels is not None and labels.dim() != 2:
+            return None
+
+        batch_size, seq_len = input_ids.shape
+        if inputs_embeds.shape[0] != batch_size:
+            return None
+
+        visual_token_ids = {
+            getattr(self.config, "image_token_id", None),
+            getattr(self.config, "video_token_id", None),
+            getattr(self.config, "vision_start_token_id", None),
+            getattr(self.config, "vision_end_token_id", None),
+        }
+        visual_token_ids.discard(None)
+
+        position_index = torch.arange(seq_len, device=input_ids.device)
+        question_summaries = []
+        for idx in range(batch_size):
+            sample_ids = input_ids[idx]
+            sample_embeds = inputs_embeds[idx]
+            sample_valid_mask = (
+                attention_mask[idx].to(device=sample_ids.device, dtype=torch.bool)
+                if attention_mask is not None
+                else torch.ones_like(sample_ids, dtype=torch.bool)
+            )
+            if not sample_valid_mask.any():
+                question_summaries.append(sample_embeds.new_zeros((sample_embeds.shape[-1],)))
+                continue
+
+            text_mask = sample_valid_mask.clone()
+            visual_mask = torch.zeros_like(sample_valid_mask)
+            for token_id in visual_token_ids:
+                token_mask = sample_ids == token_id
+                text_mask = text_mask & (~token_mask)
+                visual_mask = visual_mask | token_mask
+
+            visual_positions = torch.nonzero(visual_mask & sample_valid_mask, as_tuple=False).squeeze(-1)
+            after_visual_mask = sample_valid_mask.clone()
+            if visual_positions.numel() > 0:
+                after_visual_mask = position_index > int(visual_positions[-1].item())
+
+            question_mask = text_mask & after_visual_mask
+            sample_labels = labels[idx] if labels is not None else None
+            if sample_labels is not None:
+                question_mask = question_mask & (sample_labels == -100)
+                if not question_mask.any():
+                    question_mask = text_mask & after_visual_mask
+
+            if not question_mask.any() and sample_labels is not None:
+                question_mask = text_mask & sample_valid_mask & (sample_labels == -100)
+            if not question_mask.any():
+                question_mask = text_mask & sample_valid_mask
+
+            if not question_mask.any():
+                question_summaries.append(sample_embeds.new_zeros((sample_embeds.shape[-1],)))
+                continue
+
+            question_summaries.append(sample_embeds[question_mask].mean(dim=0))
+
+        return torch.stack(question_summaries, dim=0)
+
+    def _mean_pool_text_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        mask = attention_mask.to(device=hidden_states.device, dtype=hidden_states.dtype).unsqueeze(-1)
+        pooled = (hidden_states * mask).sum(dim=1)
+        denom = mask.sum(dim=1).clamp_min(1.0)
+        return pooled / denom
+
+    def _encode_text_gate_questions(
+        self,
+        bert_question_input_ids: Optional[torch.LongTensor],
+        bert_question_attention_mask: Optional[torch.Tensor],
+        target_device: torch.device,
+        target_dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if (
+            self.text_gate_bert is None
+            or self.text_gate_projection is None
+            or bert_question_input_ids is None
+            or bert_question_attention_mask is None
+        ):
+            return None
+
+        bert_question_input_ids = bert_question_input_ids.to(target_device)
+        bert_question_attention_mask = bert_question_attention_mask.to(target_device)
+        with torch.no_grad():
+            bert_outputs = self.text_gate_bert(
+                input_ids=bert_question_input_ids,
+                attention_mask=bert_question_attention_mask,
+                return_dict=True,
+            )
+            bert_summary = self._mean_pool_text_hidden_states(
+                bert_outputs.last_hidden_state,
+                bert_question_attention_mask,
+            )
+        question_summaries = self.text_gate_projection(bert_summary.to(dtype=target_dtype))
+        return question_summaries.to(device=target_device, dtype=target_dtype)
+
     def _process_geometry_features(
         self,
         image_embeds,
         geometry_encoder_inputs,
+        question_summaries: Optional[torch.Tensor] = None,
         return_aux_losses: bool = False,
         return_prefix_embeddings: bool = False,
     ):
@@ -1844,6 +1993,11 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             return fused
 
         batch_size = len(geometry_encoder_inputs)
+        if question_summaries is not None and question_summaries.shape[0] != batch_size:
+            raise ValueError(
+                "question_summaries batch size does not match geometry inputs: "
+                f"{question_summaries.shape[0]} vs {batch_size}"
+            )
         fusion_aux_losses = None
         prefix_embeddings = [] if return_prefix_embeddings else None
         fused_samples = []
@@ -1856,6 +2010,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         for bn in range(batch_size):
             sample_inputs = geometry_encoder_inputs[bn]
             sample_prefix = None
+            sample_question_summary = question_summaries[bn] if question_summaries is not None else None
 
             if sample_inputs.shape[0] > 0:
                 n_image, _, height, width = sample_inputs.shape
@@ -1877,13 +2032,18 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                     sample_fused, sample_details = self.feature_fusion(
                         sample_image_embeds,
                         geo_embeds,
+                        question_summary=sample_question_summary,
                         return_aux_losses=return_aux_losses,
                         return_details=return_prefix_embeddings,
                     )
                     sample_details = sample_details or {}
                     sample_prefix = sample_details.pop("prefix_embeddings", None)
                 else:
-                    sample_fused = self.feature_fusion(sample_image_embeds, geo_embeds)
+                    sample_fused = self.feature_fusion(
+                        sample_image_embeds,
+                        geo_embeds,
+                        question_summary=sample_question_summary,
+                    )
                     sample_details = {}
 
                 fused_samples.append(sample_fused.reshape(-1, sample_fused.shape[-1]))
@@ -1891,7 +2051,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 if return_aux_losses:
                     sample_weight = sample_fused.new_tensor(float(sample_num_tokens))
                     aux_weight = sample_weight if aux_weight is None else aux_weight + sample_weight
-                    for key in ("loss_shared", "loss_ortho", "loss_recon", "loss_nrsr_kl"):
+                    for key in ("loss_shared", "loss_ortho", "loss_recon", "loss_nrsr_kl", "gate_shared_ratio"):
                         value = sample_details.get(key)
                         if value is None:
                             continue
@@ -2187,7 +2347,47 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 return False
         return True
 
-    def _apply_dynamic_visual_prefix(
+    def _get_visual_prefix_insert_position(
+        self,
+        sample_input_ids: torch.LongTensor,
+        sample_mask: Optional[torch.Tensor],
+    ) -> int:
+        if sample_mask is None:
+            valid_start = 0
+            valid_end = sample_input_ids.shape[0]
+        else:
+            valid_positions = torch.nonzero(sample_mask > 0, as_tuple=False).squeeze(-1)
+            if valid_positions.numel() == 0:
+                return 0
+            valid_start = int(valid_positions[0].item())
+            valid_end = int(valid_positions[-1].item()) + 1
+
+        valid_input_ids = sample_input_ids[valid_start:valid_end]
+        vision_end_token_id = getattr(self.config, "vision_end_token_id", None)
+        if vision_end_token_id is not None:
+            vision_end_positions = torch.nonzero(
+                valid_input_ids == vision_end_token_id, as_tuple=False
+            ).squeeze(-1)
+            if vision_end_positions.numel() > 0:
+                return valid_start + int(vision_end_positions[-1].item()) + 1
+
+        visual_positions = torch.nonzero(
+            (valid_input_ids == self.config.image_token_id)
+            | (valid_input_ids == self.config.video_token_id),
+            as_tuple=False,
+        ).squeeze(-1)
+        if visual_positions.numel() > 0:
+            return valid_start + int(visual_positions[-1].item()) + 1
+
+        vision_start_positions = torch.nonzero(
+            valid_input_ids == self.config.vision_start_token_id, as_tuple=False
+        ).squeeze(-1)
+        if vision_start_positions.numel() > 0:
+            return valid_start + int(vision_start_positions[-1].item()) + 1
+
+        return valid_start
+
+    def _apply_prefix_embeddings_at_visual_boundary(
         self,
         input_ids: torch.LongTensor,
         inputs_embeds: torch.Tensor,
@@ -2196,7 +2396,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         prefix_embeddings: torch.Tensor,
     ) -> Tuple[torch.LongTensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         if attention_mask is not None and attention_mask.dim() == 1:
-            raise ValueError("Dynamic visual prefix does not support packed 1D attention masks.")
+            raise ValueError("Visual-boundary prefix insertion does not support packed 1D attention masks.")
 
         batch_size = inputs_embeds.size(0)
         prefix_len = prefix_embeddings.size(1)
@@ -2220,21 +2420,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             sample_embeds = inputs_embeds[idx]
             sample_mask = attention_mask[idx]
             sample_prefix = prefix_embeddings[idx]
-
-            vision_start_positions = torch.nonzero(
-                sample_input_ids == self.config.vision_start_token_id, as_tuple=False
-            ).squeeze(-1)
-            if vision_start_positions.numel() > 0:
-                insert_pos = int(vision_start_positions[0].item())
-            else:
-                image_positions = torch.nonzero(
-                    sample_input_ids == self.config.image_token_id, as_tuple=False
-                ).squeeze(-1)
-                if image_positions.numel() > 0:
-                    insert_pos = int(image_positions[0].item())
-                else:
-                    valid_positions = torch.nonzero(sample_mask > 0, as_tuple=False).squeeze(-1)
-                    insert_pos = int(valid_positions[0].item()) if valid_positions.numel() > 0 else 0
+            insert_pos = self._get_visual_prefix_insert_position(sample_input_ids, sample_mask)
 
             prefix_ids = sample_input_ids.new_full((prefix_len,), int(prefix_token_id))
             new_input_ids.append(
@@ -2260,6 +2446,47 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         if labels is not None:
             labels = torch.stack(new_labels, dim=0)
         return input_ids, inputs_embeds, attention_mask, labels
+
+    def _apply_dynamic_visual_prefix(
+        self,
+        input_ids: torch.LongTensor,
+        inputs_embeds: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        labels: Optional[torch.Tensor],
+        prefix_embeddings: torch.Tensor,
+    ) -> Tuple[torch.LongTensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        return self._apply_prefix_embeddings_at_visual_boundary(
+            input_ids,
+            inputs_embeds,
+            attention_mask,
+            labels,
+            prefix_embeddings,
+        )
+
+    def _apply_learnable_prefix_after_visual_block(
+        self,
+        input_ids: torch.LongTensor,
+        inputs_embeds: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        labels: Optional[torch.Tensor],
+    ) -> Tuple[torch.LongTensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        prefix_len = self.learnable_prefix_len
+        if prefix_len <= 0 or self.learnable_prefix_embeddings is None:
+            return input_ids, inputs_embeds, attention_mask, labels
+
+        batch_size = inputs_embeds.size(0)
+        prefix_embed = self.learnable_prefix_embeddings.to(
+            device=inputs_embeds.device,
+            dtype=inputs_embeds.dtype,
+        )
+        prefix_embeddings = prefix_embed.unsqueeze(0).expand(batch_size, -1, -1)
+        return self._apply_prefix_embeddings_at_visual_boundary(
+            input_ids,
+            inputs_embeds,
+            attention_mask,
+            labels,
+            prefix_embeddings,
+        )
 
     def _apply_learnable_prefix(
         self,
@@ -2444,6 +2671,8 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         cache_position: Optional[torch.LongTensor] = None,
         second_per_grid_ts: Optional[torch.Tensor] = None,
         geometry_encoder_inputs: Optional[List[torch.Tensor]] = None,
+        bert_question_input_ids: Optional[torch.LongTensor] = None,
+        bert_question_attention_mask: Optional[torch.Tensor] = None,
         boxes: Optional[List[torch.Tensor]] = None,
         tag: str = None,
         **kwargs,
@@ -2504,6 +2733,21 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 # Process 3D geometry features if enabled
                 if getattr(self.config, 'use_geometry_encoder', False) and geometry_encoder_inputs is not None:
                     fusion_method = str(getattr(self.config, "feature_fusion_method", "add")).lower()
+                    question_summaries = None
+                    if fusion_method in {"adver", "adver_ortho"}:
+                        question_summaries = self._encode_text_gate_questions(
+                            bert_question_input_ids=bert_question_input_ids,
+                            bert_question_attention_mask=bert_question_attention_mask,
+                            target_device=inputs_embeds.device,
+                            target_dtype=inputs_embeds.dtype,
+                        )
+                        if question_summaries is None:
+                            question_summaries = self._extract_question_summaries(
+                                input_ids,
+                                inputs_embeds,
+                                attention_mask,
+                                labels,
+                            )
                     need_fusion_aux_losses = (
                         labels is not None
                         and fusion_method in {"adver", "adver_ortho", "decompose_add", "decompose_concat", "nrsr_add", "nrsr_concat"}
@@ -2517,19 +2761,30 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                         image_embeds, fusion_aux_losses, dynamic_prefix_embeddings = self._process_geometry_features(
                             image_embeds,
                             geometry_encoder_inputs,
+                            question_summaries=question_summaries,
                             return_aux_losses=True,
                             return_prefix_embeddings=True,
                         )
                     elif need_fusion_aux_losses:
                         image_embeds, fusion_aux_losses = self._process_geometry_features(
-                            image_embeds, geometry_encoder_inputs, return_aux_losses=True
+                            image_embeds,
+                            geometry_encoder_inputs,
+                            question_summaries=question_summaries,
+                            return_aux_losses=True,
                         )
                     elif need_dynamic_visual_prefix:
                         image_embeds, dynamic_prefix_embeddings = self._process_geometry_features(
-                            image_embeds, geometry_encoder_inputs, return_prefix_embeddings=True
+                            image_embeds,
+                            geometry_encoder_inputs,
+                            question_summaries=question_summaries,
+                            return_prefix_embeddings=True,
                         )
                     else:
-                        image_embeds = self._process_geometry_features(image_embeds, geometry_encoder_inputs)
+                        image_embeds = self._process_geometry_features(
+                            image_embeds,
+                            geometry_encoder_inputs,
+                            question_summaries=question_summaries,
+                        )
 
                 n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
                 n_image_features = image_embeds.shape[0]
@@ -2587,38 +2842,50 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             dynamic_prefix_embeddings is None
             and self._should_apply_learnable_prefix(past_key_values, cache_position)
         ):
-            base_rope_deltas = None
-            if position_ids is None and (base_attention_mask is None or base_attention_mask.ndim == 2):
-                if input_ids is not None:
-                    position_ids, base_rope_deltas = self.get_rope_index(
-                        input_ids,
-                        image_grid_thw,
-                        video_grid_thw,
-                        second_per_grid_ts,
-                        base_attention_mask,
-                    )
-                else:
-                    position_ids = (
-                        torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
-                        .view(1, 1, -1)
-                        .expand(3, inputs_embeds.shape[0], -1)
-                    )
-                    base_rope_deltas = torch.zeros(
-                        [inputs_embeds.shape[0], 1],
-                        device=inputs_embeds.device,
-                        dtype=position_ids.dtype,
-                    )
+            if input_ids is not None and (base_attention_mask is None or base_attention_mask.ndim == 2):
+                input_ids, inputs_embeds, attention_mask, labels = self._apply_learnable_prefix_after_visual_block(
+                    input_ids,
+                    inputs_embeds,
+                    attention_mask,
+                    labels,
+                )
+                position_ids = None
+                self.rope_deltas = None
+                if cache_position is not None and cache_position.numel() != inputs_embeds.shape[1]:
+                    cache_position = None
+            else:
+                base_rope_deltas = None
+                if position_ids is None and (base_attention_mask is None or base_attention_mask.ndim == 2):
+                    if input_ids is not None:
+                        position_ids, base_rope_deltas = self.get_rope_index(
+                            input_ids,
+                            image_grid_thw,
+                            video_grid_thw,
+                            second_per_grid_ts,
+                            base_attention_mask,
+                        )
+                    else:
+                        position_ids = (
+                            torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
+                            .view(1, 1, -1)
+                            .expand(3, inputs_embeds.shape[0], -1)
+                        )
+                        base_rope_deltas = torch.zeros(
+                            [inputs_embeds.shape[0], 1],
+                            device=inputs_embeds.device,
+                            dtype=position_ids.dtype,
+                        )
 
-            inputs_embeds, attention_mask, labels, position_ids = self._apply_learnable_prefix(
-                inputs_embeds,
-                attention_mask,
-                labels,
-                position_ids,
-            )
-            if base_rope_deltas is not None:
-                self.rope_deltas = base_rope_deltas + self.learnable_prefix_len
-            if cache_position is not None and cache_position.numel() != inputs_embeds.shape[1]:
-                cache_position = None
+                inputs_embeds, attention_mask, labels, position_ids = self._apply_learnable_prefix(
+                    inputs_embeds,
+                    attention_mask,
+                    labels,
+                    position_ids,
+                )
+                if base_rope_deltas is not None:
+                    self.rope_deltas = base_rope_deltas + self.learnable_prefix_len
+                if cache_position is not None and cache_position.numel() != inputs_embeds.shape[1]:
+                    cache_position = None
 
         # if we get 4D attention mask we cannot calculate rope deltas anymore. TODO @raushan fixme
         if position_ids is None and (attention_mask is None or attention_mask.ndim == 2):
@@ -2671,6 +2938,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         loss_ortho = None
         loss_recon = None
         loss_nrsr_kl = None
+        gate_shared_ratio = None
         mine_unique_features = None
         mine_2d_features = None
         if labels is not None:
@@ -2699,6 +2967,9 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 loss_nrsr_kl_raw = fusion_aux_losses.get("loss_nrsr_kl")
                 if loss_nrsr_kl_raw is not None:
                     loss_nrsr_kl = loss_nrsr_kl_raw.to(loss.device, loss.dtype)
+                gate_shared_ratio_raw = fusion_aux_losses.get("gate_shared_ratio")
+                if gate_shared_ratio_raw is not None:
+                    gate_shared_ratio = gate_shared_ratio_raw.to(loss.device, loss.dtype)
                 mine_unique_features = fusion_aux_losses.get("mine_unique_features")
                 mine_2d_features = fusion_aux_losses.get("mine_2d_features")
                 if loss_shared is not None:
@@ -2725,6 +2996,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             loss_ortho=loss_ortho,
             loss_recon=loss_recon,
             loss_nrsr_kl=loss_nrsr_kl,
+            gate_shared_ratio=gate_shared_ratio,
             mine_unique_features=mine_unique_features,
             mine_2d_features=mine_2d_features,
         )
@@ -2765,6 +3037,10 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
 
         # Qwen2-5-VL position_ids are prepareed with rope_deltas in forward
         model_inputs["position_ids"] = None
+        if "bert_question_input_ids" in kwargs:
+            model_inputs["bert_question_input_ids"] = kwargs["bert_question_input_ids"]
+        if "bert_question_attention_mask" in kwargs:
+            model_inputs["bert_question_attention_mask"] = kwargs["bert_question_attention_mask"]
 
         if cache_position[0] != 0:
             model_inputs["pixel_values"] = None

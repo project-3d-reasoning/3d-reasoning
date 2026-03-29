@@ -12,8 +12,10 @@ class ModelArguments:
     tune_mm_vision_lora: bool = field(default=False)  # Use LoRA to tune visual tower when tune_mm_vision=True
     tune_geometry_encoder: bool = field(default=False)  # Tune geometry encoder parameters when use_geometry_encoder=True
     tune_geometry_encoder_lora: bool = field(default=False)  # Use LoRA to tune geometry encoder when tune_geometry_encoder=True
-    use_learnable_prefix: bool = field(default=False)  # Enable learnable prefix tokens before LLM inputs
-    learnable_prefix_len: int = field(default=0)  # Number of learnable prefix tokens to prepend
+    use_learnable_prefix: bool = field(default=False)  # Enable learnable prefix tokens between visual blocks and question text
+    learnable_prefix_len: int = field(default=0)  # Number of learnable prefix tokens to insert at the visual-question boundary
+    text_gate_bert_name_or_path: str = field(default="bert-base-uncased")  # Frozen BERT encoder used to extract question summaries for adver/adver_ortho gates
+    text_gate_bert_max_length: int = field(default=64)  # Maximum BERT token length for question text encoding
 
     # Geometry encoder configuration
     use_geometry_encoder: bool = field(default=False)  # Whether to use 3D geometry encoder
