@@ -6,7 +6,7 @@
 # ======================
 MASTER_ADDR="127.0.0.1"                     # [Required] Master node IP for multi-GPU training
 MASTER_PORT=$(shuf -i 20000-29999 -n 1)     # Random port to avoid conflicts
-NUM_GPUS="${NUM_GPUS:-8}"                    # Set e.g. "4" to use 4 GPUs; leave empty to use all local GPUs
+NUM_GPUS="${NUM_GPUS:-4}"                    # Set e.g. "4" to use 4 GPUs; leave empty to use all local GPUs
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../utils/select_available_gpus.sh"
 
@@ -23,7 +23,7 @@ NPROC_PER_NODE="$SELECTED_GPU_COUNT"
 # ======================
 # Path Configuration
 # ======================
-MODEL_PATH="/data7t-root/huggingface/hub/models--Qwen--Qwen2.5-VL-3B-Instruct/snapshots/66285546d2b821cf421d4f5eb2576359d3770cd3"   # [ModelArguments] Pretrained model path
+MODEL_PATH="/data7t-root/huggingface/hub/models--Qwen--Qwen2.5-VL-7B-Instruct/snapshots/cc594898137f460bfe9f0759e9844b3ce807cfb5"   # [ModelArguments] Pretrained model path
 MODEL_PATH="${MODEL_PATH%/}"               # Safety: strip trailing slash for HF repo id validation
 GEOMETRY_ENCODER_TYPE="vggt"
 GEOMETRY_ENCODER_PATH="facebook/VGGT-1B"
@@ -31,32 +31,32 @@ TUNE_MM_VISION=False
 TUNE_MM_VISION_LORA=False
 TUNE_GEOMETRY_ENCODER=False
 TUNE_GEOMETRY_ENCODER_LORA=False
-FEATURE_FUSION_METHOD="adver_ortho"      # choices: add/concat/cross_attention/gated/weighted/adver/adver_ortho/decompose_add/decompose_concat/nrsr_add/nrsr_concat/knn_concat
+FEATURE_FUSION_METHOD="adver"      # choices: add/concat/cross_attention/gated/weighted/adver/adver_ortho/decompose_add/decompose_concat/nrsr_add/nrsr_concat/knn_concat
 FUSION_NUM_LAYERS=2                    # 没用Number of Transformer-style CA blocks for cross_attention/knn_concat
 FUSION_KNN_K=5                         # 没用Number of nearest neighbors from other frames for knn_concat; self token is added automatically
 FUSION_KNN_MIN_VALID_RATIO=0.5         #  没用Minimum confidence mass ratio in the center patch window before a patch/token is marked valid
 FUSION_KNN_POS_MLP_HIDDEN_SIZE=3096     # 没用Hidden width of the relative-position MLP for knn_concat
-FUSION_RECON_MASK_RATIO=0.3              # Feature-dimension mask ratio for masked reconstruction in adver mode
+FUSION_RECON_MASK_RATIO=0.6              # Patch/token mask ratio for masked reconstruction in adver mode
 FUSION_ALIGN_MODE="infonce"               # choices: cosine/infonce
 FUSION_ORTHO_MODE="hsic"                 # choices: cosine/hsic/mine; only used by decompose_* methods
 FUSION_LAMBDA_ALIGN=1.0                  # Initial lambda for shared alignment loss in decompose_* methods
-FUSION_ALIGN_TARGET_RATIO=0.04           # Late-stage target loss_shared_weighted / loss_ce ratio
+FUSION_ALIGN_TARGET_RATIO=0.0           # Late-stage target loss_shared_weighted / loss_ce ratio
 FUSION_ALIGN_LAMBDA_MAX=5.0              # Cap for dynamic shared alignment lambda
 FUSION_LAMBDA_ORTHO=0.5                 # Initial lambda for orthogonality loss
-FUSION_ORTHO_TARGET_RATIO=0.04           # Late-stage target loss_ortho_weighted / loss_ce ratio
+FUSION_ORTHO_TARGET_RATIO=0.0           # Late-stage target loss_ortho_weighted / loss_ce ratio
 FUSION_ORTHO_LAMBDA_MAX=5.0             # Cap for dynamic orthogonality lambda
 FUSION_LAMBDA_RECON=1.0                  # Initial lambda for reconstruction loss in decompose_* methods
-FUSION_RECON_TARGET_RATIO=0.04           # Late-stage target loss_recon_weighted / loss_ce ratio
+FUSION_RECON_TARGET_RATIO=0          # Late-stage target loss_recon_weighted / loss_ce ratio
 FUSION_RECON_LAMBDA_MAX=5.0              # Cap for dynamic reconstruction lambda
 FUSION_LAMBDA_NRSR=1.0                  # 没用
 FUSION_LAMBDA_NRSR_DYNAMIC=True        # 没用
 FUSION_LAMBDA_NRSR_STAGE2_RATIO=0.1    # 没用
-FUSION_LAMBDA_NRSR_STAGE3_RATIO=0.05    # 没用
+FUSION_LAMBDA_NRSR_STAGE3_RATIO=0.1    # 没用
 FUSION_LAMBDA_WARMUP=True               
 FUSION_LAMBDA_WARMUP_STEPS=500           
 FUSION_MINE_Q_WARMUP_STEPS=500            # q_net-only warmup updates per epoch when FUSION_ORTHO_MODE=mine
-USE_LEARNABLE_PREFIX=true
-LEARNABLE_PREFIX_LEN=10
+USE_LEARNABLE_PREFIX=false
+LEARNABLE_PREFIX_LEN=0
 OUTPUT_DIR="7b-adver"                   # Directory for saving checkpoints
 CACHE_DIR="./cache"                        # [TrainingArguments] Cache directory for models
 mkdir -p $OUTPUT_DIR

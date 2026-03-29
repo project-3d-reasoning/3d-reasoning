@@ -4,15 +4,5 @@
 cache
 data
 logs
-3b-decompose-add-ffff
-3b-decompose-add-infonce-cosine-ffff
-3b-add-prefix
-3b-add-prefix222
-3b-decompose-add-club
-3b-nsrs
-3b-mine-0.05
-3b-knn-tunemmlp
-3b-knn
-3b-hsic
-3b-knn-2ca
-3b-adver
+7b-adver
+7b-adver-storage

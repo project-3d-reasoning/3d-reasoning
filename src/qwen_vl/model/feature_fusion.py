@@ -17,7 +17,7 @@ class FeatureFusionConfig:
     num_layers: int = 1
     decompose_hidden_size: Optional[int] = None
     nrsr_hidden_size: Optional[int] = None
-    recon_mask_ratio: float = 0.3  # Feature-dimension mask ratio for masked reconstruction in adver mode.
+    recon_mask_ratio: float = 0.3  # Patch/token mask ratio for masked reconstruction in adver mode.
     align_mode: str = "cosine"  # "cosine"(default) or "infonce"
     align_temperature: float = 0.07
     ortho_mode: str = "cosine"  # "cosine"(default), "hsic", or "mine" (mine mode uses vCLUB)
@@ -365,26 +365,27 @@ class FeatureFusionModule(nn.Module):
         unique_3d = self.decompose_unique_head_3d(latent_3d) * (1.0 - gate_3d)
         return shared_2d, shared_3d, unique_3d
 
-    def _build_masked_recon_inputs(
-        self, features: torch.Tensor
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def _build_patch_recon_mask(self, features: torch.Tensor) -> Optional[torch.Tensor]:
         mask_ratio = float(self.recon_mask_ratio)
         if (not self.training) or mask_ratio <= 0.0:
-            return features, None
+            return None
 
-        keep_prob = max(1.0 - mask_ratio, 0.0)
-        if keep_prob <= 0.0:
-            keep_mask = torch.zeros(features.shape, device=features.device, dtype=features.dtype)
-            masked_features = torch.zeros_like(features)
-            masked_positions = torch.ones_like(features)
-            return masked_features, masked_positions
+        num_patches = int(features[..., :1].numel())
+        if num_patches <= 0:
+            return None
 
-        keep_mask = (
-            torch.rand(features.shape, device=features.device) < keep_prob
-        ).to(features.dtype)
-        masked_features = features * keep_mask / keep_prob
-        masked_positions = 1.0 - keep_mask
-        return masked_features, masked_positions
+        num_masked = int(round(mask_ratio * num_patches))
+        if mask_ratio > 0.0 and num_masked == 0:
+            num_masked = 1
+        num_masked = min(max(num_masked, 0), num_patches)
+
+        masked_positions = features.new_zeros((*features.shape[:-1], 1))
+        if num_masked <= 0:
+            return masked_positions
+
+        masked_indices = torch.randperm(num_patches, device=features.device)[:num_masked]
+        masked_positions.view(-1)[masked_indices] = 1.0
+        return masked_positions
 
     def _compute_masked_recon_loss(
         self,
@@ -397,10 +398,38 @@ class FeatureFusionModule(nn.Module):
             return diff_sq.mean()
 
         masked_positions = masked_positions.to(diff_sq.dtype)
+        if masked_positions.shape != diff_sq.shape:
+            masked_positions = masked_positions.expand_as(diff_sq)
         masked_weight = masked_positions.sum()
         if masked_weight.item() <= 0:
             return diff_sq.mean()
         return (diff_sq * masked_positions).sum() / masked_weight
+
+    def _reconstruct_2d_from_cross_attention(
+        self,
+        shared_3d_hidden: torch.Tensor,
+        features_2d: torch.Tensor,
+    ) -> torch.Tensor:
+        query_states = shared_3d_hidden.reshape(1, -1, self.hidden_size)
+        memory_states = features_2d.reshape(1, -1, self.hidden_size)
+        seq_len = query_states.shape[1]
+        if seq_len <= 1:
+            return self.adver_reconstruct_2d(shared_3d_hidden)
+
+        attn_mask = torch.eye(seq_len, dtype=torch.bool, device=shared_3d_hidden.device)
+        attn_output, _ = self.adver_reconstruct_cross_attention(
+            query=self.adver_reconstruct_query_norm(query_states),
+            key=self.adver_reconstruct_memory_norm(memory_states),
+            value=self.adver_reconstruct_memory_norm(memory_states),
+            attn_mask=attn_mask,
+            need_weights=False,
+        )
+        recon_hidden = query_states + attn_output
+        recon_hidden = recon_hidden + self.adver_reconstruct_mlp(
+            self.adver_reconstruct_output_norm(recon_hidden)
+        )
+        recon_hidden = recon_hidden.reshape_as(shared_3d_hidden)
+        return self.adver_reconstruct_2d(recon_hidden)
 
     def _guided_hidden_states(
         self, shared_2d: torch.Tensor, shared_3d: torch.Tensor, unique_3d: torch.Tensor
@@ -554,6 +583,11 @@ class FeatureFusionModule(nn.Module):
             adver_latent_size = int(self.config.decompose_hidden_size or self.hidden_size)
             if adver_latent_size <= 0:
                 raise ValueError("decompose_hidden_size must be positive when using adver/adver_ortho fusion.")
+            if self.hidden_size % self.config.num_heads != 0:
+                raise ValueError(
+                    f"hidden_size ({self.hidden_size}) must be divisible by num_heads "
+                    f"({self.config.num_heads}) for adver/adver_ortho reconstruction attention."
+                )
             adver_align_size = 1800
             adver_align_hidden = 1800
             adver_hidden = max(
@@ -577,7 +611,23 @@ class FeatureFusionModule(nn.Module):
                 adver_align_size,
                 hidden_dim=adver_align_hidden,
             )
-            self.adver_reconstruct_3d = self._build_projection_mlp(
+            self.adver_reconstruct_query_norm = nn.LayerNorm(self.hidden_size)
+            self.adver_reconstruct_memory_norm = nn.LayerNorm(self.hidden_size)
+            self.adver_reconstruct_cross_attention = nn.MultiheadAttention(
+                embed_dim=self.hidden_size,
+                num_heads=self.config.num_heads,
+                dropout=self.config.dropout,
+                batch_first=True,
+            )
+            self.adver_reconstruct_output_norm = nn.LayerNorm(self.hidden_size)
+            self.adver_reconstruct_mlp = nn.Sequential(
+                nn.Linear(self.hidden_size, adver_hidden),
+                nn.GELU(),
+                nn.Dropout(self.config.dropout),
+                nn.Linear(adver_hidden, self.hidden_size),
+                nn.Dropout(self.config.dropout),
+            )
+            self.adver_reconstruct_2d = self._build_projection_mlp(
                 self.hidden_size,
                 self.hidden_size,
                 hidden_dim=recon_hidden,
@@ -587,12 +637,6 @@ class FeatureFusionModule(nn.Module):
                     self.hidden_size,
                     self.hidden_size,
                     hidden_dim=adver_hidden,
-                )
-                self.adver_joint_reconstruct_3d = self._build_projection_mlp(
-                    self.hidden_size * 2,
-                    self.hidden_size,
-                    hidden_dim=max(self.hidden_size * 2, recon_hidden),
-                    apply_norm=True,
                 )
                 if self.adver_prefix_len > 0:
                     if self.hidden_size % self.config.num_heads != 0:
@@ -987,19 +1031,19 @@ class FeatureFusionModule(nn.Module):
             return self._knn_cross_attention(features_2d, features_3d, patch_world, patch_valid)
 
         elif self.fusion_method == "adver":
-            detached_features_3d = features_3d.detach()
-            shared_3d_hidden = self.adver_shared_encoder(detached_features_3d)
-            fused = features_3d + features_2d + shared_3d_hidden
+            shared_3d_hidden = self.adver_shared_encoder(features_3d)
+            fused =features_2d + shared_3d_hidden
 
             if not return_aux_losses and not return_details:
                 return fused
 
-            align_loss = self._compute_align_loss(shared_3d_hidden.float(), features_2d.float())
+            align_2d = self.adver_align_proj_2d(features_2d)
+            align_3d = self.adver_align_proj_3d(shared_3d_hidden)
+            align_loss = self._compute_align_loss(align_3d.float(), align_2d.float())
 
-            masked_features_3d, masked_positions = self._build_masked_recon_inputs(detached_features_3d)
-            masked_shared_3d_hidden = self.adver_shared_encoder(masked_features_3d)
-            recon_3d = self.adver_reconstruct_3d(masked_shared_3d_hidden)
-            recon_loss = self._compute_masked_recon_loss(recon_3d, features_3d, masked_positions)
+            masked_positions = self._build_patch_recon_mask(features_2d)
+            recon_2d = self._reconstruct_2d_from_cross_attention(shared_3d_hidden, features_2d)
+            recon_loss = self._compute_masked_recon_loss(recon_2d, features_2d, masked_positions)
 
             aux_losses = {
                 "loss_shared": align_loss,
@@ -1008,10 +1052,9 @@ class FeatureFusionModule(nn.Module):
             return fused, aux_losses
 
         elif self.fusion_method == "adver_ortho":
-            detached_features_3d = features_3d.detach()
-            shared_3d_hidden = self.adver_shared_encoder(detached_features_3d)
-            unique_3d_hidden = self.adver_unique_encoder(detached_features_3d)
-            fused = features_3d + features_2d + shared_3d_hidden
+            shared_3d_hidden = self.adver_shared_encoder(features_3d)
+            unique_3d_hidden = self.adver_unique_encoder(features_3d)
+            fused =features_2d + shared_3d_hidden
 
             prefix_embeddings = None
             if return_details:
@@ -1022,16 +1065,17 @@ class FeatureFusionModule(nn.Module):
 
             aux_losses = {}
             if return_aux_losses:
-                align_loss = self._compute_align_loss(shared_3d_hidden.float(), features_2d.float())
+                align_2d = self.adver_align_proj_2d(features_2d)
+                align_3d = self.adver_align_proj_3d(shared_3d_hidden)
+                align_loss = self._compute_align_loss(align_3d.float(), align_2d.float())
 
                 shared_flat = shared_3d_hidden.float().reshape(-1, shared_3d_hidden.shape[-1])
                 unique_flat = unique_3d_hidden.float().reshape(-1, unique_3d_hidden.shape[-1])
                 ortho_loss = self._compute_rbf_hsic_flat(unique_flat, shared_flat)
 
-                recon_3d = self.adver_joint_reconstruct_3d(
-                    torch.cat([shared_3d_hidden, unique_3d_hidden], dim=-1)
-                )
-                recon_loss = F.mse_loss(recon_3d.float(), features_3d.float())
+                masked_positions = self._build_patch_recon_mask(features_2d)
+                recon_2d = self._reconstruct_2d_from_cross_attention(shared_3d_hidden, features_2d)
+                recon_loss = self._compute_masked_recon_loss(recon_2d, features_2d, masked_positions)
 
                 aux_losses.update(
                     {

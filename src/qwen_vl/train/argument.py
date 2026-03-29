@@ -25,7 +25,7 @@ class ModelArguments:
     geometry_merger_type: str = field(default="mlp")  # Type of geometry feature merger ("mlp", "avg")
     decompose_hidden_size: Optional[int] = field(default=None)  # Bottleneck size for shared/unique decomposition branches; defaults to hidden_size when unset
     nrsr_hidden_size: Optional[int] = field(default=None)  # Hidden size for NRSR VIB MLP
-    fusion_recon_mask_ratio: float = field(default=0.3)  # Feature-dimension mask ratio used by masked reconstruction in adver mode
+    fusion_recon_mask_ratio: float = field(default=0.3)  # Patch/token mask ratio used by masked reconstruction in adver mode
     fusion_align_mode: str = field(default="cosine")  # Alignment loss mode ("cosine", "infonce")
     fusion_ortho_mode: str = field(default="cosine")  # Orthogonality mode ("cosine", "hsic", "mine")
     fusion_lambda_align: float = field(default=1.0)  # Weight for shared alignment loss in decompose fusion methods
