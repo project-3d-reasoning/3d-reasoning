@@ -31,7 +31,7 @@ TUNE_MM_VISION=False
 TUNE_MM_VISION_LORA=False
 TUNE_GEOMETRY_ENCODER=False
 TUNE_GEOMETRY_ENCODER_LORA=False
-FEATURE_FUSION_METHOD="add"      # choices: add/concat/cross_attention/gated/weighted/adver/adver_ortho/decompose_add/decompose_concat/nrsr_add/nrsr_concat/knn_concat
+FEATURE_FUSION_METHOD="adver_ortho"      # choices: add/concat/cross_attention/gated/weighted/adver/adver_ortho/decompose_add/decompose_concat/nrsr_add/nrsr_concat/knn_concat
 FUSION_NUM_LAYERS=2                    # 没用Number of Transformer-style CA blocks for cross_attention/knn_concat
 FUSION_KNN_K=5                         # 没用Number of nearest neighbors from other frames for knn_concat; self token is added automatically
 FUSION_KNN_MIN_VALID_RATIO=0.5         #  没用Minimum confidence mass ratio in the center patch window before a patch/token is marked valid
@@ -56,7 +56,7 @@ FUSION_LAMBDA_NRSR_STAGE3_RATIO=0.1    # 没用
 FUSION_LAMBDA_WARMUP=True               
 FUSION_LAMBDA_WARMUP_STEPS=500           
 FUSION_MINE_Q_WARMUP_STEPS=500            # q_net-only warmup updates per epoch when FUSION_ORTHO_MODE=mine
-USE_LABEL_WEIGHT_MASKS=true
+USE_LABEL_WEIGHT_MASKS=false
 # Run scripts/utils/build_label_weight_masks.py beforehand to populate this sidecar directory.
 LABEL_WEIGHT_MASKS_DIR="data/train/label_weight_masks"
 LABEL_WEIGHT_DEFAULT=1.0
