@@ -56,7 +56,7 @@ FUSION_LAMBDA_NRSR_STAGE3_RATIO=0.1    # 没用
 FUSION_LAMBDA_WARMUP=True               
 FUSION_LAMBDA_WARMUP_STEPS=500           
 FUSION_MINE_Q_WARMUP_STEPS=500            # q_net-only warmup updates per epoch when FUSION_ORTHO_MODE=mine
-USE_LABEL_WEIGHT_MASKS=false
+USE_LABEL_WEIGHT_MASKS=true
 # Run scripts/utils/build_label_weight_masks.py beforehand to populate this sidecar directory.
 LABEL_WEIGHT_MASKS_DIR="data/train/label_weight_masks"
 LABEL_WEIGHT_DEFAULT=1.0

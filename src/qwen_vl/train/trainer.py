@@ -405,6 +405,7 @@ class VGTrainer(Trainer):
     """Trainer with optional extra q_theta updates for vCLUB in ortho mine mode."""
     NRSR_STAGE1_END = 0.1
     NRSR_STAGE2_END = 0.5
+    LABEL_WEIGHT_MASK_ENABLE_START = 2.0 / 3.0
     ADVER_DISABLE_START = 2.0 / 3.0
     ADVER_ORTHO_STAGE1_END = 1.0 / 3.0
     ADVER_ORTHO_STAGE2_END = 2.0 / 3.0
@@ -727,7 +728,7 @@ class VGTrainer(Trainer):
 
         return dynamic_weights
 
-    def _recompute_dynamic_iou_loss(
+    def _recompute_label_weighted_loss(
         self,
         model: torch.nn.Module,
         inputs: Dict[str, Any],
@@ -740,41 +741,45 @@ class VGTrainer(Trainer):
         if labels is None or label_weight_codes is None or logits is None:
             return fallback_loss
 
-        alpha, _ = self._get_dynamic_iou_params(model)
-        if alpha <= 0.0:
-            return fallback_loss
-
         shift_logits = logits[..., :-1, :].contiguous().float()
         shift_labels = labels[..., 1:].contiguous().to(shift_logits.device)
         shift_label_weight_codes = label_weight_codes[..., 1:].contiguous().to(shift_logits.device)
-
-        has_dynamic_codes = bool(
-            (shift_label_weight_codes == LABEL_WEIGHT_CODE_SCANREFER_BBOX).any()
-            or (shift_label_weight_codes == LABEL_WEIGHT_CODE_SCANNET_DET_BBOX).any()
-        )
-        if not has_dynamic_codes:
-            return fallback_loss
-
-        weight_table = get_label_weight_value_table(
-            self._unwrap_model(model).config,
-            device=shift_logits.device,
-            dtype=shift_logits.dtype,
-        )
-        token_weights = weight_table[shift_label_weight_codes.long()]
         valid_mask = shift_labels.ne(-100)
-        token_weights = torch.where(
-            valid_mask,
-            token_weights,
-            torch.zeros_like(token_weights),
-        )
-        token_weights = self._build_dynamic_iou_token_weights(
-            model,
-            inputs,
-            shift_logits,
-            shift_labels,
-            shift_label_weight_codes,
-            token_weights,
-        )
+        label_weight_mask_factor = self._get_label_weight_mask_factor()
+
+        if label_weight_mask_factor <= 0.0:
+            token_weights = torch.where(
+                valid_mask,
+                torch.ones_like(shift_logits[..., 0]),
+                torch.zeros_like(shift_logits[..., 0]),
+            )
+        else:
+            weight_table = get_label_weight_value_table(
+                self._unwrap_model(model).config,
+                device=shift_logits.device,
+                dtype=shift_logits.dtype,
+            )
+            token_weights = weight_table[shift_label_weight_codes.long()]
+            token_weights = torch.where(
+                valid_mask,
+                token_weights,
+                torch.zeros_like(token_weights),
+            )
+
+            alpha, _ = self._get_dynamic_iou_params(model)
+            has_dynamic_codes = bool(
+                (shift_label_weight_codes == LABEL_WEIGHT_CODE_SCANREFER_BBOX).any()
+                or (shift_label_weight_codes == LABEL_WEIGHT_CODE_SCANNET_DET_BBOX).any()
+            )
+            if alpha > 0.0 and has_dynamic_codes:
+                token_weights = self._build_dynamic_iou_token_weights(
+                    model,
+                    inputs,
+                    shift_logits,
+                    shift_labels,
+                    shift_label_weight_codes,
+                    token_weights,
+                )
 
         flat_logits = shift_logits.view(-1, shift_logits.size(-1))
         flat_labels = shift_labels.view(-1)
@@ -816,6 +821,13 @@ class VGTrainer(Trainer):
         if epoch is not None and num_train_epochs is not None and float(num_train_epochs) > 0:
             return float(max(0.0, min(1.0, float(epoch) / float(num_train_epochs))))
         return 0.0
+
+    def _get_label_weight_mask_factor(self) -> float:
+        # Delay token reweighting until the last training third so the base CE can stabilize first.
+        progress = self._training_progress()
+        if progress < self.LABEL_WEIGHT_MASK_ENABLE_START:
+            return 0.0
+        return 1.0
 
     def _maybe_get_float_arg(self, name: str) -> Optional[float]:
         value = getattr(self.args, name, None)
@@ -1014,6 +1026,7 @@ class VGTrainer(Trainer):
             self._accumulate_aux_monitor_logs(
                 {
                 "loss_ce": float(loss_ce.item()),
+                "label_weight_mask_factor": float(self._get_label_weight_mask_factor()),
                 }
             )
             return
@@ -1049,6 +1062,7 @@ class VGTrainer(Trainer):
 
         aux_logs: Dict[str, float] = {
             "loss_ce": loss_ce_val_f,
+            "label_weight_mask_factor": float(self._get_label_weight_mask_factor()),
         }
 
         aux_log_specs = (
@@ -1313,7 +1327,7 @@ class VGTrainer(Trainer):
             loss, outputs = loss_outputs, None
 
         if outputs is not None and loss is not None:
-            loss = self._recompute_dynamic_iou_loss(model, inputs, outputs, loss)
+            loss = self._recompute_label_weighted_loss(model, inputs, outputs, loss)
         loss = self._apply_nrsr_ratio_constraint(model, loss, outputs)
         self._update_aux_monitor_logs(model, loss, outputs)
 
