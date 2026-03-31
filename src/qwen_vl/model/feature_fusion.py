@@ -18,6 +18,7 @@ class FeatureFusionConfig:
     decompose_hidden_size: Optional[int] = None
     nrsr_hidden_size: Optional[int] = None
     recon_mask_ratio: float = 0.3  # Patch/token mask ratio for masked reconstruction in adver mode.
+    adver_compute_align_loss: bool = False  # Keep align-loss code path available, but disable it by default in adver/adver_ortho training to save time.
     align_mode: str = "cosine"  # "cosine"(default) or "infonce"
     align_temperature: float = 0.07
     ortho_mode: str = "cosine"  # "cosine"(default), "hsic", or "mine" (mine mode uses vCLUB)
@@ -1094,30 +1095,30 @@ class FeatureFusionModule(nn.Module):
             if not return_aux_losses and not return_details:
                 return fused
 
-            align_2d = self.adver_align_proj_2d(features_2d)
-            align_3d = self.adver_align_proj_3d(shared_3d_hidden)
-            align_loss = self._compute_align_loss(align_3d.float(), align_2d.float())
+            align_loss = None
+            if self.config.adver_compute_align_loss:
+                align_2d = self.adver_align_proj_2d(features_2d)
+                align_3d = self.adver_align_proj_3d(shared_3d_hidden)
+                align_loss = self._compute_align_loss(align_3d.float(), align_2d.float())
 
             masked_positions = self._build_patch_recon_mask(features_2d)
             recon_2d = self._reconstruct_2d_from_cross_attention(shared_3d_hidden, features_2d)
             recon_loss = self._compute_masked_recon_loss(recon_2d, features_2d, masked_positions)
 
             aux_losses = {
-                "loss_shared": align_loss,
                 "loss_recon": recon_loss,
                 "gate_shared_ratio": gate_shared_ratio,
             }
+            if align_loss is not None:
+                aux_losses["loss_shared"] = align_loss
             return fused, aux_losses
 
         elif self.fusion_method == "adver_ortho":
             shared_3d_hidden = self.adver_shared_encoder(features_3d)
             unique_3d_hidden = self.adver_unique_encoder(features_3d)
-            shared_3d_fused, gate_shared_ratio = self._apply_question_guided_shared_gate(
-                features_2d,
-                shared_3d_hidden,
-                question_summary,
-                return_gate_ratio=return_aux_losses or return_details,
-            )
+            # Keep the question-guided gate implementation available, but bypass it in
+            # adver_ortho so the shared branch is always fully used.
+            shared_3d_fused = shared_3d_hidden
             fused = features_2d + shared_3d_fused
 
             prefix_embeddings = None
@@ -1129,24 +1130,14 @@ class FeatureFusionModule(nn.Module):
 
             aux_losses = {}
             if return_aux_losses:
-                align_2d = self.adver_align_proj_2d(features_2d)
-                align_3d = self.adver_align_proj_3d(shared_3d_hidden)
-                align_loss = self._compute_align_loss(align_3d.float(), align_2d.float())
-
                 shared_flat = shared_3d_hidden.float().reshape(-1, shared_3d_hidden.shape[-1])
                 unique_flat = unique_3d_hidden.float().reshape(-1, unique_3d_hidden.shape[-1])
                 ortho_loss = self._compute_rbf_hsic_flat(unique_flat, shared_flat)
 
-                masked_positions = self._build_patch_recon_mask(features_2d)
-                recon_2d = self._reconstruct_2d_from_cross_attention(shared_3d_hidden, features_2d)
-                recon_loss = self._compute_masked_recon_loss(recon_2d, features_2d, masked_positions)
-
                 aux_losses.update(
                     {
-                        "loss_shared": align_loss,
                         "loss_ortho": ortho_loss,
-                        "loss_recon": recon_loss,
-                        "gate_shared_ratio": gate_shared_ratio,
+                        "gate_shared_ratio": features_2d.new_tensor(1.0),
                     }
                 )
             if prefix_embeddings is not None:

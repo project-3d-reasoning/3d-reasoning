@@ -186,8 +186,8 @@ class FusionLambdaWarmupCallback(transformers.TrainerCallback):
 
     Behavior:
     - `adver`: first 2/3 enables align+recon, last 1/3 disables all aux losses.
-    - `adver_ortho`: first 1/3 enables align+recon, middle 1/3 enables
-      align+recon+ortho, last 1/3 disables all aux losses.
+    - `adver_ortho`: first 1/3 disables aux losses, middle 1/3 enables
+      ortho only, last 1/3 disables all aux losses.
     - other supported fusion modes keep the original warmup-only behavior.
     """
 
@@ -226,9 +226,9 @@ class FusionLambdaWarmupCallback(transformers.TrainerCallback):
 
     def _adver_ortho_stage_factor(self, lambda_attr: str, progress: float) -> float:
         if progress < self.ADVER_ORTHO_STAGE1_END:
-            return 1.0 if lambda_attr in {"fusion_lambda_align", "fusion_lambda_recon"} else 0.0
+            return 0.0
         if progress < self.ADVER_ORTHO_STAGE2_END:
-            return 1.0
+            return 1.0 if lambda_attr == "fusion_lambda_ortho" else 0.0
         return 0.0
 
     def _schedule_factor(self, lambda_attr: str, progress: float, warmup_factor: float) -> float:
@@ -282,6 +282,7 @@ class FusionLambdaWarmupCallback(transformers.TrainerCallback):
         elif fusion_method == "adver_ortho":
             rank0_print(
                 "[FusionLambdaWarmup] Enabled adver_ortho 3-stage aux schedule, "
+                "stage1=off, stage2=ortho-only, stage3=off, "
                 f"stage1_end={self.ADVER_ORTHO_STAGE1_END:.3f}, "
                 f"stage2_end={self.ADVER_ORTHO_STAGE2_END:.3f}, "
                 f"warmup_steps={self.warmup_steps}, base_lambdas={self.lambda_bases}"
@@ -433,6 +434,7 @@ def train(attn_implementation="flash_attention_2"):
                 "decompose_hidden_size",
                 "nrsr_hidden_size",
                 "fusion_recon_mask_ratio",
+                "adver_compute_align_loss",
                 "fusion_align_mode",
                 "fusion_ortho_mode",
                 "fusion_lambda_align",
@@ -457,6 +459,16 @@ def train(attn_implementation="flash_attention_2"):
                 "learnable_prefix_len",
                 "text_gate_bert_name_or_path",
                 "text_gate_bert_max_length",
+                "label_weight_default",
+                "label_weight_scanrefer_frame",
+                "label_weight_scanrefer_bbox",
+                "label_weight_scan2cap_category",
+                "label_weight_scan2cap_attribute",
+                "label_weight_scan2cap_relation",
+                "label_weight_scannet_det_label",
+                "label_weight_scannet_det_bbox",
+                "label_weight_dynamic_iou_alpha",
+                "label_weight_dynamic_iou_eps",
             ]:
                 setattr(config, k, getattr(model_args, k))
             setattr(config, "text_gate_bert_cache_dir", training_args.cache_dir)
@@ -513,7 +525,7 @@ def train(attn_implementation="flash_attention_2"):
     bert_tokenizer = None
     if (
         model_args.use_geometry_encoder
-        and str(model_args.feature_fusion_method).lower() in {"adver", "adver_ortho"}
+        and str(model_args.feature_fusion_method).lower() == "adver"
         and getattr(model_args, "text_gate_bert_name_or_path", None)
     ):
         bert_tokenizer = transformers.AutoTokenizer.from_pretrained(

@@ -4,11 +4,133 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import copy
+import os
+from collections import OrderedDict
+from threading import Lock
+
 import torch
 from PIL import Image
 from torchvision import transforms as TF
-import numpy as np
-import copy
+
+
+def _get_preprocess_cache_size() -> int:
+    try:
+        return max(int(os.environ.get("VGLLM_PREPROCESS_CACHE_SIZE", "64")), 0)
+    except ValueError:
+        return 64
+
+
+_PREPROCESS_CACHE_MAX_ENTRIES = _get_preprocess_cache_size()
+_PREPROCESS_CACHE = OrderedDict()
+_PREPROCESS_CACHE_LOCK = Lock()
+
+
+def _build_preprocess_cache_key(image_source, mode: str, target_size: int):
+    if _PREPROCESS_CACHE_MAX_ENTRIES <= 0:
+        return None
+
+    source_path = None
+    if isinstance(image_source, str):
+        source_path = image_source
+    elif isinstance(image_source, Image.Image):
+        source_path = image_source.info.get("vgllm_cache_key") if hasattr(image_source, "info") else None
+        if not source_path:
+            source_path = getattr(image_source, "filename", None)
+
+    if not source_path:
+        return None
+
+    source_path = os.path.abspath(source_path)
+    try:
+        stat = os.stat(source_path)
+        source_version = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        source_version = None
+
+    return (source_path, source_version, mode, target_size)
+
+
+def _get_cached_preprocessed_image(image_source, mode: str, target_size: int):
+    cache_key = _build_preprocess_cache_key(image_source, mode, target_size)
+    if cache_key is None:
+        return None
+
+    with _PREPROCESS_CACHE_LOCK:
+        cached = _PREPROCESS_CACHE.get(cache_key)
+        if cached is not None:
+            _PREPROCESS_CACHE.move_to_end(cache_key)
+        return cached
+
+
+def _store_cached_preprocessed_image(image_source, mode: str, target_size: int, image_tensor: torch.Tensor):
+    cache_key = _build_preprocess_cache_key(image_source, mode, target_size)
+    if cache_key is None:
+        return
+
+    with _PREPROCESS_CACHE_LOCK:
+        _PREPROCESS_CACHE[cache_key] = image_tensor
+        _PREPROCESS_CACHE.move_to_end(cache_key)
+        while len(_PREPROCESS_CACHE) > _PREPROCESS_CACHE_MAX_ENTRIES:
+            _PREPROCESS_CACHE.popitem(last=False)
+
+
+def _load_single_preprocessed_image(image_source, mode="crop", target_size=518, to_tensor=None):
+    cached_image = _get_cached_preprocessed_image(image_source, mode, target_size)
+    if cached_image is not None:
+        return cached_image
+
+    if to_tensor is None:
+        to_tensor = TF.ToTensor()
+
+    if isinstance(image_source, str):
+        with Image.open(image_source) as opened_image:
+            img = opened_image.copy()
+    elif isinstance(image_source, Image.Image):
+        img = image_source
+    else:
+        raise NotImplementedError(f"Unsupported image type: {type(image_source)}")
+
+    if img.mode == "RGBA":
+        background = Image.new("RGBA", img.size, (255, 255, 255, 255))
+        img = Image.alpha_composite(background, img)
+
+    img = img.convert("RGB")
+    width, height = img.size
+
+    if mode == "pad":
+        if width >= height:
+            new_width = target_size
+            new_height = round(height * (new_width / width) / 14) * 14
+        else:
+            new_height = target_size
+            new_width = round(width * (new_height / height) / 14) * 14
+    else:
+        new_width = target_size
+        new_height = round(height * (new_width / width) / 14) * 14
+
+    img = img.resize((new_width, new_height), Image.Resampling.BICUBIC)
+    img = to_tensor(img)
+
+    if mode == "crop" and new_height > target_size:
+        start_y = (new_height - target_size) // 2
+        img = img[:, start_y : start_y + target_size, :]
+
+    if mode == "pad":
+        h_padding = target_size - img.shape[1]
+        w_padding = target_size - img.shape[2]
+        if h_padding > 0 or w_padding > 0:
+            pad_top = h_padding // 2
+            pad_bottom = h_padding - pad_top
+            pad_left = w_padding // 2
+            pad_right = w_padding - pad_left
+            img = torch.nn.functional.pad(
+                img, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=1.0
+            )
+
+    _store_cached_preprocessed_image(image_source, mode, target_size, img)
+    return img
+
 
 def load_and_preprocess_images(image_path_list, mode="crop", target_size=518):
     """
@@ -51,66 +173,12 @@ def load_and_preprocess_images(image_path_list, mode="crop", target_size=518):
 
     # First process all images and collect their shapes
     for image_path in image_path_list:
-
-        # Open image
-        if isinstance(image_path, str):
-            img = Image.open(image_path)
-        elif isinstance(image_path, Image.Image):
-            img = image_path
-        else:
-            raise NotImplementedError(f"Unsupported image type: {type(image_path)}")
-
-        # If there's an alpha channel, blend onto white background:
-        if img.mode == "RGBA":
-            # Create white background
-            background = Image.new("RGBA", img.size, (255, 255, 255, 255))
-            # Alpha composite onto the white background
-            img = Image.alpha_composite(background, img)
-
-        # Now convert to "RGB" (this step assigns white for transparent areas)
-        img = img.convert("RGB")
-
-        width, height = img.size
-
-        if mode == "pad":
-            # Make the largest dimension 518px while maintaining aspect ratio
-            if width >= height:
-                new_width = target_size
-                new_height = round(height * (new_width / width) / 14) * 14  # Make divisible by 14
-            else:
-                new_height = target_size
-                new_width = round(width * (new_height / height) / 14) * 14  # Make divisible by 14
-        else:  # mode == "crop"
-            # Original behavior: set width to 518px
-            new_width = target_size
-            # Calculate height maintaining aspect ratio, divisible by 14
-            new_height = round(height * (new_width / width) / 14) * 14
-
-        # Resize with new dimensions (width, height)
-        img = img.resize((new_width, new_height), Image.Resampling.BICUBIC)
-        img = to_tensor(img)  # Convert to tensor (0, 1)
-
-        # Center crop height if it's larger than 518 (only in crop mode)
-        if mode == "crop" and new_height > target_size:
-            start_y = (new_height - target_size) // 2
-            img = img[:, start_y : start_y + target_size, :]
-
-        # For pad mode, pad to make a square of target_size x target_size
-        if mode == "pad":
-            h_padding = target_size - img.shape[1]
-            w_padding = target_size - img.shape[2]
-
-            if h_padding > 0 or w_padding > 0:
-                pad_top = h_padding // 2
-                pad_bottom = h_padding - pad_top
-                pad_left = w_padding // 2
-                pad_right = w_padding - pad_left
-
-                # Pad with white (value=1.0)
-                img = torch.nn.functional.pad(
-                    img, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=1.0
-                )
-
+        img = _load_single_preprocessed_image(
+            image_path,
+            mode=mode,
+            target_size=target_size,
+            to_tensor=to_tensor,
+        )
         shapes.add((img.shape[1], img.shape[2]))
         images.append(img)
 

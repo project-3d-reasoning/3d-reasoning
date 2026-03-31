@@ -16,6 +16,16 @@ class ModelArguments:
     learnable_prefix_len: int = field(default=0)  # Number of learnable prefix tokens to insert at the visual-question boundary
     text_gate_bert_name_or_path: str = field(default="bert-base-uncased")  # Frozen BERT encoder used to extract question summaries for adver/adver_ortho gates
     text_gate_bert_max_length: int = field(default=64)  # Maximum BERT token length for question text encoding
+    label_weight_default: float = field(default=1.0)  # Default token weight for supervised assistant tokens when label weighting is enabled
+    label_weight_scanrefer_frame: float = field(default=3.0)  # Weight for ScanRefer frame index tokens
+    label_weight_scanrefer_bbox: float = field(default=3.0)  # Weight for ScanRefer bbox numeric tokens
+    label_weight_scan2cap_category: float = field(default=2.0)  # Weight for Scan2Cap category phrases
+    label_weight_scan2cap_attribute: float = field(default=1.5)  # Weight for Scan2Cap attribute phrases
+    label_weight_scan2cap_relation: float = field(default=1.5)  # Weight for Scan2Cap relation phrases
+    label_weight_scannet_det_label: float = field(default=2.0)  # Weight for ScanNetDet label phrases
+    label_weight_scannet_det_bbox: float = field(default=2.5)  # Weight for ScanNetDet bbox numeric tokens
+    label_weight_dynamic_iou_alpha: float = field(default=0.0)  # Dynamic IoU weight factor; 0 disables dynamic IoU reweighting
+    label_weight_dynamic_iou_eps: float = field(default=1e-6)  # Numerical stabilizer for dynamic IoU weights
 
     # Geometry encoder configuration
     use_geometry_encoder: bool = field(default=False)  # Whether to use 3D geometry encoder
@@ -28,6 +38,7 @@ class ModelArguments:
     decompose_hidden_size: Optional[int] = field(default=None)  # Bottleneck size for shared/unique decomposition branches; defaults to hidden_size when unset
     nrsr_hidden_size: Optional[int] = field(default=None)  # Hidden size for NRSR VIB MLP
     fusion_recon_mask_ratio: float = field(default=0.3)  # Patch/token mask ratio used by masked reconstruction in adver mode
+    adver_compute_align_loss: bool = field(default=False)  # Whether to compute shared alignment loss in adver/adver_ortho; defaults to False to save training time while keeping the code path available
     fusion_align_mode: str = field(default="cosine")  # Alignment loss mode ("cosine", "infonce")
     fusion_ortho_mode: str = field(default="cosine")  # Orthogonality mode ("cosine", "hsic", "mine")
     fusion_lambda_align: float = field(default=1.0)  # Weight for shared alignment loss in decompose fusion methods
@@ -58,6 +69,7 @@ class DataArguments:
     dataset_use: str = field(default="")
     video_max_frames: Optional[int] = field(default=8)
     video_min_frames: Optional[int] = field(default=4)
+    label_weight_masks_dir: Optional[str] = field(default=None)
     data_flatten: bool = field(default=False)
     base_interval: int = field(default=2)
     max_pixels: int = field(default=28 * 28 * 576)

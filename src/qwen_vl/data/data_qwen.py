@@ -27,6 +27,11 @@ import transformers
 from . import data_list
 from .rope2d import get_rope_index_25, get_rope_index_2
 from .utils import prepare_image_inputs
+from qwen_vl.label_weighting import (
+    LabelWeightMaskStore,
+    build_full_label_weight_codes,
+    get_label_weight_mask_path,
+)
 
 IGNORE_INDEX = -100
 IMAGE_TOKEN_INDEX = 151655
@@ -206,18 +211,21 @@ class LazySupervisedDataset(Dataset):
                 annotations = read_jsonl(data["annotation_path"], max_samples=data_args.max_samples)
             else:
                 annotations = json.load(open(data["annotation_path"], "r"))
+            indexed_annotations = list(enumerate(annotations))
             sampling_rate = data.get("sampling_rate", 1.0)
             if sampling_rate < 1.0:
-                annotations = random.sample(
-                    annotations, int(len(annotations) * sampling_rate)
+                indexed_annotations = random.sample(
+                    indexed_annotations, int(len(indexed_annotations) * sampling_rate)
                 )
-                print(f"sampling {len(annotations)} examples from dataset {data}")
+                print(f"sampling {len(indexed_annotations)} examples from dataset {data}")
             else:
                 rank0_print(f"dataset name: {data}")
-            for ann in annotations:
+            for source_ann_idx, ann in indexed_annotations:
                 ann["data_path"] = data["data_path"]
                 ann["tag"] = data["tag"]
-            list_data_dict += annotations
+                ann["_source_dataset_name"] = data["dataset_name"]
+                ann["_source_sample_idx"] = source_ann_idx
+            list_data_dict += [ann for _, ann in indexed_annotations]
 
         print(f"Total training samples: {len(list_data_dict)}")
 
@@ -227,6 +235,23 @@ class LazySupervisedDataset(Dataset):
         self.tokenizer = tokenizer
         self.list_data_dict = list_data_dict
         self.data_args = data_args
+        self.label_weight_mask_enabled = bool(getattr(data_args, "label_weight_masks_dir", None))
+        self.label_weight_mask_stores = {}
+        if self.label_weight_mask_enabled:
+            masks_dir = getattr(data_args, "label_weight_masks_dir", None)
+            for data in dataset_list:
+                try:
+                    mask_path = get_label_weight_mask_path(data["annotation_path"], masks_dir)
+                    if os.path.exists(mask_path):
+                        self.label_weight_mask_stores[data["dataset_name"]] = LabelWeightMaskStore(mask_path)
+                    else:
+                        rank0_print(
+                            f"[LabelWeightMask] Missing sidecar for dataset={data['dataset_name']}: {mask_path}"
+                        )
+                except Exception as exc:
+                    rank0_print(
+                        f"[LabelWeightMask] Failed to load sidecar for dataset={data['dataset_name']}: {exc}"
+                    )
         self.data_args.image_processor.max_pixels = data_args.max_pixels
         self.data_args.image_processor.min_pixels = data_args.min_pixels
         self.data_args.image_processor.size["longest_edge"] = data_args.max_pixels
@@ -555,6 +580,21 @@ class LazySupervisedDataset(Dataset):
             data_dict["video_grid_thw"] = grid_thw
         
         data_dict["tag"] = self.list_data_dict[i].get("tag", "2d")
+        source_dataset_name = self.list_data_dict[i].get("_source_dataset_name")
+        if self.label_weight_mask_enabled:
+            source_sample_idx = int(self.list_data_dict[i].get("_source_sample_idx", -1))
+            assistant_codes = None
+            if source_dataset_name in self.label_weight_mask_stores and source_sample_idx >= 0:
+                assistant_codes = self.label_weight_mask_stores[source_dataset_name].get_codes(source_sample_idx)
+            data_dict["label_weight_codes"] = build_full_label_weight_codes(
+                data_dict["labels"],
+                assistant_codes=assistant_codes,
+                ignore_index=IGNORE_INDEX,
+            )
+        if source_dataset_name == "scanrefer" and "target" in self.list_data_dict[i]:
+            data_dict["scanrefer_target"] = copy.deepcopy(self.list_data_dict[i]["target"])
+        if source_dataset_name == "scannet_det" and "boxes" in self.list_data_dict[i]:
+            data_dict["scannet_det_boxes"] = copy.deepcopy(self.list_data_dict[i]["boxes"])
         return data_dict
 
 
@@ -620,6 +660,31 @@ class DataCollatorForSupervisedDataset(object):
             labels=labels,
             attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
         )
+        if any("label_weight_codes" in instance for instance in instances):
+            label_weight_codes = [
+                instance.get(
+                    "label_weight_codes",
+                    torch.zeros_like(instance["labels"], dtype=torch.uint8),
+                )
+                for instance in instances
+            ]
+            label_weight_codes = torch.nn.utils.rnn.pad_sequence(
+                label_weight_codes,
+                batch_first=True,
+                padding_value=0,
+            )
+            label_weight_codes = label_weight_codes[:, : self.tokenizer.model_max_length]
+            batch["label_weight_codes"] = label_weight_codes
+        if any("scanrefer_target" in instance for instance in instances):
+            batch["scanrefer_targets"] = [
+                instance.get("scanrefer_target")
+                for instance in instances
+            ]
+        if any("scannet_det_boxes" in instance for instance in instances):
+            batch["scannet_det_boxes"] = [
+                instance.get("scannet_det_boxes")
+                for instance in instances
+            ]
         images = list(
             itertools.chain(
                 *(
@@ -711,6 +776,25 @@ class FlattenedDataCollatorForSupervisedDataset(DataCollatorForSupervisedDataset
             attention_mask=cumsum_seq_lens,
             position_ids=position_ids,
         )
+        if any("label_weight_codes" in instance for instance in instances):
+            label_weight_codes = [
+                instance.get(
+                    "label_weight_codes",
+                    torch.zeros_like(instance["labels"], dtype=torch.uint8),
+                )
+                for instance in instances
+            ]
+            batch["label_weight_codes"] = torch.cat(label_weight_codes, dim=0).unsqueeze(0)
+        if any("scanrefer_target" in instance for instance in instances):
+            batch["scanrefer_targets"] = [
+                instance.get("scanrefer_target")
+                for instance in instances
+            ]
+        if any("scannet_det_boxes" in instance for instance in instances):
+            batch["scannet_det_boxes"] = [
+                instance.get("scannet_det_boxes")
+                for instance in instances
+            ]
         images = list(
             itertools.chain(
                 *(

@@ -292,12 +292,18 @@ media_dir = yaml.safe_load("".join(safe_data))["metadata"]["media_dir"]
 #     data = pickle.load(f)["data_list"]
 #     id2scene = {sample["sample_id"]: sample for sample in data}
 
+
+def _load_eval_image(image_file: str) -> Image.Image:
+    image_path = os.path.join(media_dir, image_file)
+    with Image.open(image_path) as image:
+        rgb_image = image.convert("RGB")
+    rgb_image.info["vgllm_cache_key"] = os.path.abspath(image_path)
+    return rgb_image
+
 def threedod_doc_to_visual(doc):
     image_files = doc["images"]
     images = [
-        Image.open(
-            os.path.join(media_dir, image_file)
-        ).convert("RGB")
+        _load_eval_image(image_file)
         for image_file in image_files
     ]
     return [images]

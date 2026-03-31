@@ -1,4 +1,6 @@
+import math
 import os
+import re
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import datasets
@@ -24,6 +26,17 @@ from transformers.trainer import (
     is_sagemaker_mp_enabled,
 )
 from transformers.trainer_utils import seed_worker
+
+from qwen_vl.label_weighting import (
+    LABEL_WEIGHT_CODE_SCANREFER_BBOX,
+    LABEL_WEIGHT_CODE_SCANNET_DET_BBOX,
+    get_label_weight_value_table,
+)
+
+
+_NUMBER_PATTERN = re.compile(r"-?\d+(?:\.\d+)?")
+_SCANREFER_FRAME_PATTERN = re.compile(r'"frame"\s*:\s*(-?\d+)')
+_JSON_BBOX_PATTERN = re.compile(r'"bbox_3d"\s*:\s*\[([^\]]*)\]', re.DOTALL)
 
 
 def _flash_attention_forward(
@@ -457,6 +470,342 @@ class VGTrainer(Trainer):
             return outputs.get(name)
         return getattr(outputs, name, None)
 
+    def _get_dynamic_iou_params(self, model: torch.nn.Module) -> Tuple[float, float]:
+        base_model = self._unwrap_model(model)
+        config = getattr(base_model, "config", None)
+        alpha = float(getattr(config, "label_weight_dynamic_iou_alpha", 0.0) or 0.0)
+        eps = float(getattr(config, "label_weight_dynamic_iou_eps", 1e-6) or 1e-6)
+        return alpha, max(eps, 1e-12)
+
+    def _get_tokenizer(self):
+        tokenizer = getattr(self, "processing_class", None)
+        if tokenizer is None:
+            tokenizer = getattr(self, "tokenizer", None)
+        if tokenizer is None or not hasattr(tokenizer, "decode"):
+            return None
+        return tokenizer
+
+    @staticmethod
+    def _parse_bbox_numbers(text: str) -> Optional[List[float]]:
+        numbers = _NUMBER_PATTERN.findall(text)
+        if len(numbers) != 9:
+            return None
+        try:
+            return [float(value) for value in numbers]
+        except ValueError:
+            return None
+
+    def _parse_scanrefer_prediction(self, text: str) -> Tuple[Optional[int], Optional[List[float]]]:
+        frame_match = _SCANREFER_FRAME_PATTERN.search(text)
+        bbox_match = _JSON_BBOX_PATTERN.search(text)
+        frame_idx = None
+        if frame_match is not None:
+            try:
+                frame_idx = int(frame_match.group(1))
+            except ValueError:
+                frame_idx = None
+        bbox = None
+        if bbox_match is not None:
+            bbox = self._parse_bbox_numbers(bbox_match.group(1))
+        return frame_idx, bbox
+
+    def _parse_bbox_matches(self, text: str) -> List[Tuple[List[float], int, int]]:
+        matches: List[Tuple[List[float], int, int]] = []
+        for match in _JSON_BBOX_PATTERN.finditer(text):
+            bbox = self._parse_bbox_numbers(match.group(1))
+            if bbox is None:
+                continue
+            matches.append((bbox, match.start(1), match.end(1)))
+        return matches
+
+    @staticmethod
+    def _normalize_scannet_det_gt_boxes(boxes: Any) -> List[List[float]]:
+        entries: List[List[float]] = []
+        if not isinstance(boxes, list):
+            return entries
+        for item in boxes:
+            if not isinstance(item, dict):
+                continue
+            bbox = item.get("bbox_3d")
+            if not isinstance(bbox, list) or len(bbox) != 9:
+                continue
+            try:
+                entries.append([float(value) for value in bbox])
+            except (TypeError, ValueError):
+                continue
+        return entries
+
+    @staticmethod
+    def _clamp_dynamic_weight(weight: float) -> float:
+        return float(max(0.0, min(weight, 5.0)))
+
+    def _text_char_span_to_token_span(
+        self,
+        tokenizer,
+        text: str,
+        char_start: int,
+        char_end: int,
+    ) -> Optional[Tuple[int, int]]:
+        try:
+            prefix_ids = tokenizer(text[:char_start], add_special_tokens=False)["input_ids"]
+            span_ids = tokenizer(text[char_start:char_end], add_special_tokens=False)["input_ids"]
+        except Exception:
+            return None
+        if not span_ids:
+            return None
+        return len(prefix_ids), len(prefix_ids) + len(span_ids)
+
+    @staticmethod
+    def _decode_supervised_text(
+        tokenizer,
+        token_ids: torch.Tensor,
+        label_ids: torch.Tensor,
+    ) -> str:
+        valid_ids = token_ids[label_ids.ne(-100)].tolist()
+        if not valid_ids:
+            return ""
+        return tokenizer.decode(
+            valid_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+
+    @staticmethod
+    def _compute_box_iou(pred_box: Sequence[float], gt_box: Sequence[float]) -> float:
+        try:
+            from lmms_eval.tasks.threedod.utils import EulerDepthInstance3DBoxes
+
+            pred_tensor = torch.tensor([pred_box], dtype=torch.float32)
+            gt_tensor = torch.tensor([gt_box], dtype=torch.float32)
+            iou = EulerDepthInstance3DBoxes.overlaps(
+                EulerDepthInstance3DBoxes(pred_tensor, convention="ZXY"),
+                EulerDepthInstance3DBoxes(gt_tensor, convention="ZXY"),
+            ).item()
+            return float(max(0.0, min(1.0, iou)))
+        except Exception:
+            return 0.0
+
+    def _compute_ordered_box_ious(
+        self,
+        pred_boxes: List[List[float]],
+        gt_boxes: List[List[float]],
+    ) -> List[float]:
+        if not gt_boxes:
+            return []
+
+        ious = [0.0 for _ in gt_boxes]
+        common_count = min(len(pred_boxes), len(gt_boxes))
+        if common_count <= 0:
+            return ious
+
+        try:
+            from lmms_eval.tasks.threedod.utils import EulerDepthInstance3DBoxes
+
+            pred_tensor = torch.tensor(pred_boxes[:common_count], dtype=torch.float32)
+            gt_tensor = torch.tensor(gt_boxes[:common_count], dtype=torch.float32)
+            iou_matrix = EulerDepthInstance3DBoxes.overlaps(
+                EulerDepthInstance3DBoxes(pred_tensor, convention="ZXY"),
+                EulerDepthInstance3DBoxes(gt_tensor, convention="ZXY"),
+            )
+            diag = torch.diagonal(iou_matrix, 0).tolist()
+            for idx, value in enumerate(diag):
+                ious[idx] = float(max(0.0, min(1.0, value)))
+        except Exception:
+            return ious
+
+        return ious
+
+    def _build_dynamic_iou_token_weights(
+        self,
+        model: torch.nn.Module,
+        inputs: Dict[str, Any],
+        shift_logits: torch.Tensor,
+        shift_labels: torch.Tensor,
+        shift_label_weight_codes: torch.Tensor,
+        token_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        alpha, eps = self._get_dynamic_iou_params(model)
+        if alpha <= 0.0:
+            return token_weights
+
+        tokenizer = self._get_tokenizer()
+        if tokenizer is None:
+            return token_weights
+
+        has_scanrefer = bool((shift_label_weight_codes == LABEL_WEIGHT_CODE_SCANREFER_BBOX).any())
+        has_scannet_det = bool((shift_label_weight_codes == LABEL_WEIGHT_CODE_SCANNET_DET_BBOX).any())
+        if not has_scanrefer and not has_scannet_det:
+            return token_weights
+
+        dynamic_weights = token_weights.detach().clone()
+        pred_ids = shift_logits.argmax(dim=-1).detach().cpu()
+        label_ids = shift_labels.detach().cpu()
+        scanrefer_targets = inputs.get("scanrefer_targets") or []
+        scannet_det_boxes = inputs.get("scannet_det_boxes") or []
+
+        for sample_idx in range(shift_labels.size(0)):
+            sample_codes = shift_label_weight_codes[sample_idx]
+            needs_scanrefer = bool((sample_codes == LABEL_WEIGHT_CODE_SCANREFER_BBOX).any())
+            needs_scannet_det = bool((sample_codes == LABEL_WEIGHT_CODE_SCANNET_DET_BBOX).any())
+            if not needs_scanrefer and not needs_scannet_det:
+                continue
+
+            pred_text = self._decode_supervised_text(tokenizer, pred_ids[sample_idx], label_ids[sample_idx])
+            gt_text = self._decode_supervised_text(tokenizer, label_ids[sample_idx], label_ids[sample_idx])
+            if needs_scanrefer:
+                target = scanrefer_targets[sample_idx] if sample_idx < len(scanrefer_targets) else None
+                gt_frame = None
+                gt_box = None
+                if isinstance(target, dict):
+                    frame_value = target.get("frame")
+                    bbox_value = target.get("bbox_3d")
+                    if isinstance(frame_value, int):
+                        gt_frame = frame_value
+                    if isinstance(bbox_value, list) and len(bbox_value) == 9:
+                        try:
+                            gt_box = [float(value) for value in bbox_value]
+                        except (TypeError, ValueError):
+                            gt_box = None
+                pred_frame, pred_box = self._parse_scanrefer_prediction(pred_text)
+                scanrefer_iou = 0.0
+                if (
+                    gt_frame is not None
+                    and pred_frame is not None
+                    and gt_box is not None
+                    and pred_box is not None
+                    and pred_frame == gt_frame
+                ):
+                    scanrefer_iou = self._compute_box_iou(pred_box, gt_box)
+                scanrefer_weight = self._clamp_dynamic_weight(1.0 - alpha * math.log(scanrefer_iou + eps))
+                bbox_mask = sample_codes == LABEL_WEIGHT_CODE_SCANREFER_BBOX
+                dynamic_weights[sample_idx] = torch.where(
+                    bbox_mask,
+                    dynamic_weights[sample_idx].new_tensor(scanrefer_weight).detach(),
+                    dynamic_weights[sample_idx],
+                )
+
+            if needs_scannet_det:
+                gt_boxes = scannet_det_boxes[sample_idx] if sample_idx < len(scannet_det_boxes) else None
+                gt_box_list = self._normalize_scannet_det_gt_boxes(gt_boxes)
+                pred_box_matches = self._parse_bbox_matches(pred_text)
+                gt_box_matches = self._parse_bbox_matches(gt_text)
+                pred_box_list = [bbox for bbox, _, _ in pred_box_matches]
+                gt_text_box_list = [bbox for bbox, _, _ in gt_box_matches]
+
+                if gt_box_list and gt_text_box_list and len(gt_box_list) == len(gt_text_box_list):
+                    box_ious = self._compute_ordered_box_ious(pred_box_list, gt_box_list)
+                    valid_positions = torch.nonzero(shift_labels[sample_idx].ne(-100), as_tuple=False).squeeze(-1)
+                    for box_idx, (_, char_start, char_end) in enumerate(gt_box_matches):
+                        token_span = self._text_char_span_to_token_span(
+                            tokenizer,
+                            gt_text,
+                            char_start,
+                            char_end,
+                        )
+                        if token_span is None:
+                            continue
+                        token_start, token_end = token_span
+                        if token_start >= token_end or token_start >= valid_positions.numel():
+                            continue
+                        token_end = min(token_end, int(valid_positions.numel()))
+                        if token_start >= token_end:
+                            continue
+                        seq_positions = valid_positions[token_start:token_end]
+                        if seq_positions.numel() == 0:
+                            continue
+                        box_weight = self._clamp_dynamic_weight(
+                            1.0 - alpha * math.log(box_ious[box_idx] + eps)
+                        )
+                        box_mask = torch.zeros_like(sample_codes, dtype=torch.bool)
+                        box_mask[seq_positions] = True
+                        box_mask = box_mask & sample_codes.eq(LABEL_WEIGHT_CODE_SCANNET_DET_BBOX)
+                        dynamic_weights[sample_idx] = torch.where(
+                            box_mask,
+                            dynamic_weights[sample_idx].new_tensor(box_weight).detach(),
+                            dynamic_weights[sample_idx],
+                        )
+
+        return dynamic_weights
+
+    def _recompute_dynamic_iou_loss(
+        self,
+        model: torch.nn.Module,
+        inputs: Dict[str, Any],
+        outputs: Any,
+        fallback_loss: torch.Tensor,
+    ) -> torch.Tensor:
+        labels = inputs.get("labels")
+        label_weight_codes = inputs.get("label_weight_codes")
+        logits = self._get_output_field(outputs, "logits")
+        if labels is None or label_weight_codes is None or logits is None:
+            return fallback_loss
+
+        alpha, _ = self._get_dynamic_iou_params(model)
+        if alpha <= 0.0:
+            return fallback_loss
+
+        shift_logits = logits[..., :-1, :].contiguous().float()
+        shift_labels = labels[..., 1:].contiguous().to(shift_logits.device)
+        shift_label_weight_codes = label_weight_codes[..., 1:].contiguous().to(shift_logits.device)
+
+        has_dynamic_codes = bool(
+            (shift_label_weight_codes == LABEL_WEIGHT_CODE_SCANREFER_BBOX).any()
+            or (shift_label_weight_codes == LABEL_WEIGHT_CODE_SCANNET_DET_BBOX).any()
+        )
+        if not has_dynamic_codes:
+            return fallback_loss
+
+        weight_table = get_label_weight_value_table(
+            self._unwrap_model(model).config,
+            device=shift_logits.device,
+            dtype=shift_logits.dtype,
+        )
+        token_weights = weight_table[shift_label_weight_codes.long()]
+        valid_mask = shift_labels.ne(-100)
+        token_weights = torch.where(
+            valid_mask,
+            token_weights,
+            torch.zeros_like(token_weights),
+        )
+        token_weights = self._build_dynamic_iou_token_weights(
+            model,
+            inputs,
+            shift_logits,
+            shift_labels,
+            shift_label_weight_codes,
+            token_weights,
+        )
+
+        flat_logits = shift_logits.view(-1, shift_logits.size(-1))
+        flat_labels = shift_labels.view(-1)
+        flat_weights = token_weights.view(-1)
+        token_loss = torch.nn.functional.cross_entropy(flat_logits, flat_labels, reduction="none")
+        weight_sum = flat_weights.sum()
+        if float(weight_sum.item()) > 0.0:
+            loss_ce = (token_loss * flat_weights).sum() / weight_sum
+        elif bool(valid_mask.any()):
+            loss_ce = token_loss[flat_labels.ne(-100)].mean()
+        else:
+            loss_ce = token_loss.new_zeros(())
+
+        total_loss = loss_ce
+        base_model = self._unwrap_model(model)
+        aux_specs = (
+            ("loss_shared", "fusion_lambda_align"),
+            ("loss_ortho", "fusion_lambda_ortho"),
+            ("loss_recon", "fusion_lambda_recon"),
+            ("loss_nrsr_kl", "fusion_lambda_nrsr"),
+        )
+        for loss_name, lambda_attr in aux_specs:
+            aux_loss = self._get_output_field(outputs, loss_name)
+            if aux_loss is None:
+                continue
+            total_loss = total_loss + float(getattr(base_model, lambda_attr, 1.0)) * aux_loss.to(
+                total_loss.device,
+                total_loss.dtype,
+            )
+        return total_loss
+
     def _training_progress(self) -> float:
         max_steps = int(getattr(self.state, "max_steps", 0) or 0)
         if max_steps > 0:
@@ -539,9 +888,9 @@ class VGTrainer(Trainer):
         if fusion_method == "adver_ortho":
             progress = self._training_progress()
             if progress < self.ADVER_ORTHO_STAGE1_END:
-                stage_factor = 1.0 if loss_name in {"loss_shared", "loss_recon"} else 0.0
+                stage_factor = 0.0
             elif progress < self.ADVER_ORTHO_STAGE2_END:
-                stage_factor = 1.0
+                stage_factor = 1.0 if loss_name == "loss_ortho" else 0.0
             else:
                 stage_factor = 0.0
             if stage_factor <= 0.0:
@@ -963,6 +1312,8 @@ class VGTrainer(Trainer):
         else:
             loss, outputs = loss_outputs, None
 
+        if outputs is not None and loss is not None:
+            loss = self._recompute_dynamic_iou_loss(model, inputs, outputs, loss)
         loss = self._apply_nrsr_ratio_constraint(model, loss, outputs)
         self._update_aux_monitor_logs(model, loss, outputs)
 

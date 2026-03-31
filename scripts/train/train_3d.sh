@@ -6,7 +6,7 @@
 # ======================
 MASTER_ADDR="127.0.0.1"                     # [Required] Master node IP for multi-GPU training
 MASTER_PORT=$(shuf -i 20000-29999 -n 1)     # Random port to avoid conflicts
-NUM_GPUS="${NUM_GPUS:-4}"                    # Set e.g. "4" to use 4 GPUs; leave empty to use all local GPUs
+NUM_GPUS="${NUM_GPUS:-8}"                    # Set e.g. "4" to use 4 GPUs; leave empty to use all local GPUs
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../utils/select_available_gpus.sh"
 
@@ -31,12 +31,13 @@ TUNE_MM_VISION=False
 TUNE_MM_VISION_LORA=False
 TUNE_GEOMETRY_ENCODER=False
 TUNE_GEOMETRY_ENCODER_LORA=False
-FEATURE_FUSION_METHOD="adver"      # choices: add/concat/cross_attention/gated/weighted/adver/adver_ortho/decompose_add/decompose_concat/nrsr_add/nrsr_concat/knn_concat
+FEATURE_FUSION_METHOD="adver_ortho"      # choices: add/concat/cross_attention/gated/weighted/adver/adver_ortho/decompose_add/decompose_concat/nrsr_add/nrsr_concat/knn_concat
 FUSION_NUM_LAYERS=2                    # 没用Number of Transformer-style CA blocks for cross_attention/knn_concat
 FUSION_KNN_K=5                         # 没用Number of nearest neighbors from other frames for knn_concat; self token is added automatically
 FUSION_KNN_MIN_VALID_RATIO=0.5         #  没用Minimum confidence mass ratio in the center patch window before a patch/token is marked valid
 FUSION_KNN_POS_MLP_HIDDEN_SIZE=3096     # 没用Hidden width of the relative-position MLP for knn_concat
 FUSION_RECON_MASK_RATIO=0.3              # Patch/token mask ratio for masked reconstruction in adver mode
+ADVER_COMPUTE_ALIGN_LOSS=False           # Whether to compute loss_align in adver/adver_ortho; keep False to skip the extra branch during training
 FUSION_ALIGN_MODE="infonce"               # choices: cosine/infonce
 FUSION_ORTHO_MODE="hsic"                 # choices: cosine/hsic/mine; only used by decompose_* methods
 FUSION_LAMBDA_ALIGN=0                 # Initial lambda for shared alignment loss in decompose_* methods
@@ -46,7 +47,7 @@ FUSION_LAMBDA_ORTHO=0                 # Initial lambda for orthogonality loss
 FUSION_ORTHO_TARGET_RATIO=0          # Late-stage target loss_ortho_weighted / loss_ce ratio
 FUSION_ORTHO_LAMBDA_MAX=5.0             # Cap for dynamic orthogonality lambda
 FUSION_LAMBDA_RECON=0                  # Initial lambda for reconstruction loss in decompose_* methods
-FUSION_RECON_TARGET_RATIO=0.04          # Late-stage target loss_recon_weighted / loss_ce ratio
+FUSION_RECON_TARGET_RATIO=0          # Late-stage target loss_recon_weighted / loss_ce ratio
 FUSION_RECON_LAMBDA_MAX=5.0              # Cap for dynamic reconstruction lambda
 FUSION_LAMBDA_NRSR=1.0                  # 没用
 FUSION_LAMBDA_NRSR_DYNAMIC=True        # 没用
@@ -55,10 +56,23 @@ FUSION_LAMBDA_NRSR_STAGE3_RATIO=0.1    # 没用
 FUSION_LAMBDA_WARMUP=True               
 FUSION_LAMBDA_WARMUP_STEPS=500           
 FUSION_MINE_Q_WARMUP_STEPS=500            # q_net-only warmup updates per epoch when FUSION_ORTHO_MODE=mine
-USE_LEARNABLE_PREFIX=false
-LEARNABLE_PREFIX_LEN=0
+USE_LABEL_WEIGHT_MASKS=true
+# Run scripts/utils/build_label_weight_masks.py beforehand to populate this sidecar directory.
+LABEL_WEIGHT_MASKS_DIR="data/train/label_weight_masks"
+LABEL_WEIGHT_DEFAULT=1.0
+LABEL_WEIGHT_SCANREFER_FRAME=3.0
+LABEL_WEIGHT_SCANREFER_BBOX=3.0
+LABEL_WEIGHT_SCAN2CAP_CATEGORY=2
+LABEL_WEIGHT_SCAN2CAP_ATTRIBUTE=2
+LABEL_WEIGHT_SCAN2CAP_RELATION=2
+LABEL_WEIGHT_SCANNET_DET_LABEL=3
+LABEL_WEIGHT_SCANNET_DET_BBOX=3
+LABEL_WEIGHT_DYNAMIC_IOU_ALPHA=1.0
+LABEL_WEIGHT_DYNAMIC_IOU_EPS=1e-6
+USE_LEARNABLE_PREFIX=true
+LEARNABLE_PREFIX_LEN=10
 TEXT_GATE_BERT_NAME_OR_PATH="/data7t-root/huggingface/hub/bert"
-OUTPUT_DIR="7b-adver-gate"                   # Directory for saving checkpoints
+OUTPUT_DIR="7b-adver-span-prefix"                   # Directory for saving checkpoints
 CACHE_DIR="./cache"                        # [TrainingArguments] Cache directory for models
 mkdir -p $OUTPUT_DIR
 
@@ -81,6 +95,30 @@ fi
 echo "Using CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 echo "Using NPROC_PER_NODE=$NPROC_PER_NODE"
 
+LABEL_WEIGHT_ARGS=()
+USE_LABEL_WEIGHT_MASKS_NORMALIZED="${USE_LABEL_WEIGHT_MASKS,,}"
+if [ "$USE_LABEL_WEIGHT_MASKS_NORMALIZED" = "true" ]; then
+    LABEL_WEIGHT_ARGS=(
+        --label_weight_masks_dir "$LABEL_WEIGHT_MASKS_DIR"
+        --label_weight_default "$LABEL_WEIGHT_DEFAULT"
+        --label_weight_scanrefer_frame "$LABEL_WEIGHT_SCANREFER_FRAME"
+        --label_weight_scanrefer_bbox "$LABEL_WEIGHT_SCANREFER_BBOX"
+        --label_weight_scan2cap_category "$LABEL_WEIGHT_SCAN2CAP_CATEGORY"
+        --label_weight_scan2cap_attribute "$LABEL_WEIGHT_SCAN2CAP_ATTRIBUTE"
+        --label_weight_scan2cap_relation "$LABEL_WEIGHT_SCAN2CAP_RELATION"
+        --label_weight_scannet_det_label "$LABEL_WEIGHT_SCANNET_DET_LABEL"
+        --label_weight_scannet_det_bbox "$LABEL_WEIGHT_SCANNET_DET_BBOX"
+        --label_weight_dynamic_iou_alpha "$LABEL_WEIGHT_DYNAMIC_IOU_ALPHA"
+        --label_weight_dynamic_iou_eps "$LABEL_WEIGHT_DYNAMIC_IOU_EPS"
+    )
+    echo "Label weighting is enabled. Loading masks from $LABEL_WEIGHT_MASKS_DIR"
+    if [ ! -d "$LABEL_WEIGHT_MASKS_DIR" ]; then
+        echo "Warning: label weight masks directory does not exist: $LABEL_WEIGHT_MASKS_DIR"
+    fi
+else
+    echo "Label weighting is disabled."
+fi
+
 torchrun --nproc_per_node=$NPROC_PER_NODE \
             --master_addr=$MASTER_ADDR \
             --master_port=$MASTER_PORT \
@@ -91,6 +129,7 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --tune_mm_vision_lora $TUNE_MM_VISION_LORA \
             --tune_mm_mlp False \
             --dataset_use $DATASETS \
+            "${LABEL_WEIGHT_ARGS[@]}" \
             --output_dir $OUTPUT_DIR \
             --cache_dir $CACHE_DIR \
             --bf16 \
@@ -133,6 +172,7 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --fusion_knn_min_valid_ratio $FUSION_KNN_MIN_VALID_RATIO \
             --fusion_knn_pos_mlp_hidden_size $FUSION_KNN_POS_MLP_HIDDEN_SIZE \
             --fusion_recon_mask_ratio $FUSION_RECON_MASK_RATIO \
+            --adver_compute_align_loss $ADVER_COMPUTE_ALIGN_LOSS \
             --fusion_align_mode $FUSION_ALIGN_MODE \
             --fusion_ortho_mode $FUSION_ORTHO_MODE \
             --fusion_lambda_align $FUSION_LAMBDA_ALIGN \

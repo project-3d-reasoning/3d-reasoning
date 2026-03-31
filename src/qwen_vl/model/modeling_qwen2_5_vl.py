@@ -55,6 +55,7 @@ from .vggt.models.vggt import VGGT
 from .geometry_encoders import create_geometry_encoder, GeometryEncoderConfig
 from .feature_fusion import FeatureFusionModule, FeatureFusionConfig, GeometryFeatureMerger
 from .loss import normalize_pointcloud, check_and_fix_inf_nan
+from qwen_vl.label_weighting import get_label_weight_value_table
 
 
 if is_flash_attn_2_available():
@@ -1642,7 +1643,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 self.learnable_prefix_embeddings.zero_()
         if (
             getattr(config, "use_geometry_encoder", False)
-            and str(getattr(config, "feature_fusion_method", "add")).lower() in {"adver", "adver_ortho"}
+            and str(getattr(config, "feature_fusion_method", "add")).lower() == "adver"
             and getattr(config, "text_gate_bert_name_or_path", None)
         ):
             self._init_text_gate_bert(config)
@@ -1691,6 +1692,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             decompose_hidden_size=getattr(config, "decompose_hidden_size", None),
             nrsr_hidden_size=getattr(config, "nrsr_hidden_size", None),
             recon_mask_ratio=getattr(config, "fusion_recon_mask_ratio", 0.3),
+            adver_compute_align_loss=bool(getattr(config, "adver_compute_align_loss", False)),
             align_mode=getattr(config, "fusion_align_mode", "cosine"),
             align_temperature=getattr(config, "fusion_align_temperature", 0.07),
             ortho_mode=getattr(config, "fusion_ortho_mode", "cosine"),
@@ -2673,6 +2675,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         geometry_encoder_inputs: Optional[List[torch.Tensor]] = None,
         bert_question_input_ids: Optional[torch.LongTensor] = None,
         bert_question_attention_mask: Optional[torch.Tensor] = None,
+        label_weight_codes: Optional[torch.Tensor] = None,
         boxes: Optional[List[torch.Tensor]] = None,
         tag: str = None,
         **kwargs,
@@ -2734,7 +2737,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 if getattr(self.config, 'use_geometry_encoder', False) and geometry_encoder_inputs is not None:
                     fusion_method = str(getattr(self.config, "feature_fusion_method", "add")).lower()
                     question_summaries = None
-                    if fusion_method in {"adver", "adver_ortho"}:
+                    if fusion_method == "adver":
                         question_summaries = self._encode_text_gate_questions(
                             bert_question_input_ids=bert_question_input_ids,
                             bert_question_attention_mask=bert_question_attention_mask,
@@ -2748,10 +2751,22 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                                 attention_mask,
                                 labels,
                             )
-                    need_fusion_aux_losses = (
-                        labels is not None
-                        and fusion_method in {"adver", "adver_ortho", "decompose_add", "decompose_concat", "nrsr_add", "nrsr_concat"}
-                    )
+                    need_fusion_aux_losses = False
+                    if labels is not None:
+                        if fusion_method == "adver":
+                            need_fusion_aux_losses = (
+                                float(getattr(self, "fusion_lambda_align", 1.0)) > 0.0
+                                or float(getattr(self, "fusion_lambda_recon", 1.0)) > 0.0
+                            )
+                        elif fusion_method == "adver_ortho":
+                            need_fusion_aux_losses = float(getattr(self, "fusion_lambda_ortho", 1.0)) > 0.0
+                        else:
+                            need_fusion_aux_losses = fusion_method in {
+                                "decompose_add",
+                                "decompose_concat",
+                                "nrsr_add",
+                                "nrsr_concat",
+                            }
                     need_dynamic_visual_prefix = (
                         self.use_learnable_prefix
                         and self.learnable_prefix_len > 0
@@ -2947,13 +2962,40 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
+            shift_label_weight_codes = None
+            if label_weight_codes is not None:
+                shift_label_weight_codes = label_weight_codes[..., 1:].contiguous()
             # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
             shift_logits = shift_logits.view(-1, self.config.vocab_size)
             shift_labels = shift_labels.view(-1)
             # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
+            if shift_label_weight_codes is not None:
+                shift_label_weight_codes = shift_label_weight_codes.view(-1).to(shift_logits.device)
+                weight_table = get_label_weight_value_table(
+                    self.config,
+                    device=shift_logits.device,
+                    dtype=shift_logits.dtype,
+                )
+                token_weights = weight_table[shift_label_weight_codes.long()]
+                valid_mask = shift_labels.ne(-100)
+                token_weights = torch.where(
+                    valid_mask,
+                    token_weights,
+                    torch.zeros_like(token_weights),
+                )
+                loss_fct = CrossEntropyLoss(reduction="none")
+                token_loss = loss_fct(shift_logits, shift_labels)
+                weight_sum = token_weights.sum()
+                if float(weight_sum.item()) > 0.0:
+                    loss = (token_loss * token_weights).sum() / weight_sum
+                elif bool(valid_mask.any()):
+                    loss = token_loss[valid_mask].mean()
+                else:
+                    loss = token_loss.new_zeros(())
+            else:
+                loss_fct = CrossEntropyLoss()
+                loss = loss_fct(shift_logits, shift_labels)
             if fusion_aux_losses is not None:
                 loss_shared_raw = fusion_aux_losses.get("loss_shared")
                 if loss_shared_raw is not None:

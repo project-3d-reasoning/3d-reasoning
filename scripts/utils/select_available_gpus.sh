@@ -5,6 +5,7 @@
 # Priority:
 # 1) GPUs that satisfy idle thresholds:
 #    - utilization.gpu <= GPU_MAX_UTIL (default 20%)
+#    - memory.used <= GPU_MAX_USED_MB (default 1024 MiB)
 # 2) If idle GPUs are insufficient:
 #    - default: fail fast
 #    - if GPU_ALLOW_BACKFILL=1: fill remaining slots with GPUs that have the
@@ -19,6 +20,7 @@
 select_available_gpus() {
     local requested="$1"
     local max_util="${GPU_MAX_UTIL:-20}"
+    local max_used_mb="${GPU_MAX_USED_MB:-1024}"
     local allow_backfill="${GPU_ALLOW_BACKFILL:-0}"
 
     if ! command -v nvidia-smi >/dev/null 2>&1; then
@@ -34,7 +36,7 @@ select_available_gpus() {
     # Respect manually specified CUDA_VISIBLE_DEVICES.
     if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
         SELECTED_GPU_COUNT=$(echo "$CUDA_VISIBLE_DEVICES" | awk -F',' '{print NF}')
-        echo "[GPU-SELECT] Using preset CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES" >&2
+        echo "[GPU-SELECT] Using preset CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES (skipping idle checks)." >&2
         export SELECTED_GPU_COUNT
         return 0
     fi
@@ -47,7 +49,7 @@ select_available_gpus() {
     fi
 
     local idle_candidates
-    idle_candidates=$(echo "$gpu_stats" | awk -F',' -v max_util="$max_util" '
+    idle_candidates=$(echo "$gpu_stats" | awk -F',' -v max_util="$max_util" -v max_used_mb="$max_used_mb" '
         {
             gsub(/ /, "", $1); gsub(/ /, "", $2); gsub(/ /, "", $3); gsub(/ /, "", $4);
             # Force numeric comparison so values are never compared lexically.
@@ -55,7 +57,7 @@ select_available_gpus() {
             # Force numeric comparison. Some drivers may report N/A; in awk, (value + 0)
             # safely coerces non-numeric strings to 0 instead of doing lexicographic compare.
             used_num=(used + 0); free_num=(free + 0); util_num=(util + 0);
-            if (util_num <= max_util) {
+            if (util_num <= max_util && used_num <= max_used_mb) {
                 print idx "," used_num "," free_num "," util_num;
             }
         }
@@ -94,7 +96,7 @@ select_available_gpus() {
     fi
 
     if [ "${#selected[@]}" -lt "$requested" ]; then
-        echo "[GPU-SELECT] Requested $requested idle GPUs, but only ${#selected[@]} matched thresholds (util<=${max_util}%)." >&2
+        echo "[GPU-SELECT] Requested $requested idle GPUs, but only ${#selected[@]} matched thresholds (util<=${max_util}%, used<=${max_used_mb} MiB)." >&2
         echo "[GPU-SELECT] Raw stats: $gpu_stats" >&2
         if [ "$allow_backfill" != "1" ]; then
             echo "[GPU-SELECT] Set GPU_ALLOW_BACKFILL=1 to allow non-idle fallback by free memory." >&2

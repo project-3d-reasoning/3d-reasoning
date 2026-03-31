@@ -1,8 +1,6 @@
-import base64
-from io import BytesIO
-from typing import List, Optional, Tuple, Union
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
-import copy
 import decord
 import numpy as np
 import torch
@@ -21,17 +19,9 @@ from lmms_eval import utils
 from lmms_eval.api.instance import Instance
 from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model
-from lmms_eval.models.model_utils.load_video import read_video_pyav_base64
 
 from qwen_vl.model.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGenerationWithVGGT
 from qwen_vl.data.utils import load_and_preprocess_images
-
-try:
-    # from qwen_vl_utils import process_vision_info
-    from qwen_vl_utils import extract_vision_info
-except ImportError:
-    eval_logger.warning("Failed to import qwen_vl_utils; Please install it via `pip install qwen-vl-utils`")
-
 
 @register_model("vgllm")
 class VGLLM(lmms):
@@ -290,6 +280,105 @@ class VGLLM(lmms):
                 new_list.append(j)
         return new_list
 
+    def _prepare_image_tensor(self, image: Image.Image) -> Tuple[torch.Tensor, torch.Tensor]:
+        image_tensor = load_and_preprocess_images([image])[0]
+        geometry_tensor = image_tensor
+
+        patch_size = self.processor.image_processor.patch_size
+        merge_size = self.processor.image_processor.merge_size
+        _, height, width = image_tensor.shape
+        if (width // patch_size) % merge_size > 0:
+            width = width - (width // patch_size) % merge_size * patch_size
+        if (height // patch_size) % merge_size > 0:
+            height = height - (height // patch_size) % merge_size * patch_size
+        processor_tensor = image_tensor[:, :height, :width]
+        return processor_tensor, geometry_tensor
+
+    def _prepare_message_inputs(self, context: str, visual) -> Tuple[List[Dict[str, object]], List[torch.Tensor], List[torch.Tensor]]:
+        message = [{"role": "system", "content": "You are a helpful assistant."}]
+        sample_image_inputs = []
+        sample_geometry_inputs = []
+
+        if isinstance(visual, str) and visual.endswith((".mp4", ".avi", ".mov")):
+            vr = decord.VideoReader(visual)
+            image_num = len(vr)
+            if image_num < self.max_num_frames:
+                frame_indices = np.arange(image_num)
+            else:
+                frame_indices = np.linspace(0, image_num - 1, self.max_num_frames).astype(int)
+            visual_content = []
+            for frame_idx in frame_indices:
+                image = Image.fromarray(vr[frame_idx].asnumpy()).convert("RGB")
+                visual_content.append({"type": "image", "image": image})
+                processor_tensor, geometry_tensor = self._prepare_image_tensor(image)
+                sample_image_inputs.append(processor_tensor)
+                sample_geometry_inputs.append(geometry_tensor)
+            message.append({"role": "user", "content": visual_content + [{"type": "text", "text": context}]})
+            return message, sample_image_inputs, sample_geometry_inputs
+
+        if isinstance(visual, Image.Image):
+            processor_tensor, geometry_tensor = self._prepare_image_tensor(visual)
+            sample_image_inputs.append(processor_tensor)
+            sample_geometry_inputs.append(geometry_tensor)
+            message.append({"role": "user", "content": [{"type": "image", "image": visual}, {"type": "text", "text": context}]})
+            return message, sample_image_inputs, sample_geometry_inputs
+
+        if isinstance(visual, (list, tuple)) and all(isinstance(v, Image.Image) for v in visual):
+            image_content = []
+            for image_count, image in enumerate(visual):
+                if self.add_frame_index:
+                    image_content.append({"type": "text", "text": "Frame-{}: ".format(image_count)})
+                image_content.append({"type": "image", "image": image})
+                processor_tensor, geometry_tensor = self._prepare_image_tensor(image)
+                sample_image_inputs.append(processor_tensor)
+                sample_geometry_inputs.append(geometry_tensor)
+            message.append({"role": "user", "content": image_content + [{"type": "text", "text": context}]})
+            return message, sample_image_inputs, sample_geometry_inputs
+
+        message.append({"role": "user", "content": [{"type": "text", "text": context}]})
+        return message, sample_image_inputs, sample_geometry_inputs
+
+    def _prepare_generation_chunk(self, chunk) -> Dict[str, object]:
+        contexts, all_gen_kwargs, doc_to_visual, doc_id, task, split = zip(*chunk)
+        task_name = task[0]
+        split_name = split[0]
+        visuals = [doc_to_visual[0](self.task_dict[task_name][split_name][ids]) for ids in doc_id]
+        visuals = self.flatten(visuals)
+
+        messages = []
+        image_inputs = []
+        geometry_encoder_inputs = []
+        for visual_idx, context in enumerate(contexts):
+            visual = visuals[visual_idx] if visual_idx < len(visuals) else None
+            message, sample_image_inputs, sample_geometry_inputs = self._prepare_message_inputs(context, visual)
+            messages.append(message)
+            image_inputs.extend(sample_image_inputs)
+            if sample_geometry_inputs:
+                geometry_encoder_inputs.append(torch.stack(sample_geometry_inputs))
+
+        return {
+            "contexts": list(contexts),
+            "messages": messages,
+            "image_inputs": image_inputs,
+            "geometry_encoder_inputs": geometry_encoder_inputs,
+            "gen_kwargs": dict(all_gen_kwargs[0]),
+        }
+
+    def _prefetch_generation_chunks(self, chunks: Iterable) -> Iterator[Dict[str, object]]:
+        chunk_iter = iter(chunks)
+        try:
+            current_chunk = next(chunk_iter)
+        except StopIteration:
+            return
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(self._prepare_generation_chunk, current_chunk)
+            for next_chunk in chunk_iter:
+                prepared_chunk = future.result()
+                future = executor.submit(self._prepare_generation_chunk, next_chunk)
+                yield prepared_chunk
+            yield future.result()
+
     def generate_until(self, requests: List[Instance]) -> List[str]:
         res = []
 
@@ -309,14 +398,12 @@ class VGLLM(lmms):
         # in the same batch.
         re_ords = utils.Collator([reg.args for reg in requests], _collate, grouping=True)
         chunks = re_ords.get_batched(n=self.batch_size, batch_fn=None)
-        for chunk in chunks:
-            contexts, all_gen_kwargs, doc_to_visual, doc_id, task, split = zip(*chunk)
-            task = task[0]
-            split = split[0]
-            visuals = [doc_to_visual[0](self.task_dict[task][split][ids]) for ids in doc_id]
-            visuals = self.flatten(visuals)
-
-            gen_kwargs = all_gen_kwargs[0]
+        for prepared_chunk in self._prefetch_generation_chunks(chunks):
+            contexts = prepared_chunk["contexts"]
+            messages = prepared_chunk["messages"]
+            image_inputs = prepared_chunk["image_inputs"]
+            geometry_encoder_inputs = prepared_chunk["geometry_encoder_inputs"]
+            gen_kwargs = prepared_chunk["gen_kwargs"]
 
             # Set default values for until and max_new_tokens
             until = [self.tokenizer.decode(self.eot_token_id)]
@@ -329,101 +416,10 @@ class VGLLM(lmms):
                 elif not isinstance(until, list):
                     raise ValueError(f"Expected `gen_kwargs['until']` to be of type Union[str,list] but got {type(until)}")
 
-            messages = []
-            processed_visuals = []
-            for i, context in enumerate(contexts):
-
-                message = [{"role": "system", "content": "You are a helpful assistant."}]
-
-                if len(visuals) > 0:
-                    visual = visuals[i] if i < len(visuals) else None
-                    if isinstance(visual, str) and visual.endswith((".mp4", ".avi", ".mov")):  # Video file
-                        vr = decord.VideoReader(visual)
-                        image_num = len(vr)
-                        # sample max_num_frames frame indices from the video
-                        if image_num < self.max_num_frames:
-                            frame_indices = np.arange(image_num)
-                        else:
-                            frame_indices = np.linspace(0, image_num - 1, self.max_num_frames).astype(int)
-                        # read the frames
-                        frames = [vr[i].asnumpy() for i in frame_indices]
-                        visual_content = []
-                        for frame in frames:
-                            image = Image.fromarray(frame).convert("RGB")
-                            visual_content.append({"type": "image", "image": image})
-                        message.append({"role": "user", "content": visual_content + [{"type": "text", "text": context}]})
-
-                    elif isinstance(visual, Image.Image):  # Single image
-                        base64_image = visual.convert("RGB")
-                        buffer = BytesIO()
-                        base64_image.save(buffer, format="JPEG")
-                        base64_bytes = base64.b64encode(buffer.getvalue())
-                        base64_string = base64_bytes.decode("utf-8")
-                        message.append({"role": "user", "content": [{"type": "image", "image": f"data:image/jpeg;base64,{base64_string}"}, {"type": "text", "text": context}]})
-                    elif isinstance(visual, (list, tuple)) and all(isinstance(v, Image.Image) for v in visual):  # Multiple images
-                        image_content = []
-                        image_count = 0
-                        for v in visual:
-                            base64_image = v.convert("RGB")
-                            buffer = BytesIO()
-                            base64_image.save(buffer, format="JPEG")
-                            base64_bytes = base64.b64encode(buffer.getvalue())
-                            base64_string = base64_bytes.decode("utf-8")
-                            if self.add_frame_index:
-                                image_content.append({"type": "text", "text": "Frame-{}: ".format(image_count)})    
-                            image_content.append({"type": "image", "image": f"data:image/jpeg;base64,{base64_string}"})
-                            image_count += 1
-                        message.append({"role": "user", "content": image_content + [{"type": "text", "text": context}]})
-                    else:
-                        message.append({"role": "user", "content": [{"type": "text", "text": context}]})
-                else:
-                    message.append({"role": "user", "content": [{"type": "text", "text": context}]})
-
-                messages.append(message)
-
             text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            # image_inputs, video_inputs = process_vision_info(messages)
-
-            geometry_encoder_inputs = []
-            image_inputs = []
-            patch_size = self.processor.image_processor.patch_size
-            merge_size = self.processor.image_processor.merge_size
-            for message in messages:
-                vision_info = extract_vision_info(message)
-                cur_geometry_encoder_inputs = []
-                for ele in vision_info:
-                    if "image" in ele:
-                        image = ele["image"]
-                        if isinstance(image, Image.Image):
-                            pass
-                        elif isinstance(image, str) and "base64," in image:
-                            _, base64_data = image.split("base64,", 1)
-                            data = base64.b64decode(base64_data)
-                            # fix memory leak issue while using BytesIO
-                            with BytesIO(data) as bio:
-                                image = copy.deepcopy(Image.open(bio))
-                        else:
-                            raise NotImplementedError("Unsupported image type")
-
-                    else:
-                        raise NotImplementedError("Unsupported vision info type")
-
-                    assert isinstance(image, Image.Image), f"Unsupported image type: {type(image)}"
-                    image = load_and_preprocess_images([image])[0]
-                    cur_geometry_encoder_inputs.append(copy.deepcopy(image))
-                    _, height, width = image.shape
-                    # merge_size = 2
-                    if (width // patch_size) % merge_size > 0:
-                        width = width - (width // patch_size) % merge_size * patch_size
-                    if (height // patch_size) % merge_size > 0:
-                        height = height - (height // patch_size) % merge_size * patch_size
-                    image = image[:, :height, :width]
-                    image_inputs.append(image)
-
-                geometry_encoder_inputs.append(torch.stack(cur_geometry_encoder_inputs))
             inputs = self.processor(
                 text=text,
-                images=image_inputs,
+                images=image_inputs if image_inputs else None,
                 videos=None,
                 padding=True,
                 return_tensors="pt",
