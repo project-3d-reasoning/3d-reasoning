@@ -405,7 +405,6 @@ class VGTrainer(Trainer):
     """Trainer with optional extra q_theta updates for vCLUB in ortho mine mode."""
     NRSR_STAGE1_END = 0.1
     NRSR_STAGE2_END = 0.5
-    LABEL_WEIGHT_MASK_ENABLE_START = 2.0 / 3.0
     ADVER_DISABLE_START = 2.0 / 3.0
     ADVER_ORTHO_STAGE1_END = 1.0 / 3.0
     ADVER_ORTHO_STAGE2_END = 2.0 / 3.0
@@ -735,8 +734,12 @@ class VGTrainer(Trainer):
         outputs: Any,
         fallback_loss: torch.Tensor,
     ) -> torch.Tensor:
-        labels = inputs.get("labels")
-        label_weight_codes = inputs.get("label_weight_codes")
+        labels = self._get_output_field(outputs, "aligned_labels")
+        if labels is None:
+            labels = inputs.get("labels")
+        label_weight_codes = self._get_output_field(outputs, "aligned_label_weight_codes")
+        if label_weight_codes is None:
+            label_weight_codes = inputs.get("label_weight_codes")
         logits = self._get_output_field(outputs, "logits")
         if labels is None or label_weight_codes is None or logits is None:
             return fallback_loss
@@ -823,10 +826,6 @@ class VGTrainer(Trainer):
         return 0.0
 
     def _get_label_weight_mask_factor(self) -> float:
-        # Delay token reweighting until the last training third so the base CE can stabilize first.
-        progress = self._training_progress()
-        if progress < self.LABEL_WEIGHT_MASK_ENABLE_START:
-            return 0.0
         return 1.0
 
     def _maybe_get_float_arg(self, name: str) -> Optional[float]:

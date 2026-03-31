@@ -40,7 +40,7 @@ accelerate launch --num_processes="$NUM_PROCESSES" --main_process_port 29501 -m 
     --model vgllm \
     --model_args "$model_args_str" \
     --tasks ${benchmark} \
-    --batch_size 4 \
+    --batch_size 1 \
     --log_samples_suffix original \
     --log_samples \
     --output_path $output_path

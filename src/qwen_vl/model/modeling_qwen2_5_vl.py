@@ -55,7 +55,7 @@ from .vggt.models.vggt import VGGT
 from .geometry_encoders import create_geometry_encoder, GeometryEncoderConfig
 from .feature_fusion import FeatureFusionModule, FeatureFusionConfig, GeometryFeatureMerger
 from .loss import normalize_pointcloud, check_and_fix_inf_nan
-from qwen_vl.label_weighting import get_label_weight_value_table
+from qwen_vl.label_weighting import LABEL_WEIGHT_CODE_IGNORE, get_label_weight_value_table
 
 
 if is_flash_attn_2_available():
@@ -1530,6 +1530,8 @@ class Qwen2_5_VLCausalLMOutputWithPast(ModelOutput):
     gate_shared_ratio: Optional[torch.FloatTensor] = None
     mine_unique_features: Optional[torch.FloatTensor] = None
     mine_2d_features: Optional[torch.FloatTensor] = None
+    aligned_labels: Optional[torch.LongTensor] = None
+    aligned_label_weight_codes: Optional[torch.Tensor] = None
 
 
 QWEN2_5_VL_INPUTS_DOCSTRING = r"""
@@ -2395,8 +2397,15 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         inputs_embeds: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
         labels: Optional[torch.Tensor],
+        label_weight_codes: Optional[torch.Tensor],
         prefix_embeddings: torch.Tensor,
-    ) -> Tuple[torch.LongTensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[
+        torch.LongTensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
         if attention_mask is not None and attention_mask.dim() == 1:
             raise ValueError("Visual-boundary prefix insertion does not support packed 1D attention masks.")
 
@@ -2416,6 +2425,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         new_embeds = []
         new_masks = []
         new_labels = [] if labels is not None else None
+        new_label_weight_codes = [] if label_weight_codes is not None else None
 
         for idx in range(batch_size):
             sample_input_ids = input_ids[idx]
@@ -2441,13 +2451,31 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 new_labels.append(
                     torch.cat([sample_labels[:insert_pos], prefix_labels, sample_labels[insert_pos:]], dim=0)
                 )
+            if label_weight_codes is not None:
+                sample_label_weight_codes = label_weight_codes[idx]
+                prefix_label_weight_codes = sample_label_weight_codes.new_full(
+                    (prefix_len,),
+                    LABEL_WEIGHT_CODE_IGNORE,
+                )
+                new_label_weight_codes.append(
+                    torch.cat(
+                        [
+                            sample_label_weight_codes[:insert_pos],
+                            prefix_label_weight_codes,
+                            sample_label_weight_codes[insert_pos:],
+                        ],
+                        dim=0,
+                    )
+                )
 
         input_ids = torch.stack(new_input_ids, dim=0)
         inputs_embeds = torch.stack(new_embeds, dim=0)
         attention_mask = torch.stack(new_masks, dim=0)
         if labels is not None:
             labels = torch.stack(new_labels, dim=0)
-        return input_ids, inputs_embeds, attention_mask, labels
+        if label_weight_codes is not None:
+            label_weight_codes = torch.stack(new_label_weight_codes, dim=0)
+        return input_ids, inputs_embeds, attention_mask, labels, label_weight_codes
 
     def _apply_dynamic_visual_prefix(
         self,
@@ -2455,13 +2483,21 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         inputs_embeds: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
         labels: Optional[torch.Tensor],
+        label_weight_codes: Optional[torch.Tensor],
         prefix_embeddings: torch.Tensor,
-    ) -> Tuple[torch.LongTensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[
+        torch.LongTensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
         return self._apply_prefix_embeddings_at_visual_boundary(
             input_ids,
             inputs_embeds,
             attention_mask,
             labels,
+            label_weight_codes,
             prefix_embeddings,
         )
 
@@ -2471,10 +2507,17 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         inputs_embeds: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
         labels: Optional[torch.Tensor],
-    ) -> Tuple[torch.LongTensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        label_weight_codes: Optional[torch.Tensor],
+    ) -> Tuple[
+        torch.LongTensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
         prefix_len = self.learnable_prefix_len
         if prefix_len <= 0 or self.learnable_prefix_embeddings is None:
-            return input_ids, inputs_embeds, attention_mask, labels
+            return input_ids, inputs_embeds, attention_mask, labels, label_weight_codes
 
         batch_size = inputs_embeds.size(0)
         prefix_embed = self.learnable_prefix_embeddings.to(
@@ -2487,6 +2530,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             inputs_embeds,
             attention_mask,
             labels,
+            label_weight_codes,
             prefix_embeddings,
         )
 
@@ -2495,11 +2539,18 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         inputs_embeds: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
         labels: Optional[torch.Tensor],
+        label_weight_codes: Optional[torch.Tensor],
         position_ids: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
         prefix_len = self.learnable_prefix_len
         if prefix_len <= 0 or self.learnable_prefix_embeddings is None:
-            return inputs_embeds, attention_mask, labels, position_ids
+            return inputs_embeds, attention_mask, labels, label_weight_codes, position_ids
 
         prefix_embed = self.learnable_prefix_embeddings.to(
             device=inputs_embeds.device,
@@ -2512,6 +2563,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             prefix_embed = prefix_embed.unsqueeze(0)  # (1, prefix_len, hidden)
             segments = []
             label_segments = [] if labels is not None else None
+            label_weight_code_segments = [] if label_weight_codes is not None else None
             pos_segments = [] if position_ids is not None else None
             lengths = []
             for idx in range(cu_seqlens.numel() - 1):
@@ -2524,6 +2576,15 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                     prefix_labels = labels.new_full((labels.shape[0], prefix_len), -100)
                     seg_labels = labels[:, start:end]
                     label_segments.append(torch.cat([prefix_labels, seg_labels], dim=1))
+                if label_weight_codes is not None:
+                    prefix_label_weight_codes = label_weight_codes.new_full(
+                        (label_weight_codes.shape[0], prefix_len),
+                        LABEL_WEIGHT_CODE_IGNORE,
+                    )
+                    seg_label_weight_codes = label_weight_codes[:, start:end]
+                    label_weight_code_segments.append(
+                        torch.cat([prefix_label_weight_codes, seg_label_weight_codes], dim=1)
+                    )
                 if position_ids is not None:
                     if position_ids.dim() == 3:
                         prefix_pos = (
@@ -2543,6 +2604,8 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             inputs_embeds = torch.cat(segments, dim=1)
             if labels is not None:
                 labels = torch.cat(label_segments, dim=1)
+            if label_weight_codes is not None:
+                label_weight_codes = torch.cat(label_weight_code_segments, dim=1)
             if position_ids is not None:
                 if position_ids.dim() == 3:
                     position_ids = torch.cat(pos_segments, dim=2)
@@ -2553,7 +2616,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             )
             new_cu_seqlens[1:] = torch.tensor(lengths, device=cu_seqlens.device, dtype=cu_seqlens.dtype).cumsum(0)
             attention_mask = new_cu_seqlens
-            return inputs_embeds, attention_mask, labels, position_ids
+            return inputs_embeds, attention_mask, labels, label_weight_codes, position_ids
 
         batch_size = inputs_embeds.size(0)
         prefix_embed = prefix_embed.unsqueeze(0).expand(batch_size, -1, -1)
@@ -2563,6 +2626,12 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             if labels is not None:
                 prefix_labels = labels.new_full((batch_size, prefix_len), -100)
                 labels = torch.cat([prefix_labels, labels], dim=1)
+            if label_weight_codes is not None:
+                prefix_label_weight_codes = label_weight_codes.new_full(
+                    (batch_size, prefix_len),
+                    LABEL_WEIGHT_CODE_IGNORE,
+                )
+                label_weight_codes = torch.cat([prefix_label_weight_codes, label_weight_codes], dim=1)
             if position_ids is not None:
                 if position_ids.dim() == 3:
                     prefix_pos = (
@@ -2576,7 +2645,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                         1, -1
                     )
                     position_ids = torch.cat([prefix_pos.expand(batch_size, -1), position_ids + prefix_len], dim=1)
-            return inputs_embeds, attention_mask, labels, position_ids
+            return inputs_embeds, attention_mask, labels, label_weight_codes, position_ids
 
         prefix_mask = attention_mask.new_ones(prefix_len)
         prefix_range = None
@@ -2588,6 +2657,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         new_embeds = []
         new_masks = []
         new_labels = [] if labels is not None else None
+        new_label_weight_codes = [] if label_weight_codes is not None else None
         new_positions = [] if position_ids is not None else None
 
         for idx in range(batch_size):
@@ -2606,6 +2676,19 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                     pad_labels = labels[idx, :valid_start]
                     valid_labels = labels[idx, valid_start:]
                     new_labels.append(torch.cat([pad_labels, prefix_labels, valid_labels], dim=0))
+                if label_weight_codes is not None:
+                    prefix_label_weight_codes = label_weight_codes.new_full(
+                        (prefix_len,),
+                        LABEL_WEIGHT_CODE_IGNORE,
+                    )
+                    pad_label_weight_codes = label_weight_codes[idx, :valid_start]
+                    valid_label_weight_codes = label_weight_codes[idx, valid_start:]
+                    new_label_weight_codes.append(
+                        torch.cat(
+                            [pad_label_weight_codes, prefix_label_weight_codes, valid_label_weight_codes],
+                            dim=0,
+                        )
+                    )
                 if position_ids is not None:
                     if position_ids.dim() == 3:
                         pos = position_ids[:, idx, :]
@@ -2628,6 +2711,19 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                     valid_labels = labels[idx, :valid_len]
                     pad_labels = labels[idx, valid_len:]
                     new_labels.append(torch.cat([prefix_labels, valid_labels, pad_labels], dim=0))
+                if label_weight_codes is not None:
+                    prefix_label_weight_codes = label_weight_codes.new_full(
+                        (prefix_len,),
+                        LABEL_WEIGHT_CODE_IGNORE,
+                    )
+                    valid_label_weight_codes = label_weight_codes[idx, :valid_len]
+                    pad_label_weight_codes = label_weight_codes[idx, valid_len:]
+                    new_label_weight_codes.append(
+                        torch.cat(
+                            [prefix_label_weight_codes, valid_label_weight_codes, pad_label_weight_codes],
+                            dim=0,
+                        )
+                    )
                 if position_ids is not None:
                     if position_ids.dim() == 3:
                         pos = position_ids[:, idx, :]
@@ -2644,12 +2740,14 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         attention_mask = torch.stack(new_masks, dim=0)
         if labels is not None:
             labels = torch.stack(new_labels, dim=0)
+        if label_weight_codes is not None:
+            label_weight_codes = torch.stack(new_label_weight_codes, dim=0)
         if position_ids is not None:
             if position_ids.dim() == 3:
                 position_ids = torch.stack(new_positions, dim=1)
             else:
                 position_ids = torch.stack(new_positions, dim=0)
-        return inputs_embeds, attention_mask, labels, position_ids
+        return inputs_embeds, attention_mask, labels, label_weight_codes, position_ids
 
     @add_start_docstrings_to_model_forward(QWEN2_5_VL_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=Qwen2_5_VLCausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
@@ -2840,11 +2938,12 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         if self._should_apply_dynamic_visual_prefix(dynamic_prefix_embeddings, past_key_values, cache_position):
             if input_ids is None:
                 raise ValueError("Dynamic visual prefix requires input_ids to compute insertion positions.")
-            input_ids, inputs_embeds, attention_mask, labels = self._apply_dynamic_visual_prefix(
+            input_ids, inputs_embeds, attention_mask, labels, label_weight_codes = self._apply_dynamic_visual_prefix(
                 input_ids,
                 inputs_embeds,
                 attention_mask,
                 labels,
+                label_weight_codes,
                 dynamic_prefix_embeddings,
             )
             position_ids = None
@@ -2858,11 +2957,12 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             and self._should_apply_learnable_prefix(past_key_values, cache_position)
         ):
             if input_ids is not None and (base_attention_mask is None or base_attention_mask.ndim == 2):
-                input_ids, inputs_embeds, attention_mask, labels = self._apply_learnable_prefix_after_visual_block(
+                input_ids, inputs_embeds, attention_mask, labels, label_weight_codes = self._apply_learnable_prefix_after_visual_block(
                     input_ids,
                     inputs_embeds,
                     attention_mask,
                     labels,
+                    label_weight_codes,
                 )
                 position_ids = None
                 self.rope_deltas = None
@@ -2891,10 +2991,11 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                             dtype=position_ids.dtype,
                         )
 
-                inputs_embeds, attention_mask, labels, position_ids = self._apply_learnable_prefix(
+                inputs_embeds, attention_mask, labels, label_weight_codes, position_ids = self._apply_learnable_prefix(
                     inputs_embeds,
                     attention_mask,
                     labels,
+                    label_weight_codes,
                     position_ids,
                 )
                 if base_rope_deltas is not None:
@@ -3041,6 +3142,8 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             gate_shared_ratio=gate_shared_ratio,
             mine_unique_features=mine_unique_features,
             mine_2d_features=mine_2d_features,
+            aligned_labels=labels,
+            aligned_label_weight_codes=label_weight_codes,
         )
 
     def prepare_inputs_for_generation(
