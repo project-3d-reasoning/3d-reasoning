@@ -9,6 +9,8 @@ MASTER_PORT=$(shuf -i 20000-29999 -n 1)     # Random port to avoid conflicts
 NUM_GPUS="${NUM_GPUS:-}"                    # Set e.g. "4" to use 4 GPUs; leave empty to use all local GPUs
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../utils/select_available_gpus.sh"
+source "${SCRIPT_DIR}/../utils/archive_train_log.sh"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 # Set NUM_GPUS to request N GPUs. If unset, request all local GPUs.
 if [ -n "${NUM_GPUS:-}" ]; then
@@ -59,7 +61,8 @@ LEARNABLE_PREFIX_LEN=0
 TEXT_GATE_BERT_NAME_OR_PATH="/data7t-root/huggingface/hub/bert"
 OUTPUT_DIR="PATH_TO_OUTPUT_DIR"                   # Directory for saving checkpoints
 CACHE_DIR="./cache"                        # [TrainingArguments] Cache directory for models
-mkdir -p $OUTPUT_DIR
+mkdir -p "$OUTPUT_DIR"
+setup_train_log_archive "$REPO_ROOT" "$OUTPUT_DIR"
 
 # ======================
 # Model Configuration

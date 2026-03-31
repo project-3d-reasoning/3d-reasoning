@@ -31,10 +31,12 @@ def _build_preprocess_cache_key(image_source, mode: str, target_size: int):
         return None
 
     source_path = None
+    source_variant = None
     if isinstance(image_source, str):
         source_path = image_source
     elif isinstance(image_source, Image.Image):
         source_path = image_source.info.get("vgllm_cache_key") if hasattr(image_source, "info") else None
+        source_variant = image_source.info.get("vgllm_cache_variant") if hasattr(image_source, "info") else None
         if not source_path:
             source_path = getattr(image_source, "filename", None)
 
@@ -48,7 +50,7 @@ def _build_preprocess_cache_key(image_source, mode: str, target_size: int):
     except OSError:
         source_version = None
 
-    return (source_path, source_version, mode, target_size)
+    return (source_path, source_version, source_variant, mode, target_size)
 
 
 def _get_cached_preprocessed_image(image_source, mode: str, target_size: int):

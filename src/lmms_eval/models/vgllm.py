@@ -1,3 +1,4 @@
+from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
@@ -73,6 +74,7 @@ class VGLLM(lmms):
         fusion_knn_k: Optional[int] = None,
         fusion_knn_min_valid_ratio: Optional[float] = None,
         fusion_knn_pos_mlp_hidden_size: Optional[int] = None,
+        legacy_image_roundtrip: Optional[Union[bool, str]] = True,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -82,6 +84,13 @@ class VGLLM(lmms):
         self.use_custom_video_loader = use_custom_video_loader
         self.fps = fps
         self.add_frame_index = add_frame_index
+        self.legacy_image_roundtrip = str(legacy_image_roundtrip).strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+            "none",
+        }
         # if self.fps and not self.use_custom_video_loader:
         #     raise ValueError("FPS is only applicable if use_custom_video_loader is True")
         self.max_image_size = max_image_size
@@ -280,6 +289,24 @@ class VGLLM(lmms):
                 new_list.append(j)
         return new_list
 
+    def _maybe_roundtrip_image(self, image: Image.Image) -> Image.Image:
+        if not self.legacy_image_roundtrip:
+            return image
+
+        source_cache_key = None
+        if hasattr(image, "info"):
+            source_cache_key = image.info.get("vgllm_cache_key")
+
+        buffer = BytesIO()
+        image.convert("RGB").save(buffer, format="JPEG")
+        buffer.seek(0)
+        with Image.open(buffer) as reopened:
+            roundtripped_image = reopened.convert("RGB")
+        if source_cache_key:
+            roundtripped_image.info["vgllm_cache_key"] = source_cache_key
+        roundtripped_image.info["vgllm_cache_variant"] = "jpeg_roundtrip"
+        return roundtripped_image
+
     def _prepare_image_tensor(self, image: Image.Image) -> Tuple[torch.Tensor, torch.Tensor]:
         image_tensor = load_and_preprocess_images([image])[0]
         geometry_tensor = image_tensor
@@ -317,6 +344,7 @@ class VGLLM(lmms):
             return message, sample_image_inputs, sample_geometry_inputs
 
         if isinstance(visual, Image.Image):
+            visual = self._maybe_roundtrip_image(visual)
             processor_tensor, geometry_tensor = self._prepare_image_tensor(visual)
             sample_image_inputs.append(processor_tensor)
             sample_geometry_inputs.append(geometry_tensor)
@@ -326,6 +354,7 @@ class VGLLM(lmms):
         if isinstance(visual, (list, tuple)) and all(isinstance(v, Image.Image) for v in visual):
             image_content = []
             for image_count, image in enumerate(visual):
+                image = self._maybe_roundtrip_image(image)
                 if self.add_frame_index:
                     image_content.append({"type": "text", "text": "Frame-{}: ".format(image_count)})
                 image_content.append({"type": "image", "image": image})
