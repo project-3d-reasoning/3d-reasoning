@@ -32,6 +32,11 @@ from qwen_vl.label_weighting import (
     build_full_label_weight_codes,
     get_label_weight_mask_path,
 )
+from qwen_vl.geometry_tokenization import (
+    build_geometry_assistant_codes,
+    geometry_tokens_enabled,
+    transform_conversations_for_geometry_tokens,
+)
 
 IGNORE_INDEX = -100
 IMAGE_TOKEN_INDEX = 151655
@@ -180,6 +185,17 @@ def extract_question_text_from_conversations(conversations) -> str:
             question_segments.append(content)
 
     return " ".join(question_segments)
+
+
+def extract_assistant_text_from_conversations(conversations) -> str:
+    roles = {"human": "user", "gpt": "assistant"}
+    for conv in reversed(conversations):
+        role = conv.get("role", conv.get("from"))
+        role = roles.get(role, role)
+        if role != "assistant":
+            continue
+        return str(conv.get("content", conv.get("value", "")))
+    return ""
 
 
 class LazySupervisedDataset(Dataset):
@@ -447,9 +463,13 @@ class LazySupervisedDataset(Dataset):
         return images
 
     def _get_item(self, i) -> Dict[str, torch.Tensor]:
-        sources = self.list_data_dict[i]
+        original_source_item = self.list_data_dict[i]
+        source_item = copy.deepcopy(original_source_item)
+        original_conversations = original_source_item["conversations"]
         if isinstance(i, int):
-            sources = [sources]
+            sources = [source_item]
+        else:
+            sources = source_item
         assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
         video = None
         
@@ -466,14 +486,22 @@ class LazySupervisedDataset(Dataset):
             f"{DEFAULT_IMAGE_TOKEN}\n", DEFAULT_IMAGE_TOKEN
         )
 
+        source_dataset_name = sources[0].get("_source_dataset_name")
+        if geometry_tokens_enabled(self.data_args):
+            sources[0]["conversations"] = transform_conversations_for_geometry_tokens(
+                sources[0]["conversations"],
+                dataset_name=source_dataset_name,
+            )
+        transformed_conversations = sources[0]["conversations"]
+
         # rename images tag
         if "images" in sources[0]:
             sources[0]["image"] = sources[0]["images"]
 
         # notice that we use images as the tag
         if "image" in sources[0]:
-            image_folder = self.list_data_dict[i]["data_path"]
-            image_file = self.list_data_dict[i]["image"]
+            image_folder = original_source_item["data_path"]
+            image_file = sources[0]["image"]
             if isinstance(image_file, List):
 
                 if isinstance(image_file[0], str):
@@ -566,35 +594,49 @@ class LazySupervisedDataset(Dataset):
                 input_ids=data_dict["input_ids"][0],
                 labels=data_dict["labels"][0],
                 position_ids=position_ids,
-                question_text=extract_question_text_from_conversations(self.list_data_dict[i]["conversations"]),
+                question_text=extract_question_text_from_conversations(original_conversations),
             )
 
-        if "image" in self.list_data_dict[i]:
+        if "image" in original_source_item:
             data_dict["pixel_values"] = image
             data_dict["image_grid_thw"] = grid_thw
             if getattr(self.data_args, "use_geometry_encoder", False):
                 data_dict["geometry_encoder_inputs"] = geometry_encoder_inputs
         # video exist in the data
-        elif "video" in self.list_data_dict[i]:
+        elif "video" in original_source_item:
             data_dict["pixel_values_videos"] = video
             data_dict["video_grid_thw"] = grid_thw
         
-        data_dict["tag"] = self.list_data_dict[i].get("tag", "2d")
-        source_dataset_name = self.list_data_dict[i].get("_source_dataset_name")
+        data_dict["tag"] = original_source_item.get("tag", "2d")
         if self.label_weight_mask_enabled:
-            source_sample_idx = int(self.list_data_dict[i].get("_source_sample_idx", -1))
+            source_sample_idx = int(original_source_item.get("_source_sample_idx", -1))
             assistant_codes = None
-            if source_dataset_name in self.label_weight_mask_stores and source_sample_idx >= 0:
+            use_runtime_geometry_codes = bool(
+                geometry_tokens_enabled(self.data_args)
+                and source_dataset_name in {"scanrefer", "scannet_det"}
+            )
+            if (
+                not use_runtime_geometry_codes
+                and source_dataset_name in self.label_weight_mask_stores
+                and source_sample_idx >= 0
+            ):
                 assistant_codes = self.label_weight_mask_stores[source_dataset_name].get_codes(source_sample_idx)
+            elif use_runtime_geometry_codes:
+                assistant_text = extract_assistant_text_from_conversations(transformed_conversations)
+                assistant_codes = build_geometry_assistant_codes(
+                    self.tokenizer,
+                    assistant_text=assistant_text,
+                    dataset_name=source_dataset_name,
+                )
             data_dict["label_weight_codes"] = build_full_label_weight_codes(
                 data_dict["labels"],
                 assistant_codes=assistant_codes,
                 ignore_index=IGNORE_INDEX,
             )
-        if source_dataset_name == "scanrefer" and "target" in self.list_data_dict[i]:
-            data_dict["scanrefer_target"] = copy.deepcopy(self.list_data_dict[i]["target"])
-        if source_dataset_name == "scannet_det" and "boxes" in self.list_data_dict[i]:
-            data_dict["scannet_det_boxes"] = copy.deepcopy(self.list_data_dict[i]["boxes"])
+        if source_dataset_name == "scanrefer" and "target" in original_source_item:
+            data_dict["scanrefer_target"] = copy.deepcopy(original_source_item["target"])
+        if source_dataset_name == "scannet_det" and "boxes" in original_source_item:
+            data_dict["scannet_det_boxes"] = copy.deepcopy(original_source_item["boxes"])
         return data_dict
 
 
@@ -617,27 +659,40 @@ class DataCollatorForSupervisedDataset(object):
     """Collate examples for supervised fine-tuning."""
 
     tokenizer: transformers.PreTrainedTokenizer
+    sentence_bert_tokenizer: Optional[transformers.PreTrainedTokenizer] = None
+    sentence_bert_max_length: int = 64
     bert_tokenizer: Optional[transformers.PreTrainedTokenizer] = None
-    bert_max_length: int = 64
+    bert_max_length: Optional[int] = None
 
-    def _maybe_add_bert_question_inputs(
+    def _get_sentence_bert_tokenizer(self) -> Optional[transformers.PreTrainedTokenizer]:
+        if self.sentence_bert_tokenizer is not None:
+            return self.sentence_bert_tokenizer
+        return self.bert_tokenizer
+
+    def _get_sentence_bert_max_length(self) -> int:
+        if self.bert_max_length is not None:
+            return int(self.bert_max_length)
+        return int(self.sentence_bert_max_length)
+
+    def _maybe_add_sentence_bert_question_inputs(
         self,
         batch: Dict[str, torch.Tensor],
         instances: Sequence[Dict],
     ) -> Dict[str, torch.Tensor]:
-        if self.bert_tokenizer is None:
+        sentence_bert_tokenizer = self._get_sentence_bert_tokenizer()
+        if sentence_bert_tokenizer is None:
             return batch
 
         question_texts = [instance.get("question_text", "") for instance in instances]
-        bert_batch = self.bert_tokenizer(
+        sentence_bert_batch = sentence_bert_tokenizer(
             question_texts,
             padding=True,
             truncation=True,
-            max_length=self.bert_max_length,
+            max_length=self._get_sentence_bert_max_length(),
             return_tensors="pt",
         )
-        batch["bert_question_input_ids"] = bert_batch["input_ids"]
-        batch["bert_question_attention_mask"] = bert_batch["attention_mask"]
+        batch["sentence_bert_question_input_ids"] = sentence_bert_batch["input_ids"]
+        batch["sentence_bert_question_attention_mask"] = sentence_bert_batch["attention_mask"]
         return batch
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
@@ -747,7 +802,7 @@ class DataCollatorForSupervisedDataset(object):
             batch["geometry_encoder_inputs"] = geometry_encoder_inputs
             assert len(set([instance["tag"] for instance in instances])) == 1, "all data in a batch should have the same tag"
             batch["tag"] = instances[0]["tag"]
-        return self._maybe_add_bert_question_inputs(batch, instances)
+        return self._maybe_add_sentence_bert_question_inputs(batch, instances)
 
 
 @dataclass
@@ -855,30 +910,36 @@ class FlattenedDataCollatorForSupervisedDataset(DataCollatorForSupervisedDataset
         if "geometry_encoder_inputs" in instances[0]:
             raise NotImplementedError("FlattenedDataCollatorForSupervisedDataset does not support geometry_encoder_inputs")
 
-        return self._maybe_add_bert_question_inputs(batch, instances)
+        return self._maybe_add_sentence_bert_question_inputs(batch, instances)
 
 
 def make_supervised_data_module(
     tokenizer: transformers.PreTrainedTokenizer,
     data_args,
+    sentence_bert_tokenizer: Optional[transformers.PreTrainedTokenizer] = None,
+    sentence_bert_max_length: int = 64,
     bert_tokenizer: Optional[transformers.PreTrainedTokenizer] = None,
-    bert_max_length: int = 64,
+    bert_max_length: Optional[int] = None,
 ) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
+    if sentence_bert_tokenizer is None:
+        sentence_bert_tokenizer = bert_tokenizer
+    if bert_max_length is not None:
+        sentence_bert_max_length = int(bert_max_length)
     train_dataset = LazySupervisedDataset(tokenizer=tokenizer, data_args=data_args)
     if data_args.data_flatten:
         data_collator = FlattenedDataCollatorForSupervisedDataset(
             tokenizer=tokenizer,
-            bert_tokenizer=bert_tokenizer,
-            bert_max_length=bert_max_length,
+            sentence_bert_tokenizer=sentence_bert_tokenizer,
+            sentence_bert_max_length=sentence_bert_max_length,
         )
         return dict(
             train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator
         )
     data_collator = DataCollatorForSupervisedDataset(
         tokenizer=tokenizer,
-        bert_tokenizer=bert_tokenizer,
-        bert_max_length=bert_max_length,
+        sentence_bert_tokenizer=sentence_bert_tokenizer,
+        sentence_bert_max_length=sentence_bert_max_length,
     )
     return dict(
         train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator

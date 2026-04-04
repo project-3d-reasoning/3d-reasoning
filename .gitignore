@@ -9,3 +9,7 @@ logs
 7b-adver-gate
 train_log
 7b-add-span
+7b-adver-with-gate4residual
+7b-adver-with-gate3reducegatelr
+7b-adver-gate3-storage
+MISA-master 2

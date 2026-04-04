@@ -20,7 +20,7 @@ import pathlib
 import torch
 import transformers
 import json
-from typing import Dict
+from typing import Dict, Optional
 import shutil
 import sys
 from pathlib import Path
@@ -42,6 +42,17 @@ from qwen_vl.train.argument import (
     DataArguments,
     TrainingArguments,
 )
+from qwen_vl.text_gate import (
+    apply_text_gate_sentence_bert_config,
+    resolve_text_gate_sentence_bert_max_length,
+    resolve_text_gate_sentence_bert_name_or_path,
+)
+from qwen_vl.geometry_tokenization import (
+    all_geometry_added_tokens,
+    geometry_tokens_enabled,
+    initialize_geometry_token_embeddings,
+    register_geometry_token_gradient_mask,
+)
 from transformers import AutoTokenizer, AutoProcessor, Qwen2VLImageProcessor, AutoConfig, set_seed, enable_full_determinism
 
 local_rank = None
@@ -49,6 +60,29 @@ local_rank = None
 def rank0_print(*args):
     if local_rank == 0:
         print(*args)
+
+
+def _maybe_reapply_adver_gate_init(model: torch.nn.Module, loading_info: Dict) -> None:
+    if model is None or not loading_info:
+        return
+
+    missing_keys = set(loading_info.get("missing_keys") or [])
+    gate_output_missing = {
+        "feature_fusion.adver_gate_mlp.3.weight",
+        "feature_fusion.adver_gate_mlp.3.bias",
+    } & missing_keys
+    if not gate_output_missing:
+        return
+
+    feature_fusion = getattr(model, "feature_fusion", None)
+    if feature_fusion is None or not hasattr(feature_fusion, "reset_adver_gate_bias"):
+        return
+
+    feature_fusion.reset_adver_gate_bias(-2.0)
+    logging.info(
+        "Reapplied adver gate output-layer init after loading missing keys: %s",
+        sorted(gate_output_missing),
+    )
 
 
 def _infer_lora_target_modules(module: torch.nn.Module):
@@ -178,6 +212,39 @@ def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     while hasattr(model, "module"):
         model = model.module
     return model
+
+
+def _maybe_enable_geometry_tokens(model: torch.nn.Module, tokenizer, data_args) -> int:
+    if not geometry_tokens_enabled(data_args):
+        return 0
+
+    base_vocab_size = int(getattr(model.config, "geometry_token_base_vocab_size", len(tokenizer)))
+    tokenizer_len_before_add = len(tokenizer)
+    num_added_tokens = tokenizer.add_tokens(
+        all_geometry_added_tokens(),
+        special_tokens=False,
+    )
+    if num_added_tokens > 0:
+        base_vocab_size = tokenizer_len_before_add
+        model.resize_token_embeddings(len(tokenizer))
+        if hasattr(model, "tie_weights"):
+            model.tie_weights()
+        initialize_geometry_token_embeddings(
+            model=model,
+            tokenizer=tokenizer,
+            base_vocab_size=base_vocab_size,
+        )
+
+    model.config.geometry_tokens = True
+    model.config.geometry_token_base_vocab_size = int(base_vocab_size)
+    model.config.vocab_size = len(tokenizer)
+    if hasattr(model, "vocab_size"):
+        model.vocab_size = len(tokenizer)
+
+    if getattr(data_args, "geometry_token_freeze_existing_rows", True):
+        register_geometry_token_gradient_mask(model, base_vocab_size=base_vocab_size)
+
+    return int(num_added_tokens)
 
 
 class FusionLambdaWarmupCallback(transformers.TrainerCallback):
@@ -392,6 +459,104 @@ class FusionLambdaNRSRCallback(transformers.TrainerCallback):
         setattr(model, "fusion_lambda_nrsr", self.target_lambda)
 
 
+class AdverFreezeLlmCallback(transformers.TrainerCallback):
+    """
+    In adver / adver_ortho with tune_mm_llm, freeze the language decoder and lm_head
+    for the first N global steps so fusion / gate branches can stabilize first.
+
+    The LLM parameters are already part of the optimizer because `set_model`
+    marks them trainable before the Trainer builds optimizer/scheduler. This
+    callback therefore only toggles `requires_grad` during the frozen window.
+
+    On unfreeze, gate param groups have their scheduler base_lr scaled by
+    ``gate_lr_decay_on_unfreeze`` so that the gate LR transitions smoothly
+    from the pre-training value to one compatible with a jointly-trained LLM.
+    """
+
+    def __init__(
+        self,
+        freeze_steps: int,
+        tune_mm_llm: bool,
+        fusion_method: Optional[str],
+        gate_lr_decay_on_unfreeze: float = 0.1,
+        fusion_gate_lr: Optional[float] = None,
+    ):
+        self.freeze_steps = max(int(freeze_steps), 0)
+        self.tune_mm_llm = bool(tune_mm_llm)
+        self.fusion_method = str(fusion_method).lower() if fusion_method else ""
+        self.gate_lr_decay = float(gate_lr_decay_on_unfreeze)
+        self.fusion_gate_lr = float(fusion_gate_lr) if fusion_gate_lr is not None else None
+        self.trainer: Optional[transformers.Trainer] = None
+        self._active = False
+        self._prev_should_freeze: Optional[bool] = None
+
+    def _enabled(self) -> bool:
+        if self.freeze_steps <= 0:
+            return False
+        if not self.tune_mm_llm:
+            return False
+        return self.fusion_method in {"adver", "adver_ortho"}
+
+    @staticmethod
+    def _set_llm_trainable(model: torch.nn.Module, trainable: bool) -> None:
+        for _n, p in model.model.named_parameters():
+            p.requires_grad = trainable
+        model.lm_head.requires_grad = trainable
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        if model is None or not self._enabled():
+            return
+        model = _unwrap_model(model)
+        self._active = True
+        should_freeze = state.global_step < self.freeze_steps
+        self._set_llm_trainable(model, not should_freeze)
+        self._prev_should_freeze = should_freeze
+        if should_freeze:
+            rank0_print(
+                f"[AdverFreezeLlm] Freezing LLM (model + lm_head) for the first {self.freeze_steps} global steps."
+            )
+
+    def _decay_gate_lr_via_scheduler(self) -> None:
+        if self.trainer is None:
+            return
+        scheduler = getattr(self.trainer, "lr_scheduler", None)
+        if scheduler is None or not hasattr(scheduler, "base_lrs"):
+            return
+        if self.fusion_gate_lr is None or self.fusion_gate_lr <= 0:
+            return
+        matched = False
+        tol = self.fusion_gate_lr * 0.01
+        for i, base_lr in enumerate(scheduler.base_lrs):
+            if abs(base_lr - self.fusion_gate_lr) < tol:
+                old_lr = base_lr
+                scheduler.base_lrs[i] = base_lr * self.gate_lr_decay
+                matched = True
+                rank0_print(
+                    f"[AdverFreezeLlm] Decayed gate scheduler base_lr {old_lr:.2e} -> "
+                    f"{scheduler.base_lrs[i]:.2e} (x{self.gate_lr_decay})"
+                )
+        if not matched:
+            rank0_print(
+                f"[AdverFreezeLlm] No scheduler base_lr matched fusion_gate_lr={self.fusion_gate_lr:.2e}; "
+                "gate LR unchanged."
+            )
+
+    def on_step_begin(self, args, state, control, model=None, **kwargs):
+        if not self._active or model is None:
+            return
+        model = _unwrap_model(model)
+        should_freeze = state.global_step < self.freeze_steps
+        if self._prev_should_freeze is not None and should_freeze == self._prev_should_freeze:
+            return
+        self._set_llm_trainable(model, not should_freeze)
+        if self._prev_should_freeze and not should_freeze:
+            rank0_print(
+                f"[AdverFreezeLlm] Unfroze LLM at global_step={state.global_step}."
+            )
+            self._decay_gate_lr_via_scheduler()
+        self._prev_should_freeze = should_freeze
+
+
 def train(attn_implementation="flash_attention_2"):
     global local_rank
 
@@ -434,6 +599,8 @@ def train(attn_implementation="flash_attention_2"):
                 "decompose_hidden_size",
                 "nrsr_hidden_size",
                 "fusion_recon_mask_ratio",
+                "fusion_gate_temperature",
+                "fusion_gate_question_dim",
                 "adver_compute_align_loss",
                 "fusion_align_mode",
                 "fusion_ortho_mode",
@@ -457,8 +624,6 @@ def train(attn_implementation="flash_attention_2"):
                 "tune_geometry_encoder_lora",
                 "use_learnable_prefix",
                 "learnable_prefix_len",
-                "text_gate_bert_name_or_path",
-                "text_gate_bert_max_length",
                 "label_weight_default",
                 "label_weight_scanrefer_frame",
                 "label_weight_scanrefer_bbox",
@@ -469,21 +634,25 @@ def train(attn_implementation="flash_attention_2"):
                 "label_weight_scannet_det_bbox",
                 "label_weight_dynamic_iou_alpha",
                 "label_weight_dynamic_iou_eps",
+                "label_weight_dynamic_iou_skip_invalid",
+                "label_weight_loss_normalize_by_weight_sum",
             ]:
                 setattr(config, k, getattr(model_args, k))
-            setattr(config, "text_gate_bert_cache_dir", training_args.cache_dir)
+            apply_text_gate_sentence_bert_config(config, cache_dir=training_args.cache_dir)
 
             if model_args.use_geometry_encoder:
                 assert model_args.geometry_encoder_path is not None, \
                     "geometry_encoder_path must be set in the config when use_geometry_encoder is True."
-            model = Qwen2_5_VLForConditionalGenerationWithVGGT.from_pretrained(
-                pretrained_model_name_or_path=model_args.model_name_or_path,
+            model, loading_info = Qwen2_5_VLForConditionalGenerationWithVGGT.from_pretrained(
+                model_args.model_name_or_path,
                 config=config,
                 cache_dir=training_args.cache_dir,
                 attn_implementation=attn_implementation,
                 torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-                geometry_encoder_path=(model_args.geometry_encoder_path if model_args.use_geometry_encoder else None)
+                geometry_encoder_path=(model_args.geometry_encoder_path if model_args.use_geometry_encoder else None),
+                output_loading_info=True,
             )
+            _maybe_reapply_adver_gate_init(model, loading_info)
 
         data_args.image_processor = AutoProcessor.from_pretrained(
             model_args.model_name_or_path,
@@ -522,16 +691,18 @@ def train(attn_implementation="flash_attention_2"):
         padding_side="right",
         use_fast=False,
     )
-    bert_tokenizer = None
+    text_gate_sentence_bert_name_or_path = resolve_text_gate_sentence_bert_name_or_path(model_args)
+    text_gate_sentence_bert_max_length = resolve_text_gate_sentence_bert_max_length(model_args)
+    sentence_bert_tokenizer = None
     if (
         model_args.use_geometry_encoder
-        and str(model_args.feature_fusion_method).lower() == "adver"
-        and getattr(model_args, "text_gate_bert_name_or_path", None)
+        and str(model_args.feature_fusion_method).lower() in {"adver", "adver_ortho"}
+        and text_gate_sentence_bert_name_or_path
     ):
-        bert_tokenizer = transformers.AutoTokenizer.from_pretrained(
-            model_args.text_gate_bert_name_or_path,
+        sentence_bert_tokenizer = transformers.AutoTokenizer.from_pretrained(
+            text_gate_sentence_bert_name_or_path,
             cache_dir=training_args.cache_dir,
-            model_max_length=model_args.text_gate_bert_max_length,
+            model_max_length=text_gate_sentence_bert_max_length,
             padding_side="right",
             use_fast=True,
         )
@@ -550,6 +721,13 @@ def train(attn_implementation="flash_attention_2"):
         if value is not None:
             setattr(training_args, attr, float(value))
     set_model(model_args, model)
+    geometry_tokens_added = _maybe_enable_geometry_tokens(model, tokenizer, data_args)
+    if geometry_tokens_added > 0:
+        logging.info(
+            "Added %d geometry tokens. New tokenizer size=%d",
+            geometry_tokens_added,
+            len(tokenizer),
+        )
 
     if torch.distributed.get_rank() == 0:
         model.visual.print_trainable_parameters()
@@ -561,8 +739,8 @@ def train(attn_implementation="flash_attention_2"):
     data_module = make_supervised_data_module(
         tokenizer=tokenizer,
         data_args=data_args,
-        bert_tokenizer=bert_tokenizer,
-        bert_max_length=model_args.text_gate_bert_max_length,
+        sentence_bert_tokenizer=sentence_bert_tokenizer,
+        sentence_bert_max_length=text_gate_sentence_bert_max_length,
     )
     fusion_lambda_warmup_callback = FusionLambdaWarmupCallback(
         enabled=model_args.fusion_lambda_warmup,
@@ -571,20 +749,32 @@ def train(attn_implementation="flash_attention_2"):
     fusion_lambda_nrsr_callback = FusionLambdaNRSRCallback(
         enabled=model_args.fusion_lambda_nrsr_dynamic,
     )
+    adver_freeze_llm_callback = AdverFreezeLlmCallback(
+        freeze_steps=model_args.adver_freeze_llm_steps,
+        tune_mm_llm=model_args.tune_mm_llm,
+        fusion_method=model_args.feature_fusion_method,
+        gate_lr_decay_on_unfreeze=getattr(model_args, "gate_lr_decay_on_unfreeze", 0.1),
+        fusion_gate_lr=getattr(training_args, "fusion_gate_lr", None),
+    )
     trainer = VGTrainer(
         model=model,
         processing_class=tokenizer,
         args=training_args,
-        callbacks=[fusion_lambda_warmup_callback, fusion_lambda_nrsr_callback],
+        callbacks=[
+            fusion_lambda_warmup_callback,
+            fusion_lambda_nrsr_callback,
+            adver_freeze_llm_callback,
+        ],
         **data_module,
     )
-
+    adver_freeze_llm_callback.trainer = trainer
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         logging.info("checkpoint found, resume training")
         trainer.train(resume_from_checkpoint=True)
     else:
         trainer.train()
     trainer.save_state()
+    tokenizer.save_pretrained(training_args.output_dir)
     data_args.image_processor.save_pretrained(training_args.output_dir)
 
     source_path = os.path.join(model_args.model_name_or_path, "chat_template.json")

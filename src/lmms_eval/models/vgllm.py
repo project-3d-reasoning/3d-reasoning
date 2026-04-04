@@ -21,6 +21,11 @@ from lmms_eval.api.instance import Instance
 from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model
 
+from qwen_vl.text_gate import (
+    apply_text_gate_sentence_bert_config,
+    resolve_text_gate_sentence_bert_max_length,
+    resolve_text_gate_sentence_bert_name_or_path,
+)
 from qwen_vl.model.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGenerationWithVGGT
 from qwen_vl.data.utils import load_and_preprocess_images
 
@@ -52,12 +57,16 @@ class VGLLM(lmms):
         tune_geometry_encoder_lora: Optional[bool] = None,
         use_learnable_prefix: Optional[bool] = None,
         learnable_prefix_len: Optional[int] = None,
+        text_gate_sentence_bert_name_or_path: Optional[str] = None,
+        text_gate_sentence_bert_max_length: Optional[int] = None,
         text_gate_bert_name_or_path: Optional[str] = None,
+        text_gate_bert_max_length: Optional[int] = None,
         feature_fusion_method: Optional[str] = None,
         fusion_num_layers: Optional[int] = None,
         geometry_merger_type: Optional[str] = None,
         decompose_hidden_size: Optional[int] = None,
         nrsr_hidden_size: Optional[int] = None,
+        fusion_gate_question_dim: Optional[int] = None,
         fusion_align_mode: Optional[str] = None,
         fusion_ortho_mode: Optional[str] = None,
         fusion_lambda_align: Optional[float] = None,
@@ -74,7 +83,7 @@ class VGLLM(lmms):
         fusion_knn_k: Optional[int] = None,
         fusion_knn_min_valid_ratio: Optional[float] = None,
         fusion_knn_pos_mlp_hidden_size: Optional[int] = None,
-        legacy_image_roundtrip: Optional[Union[bool, str]] = True,
+        legacy_image_roundtrip: Optional[Union[bool, str]] = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -91,6 +100,10 @@ class VGLLM(lmms):
             "off",
             "none",
         }
+        eval_logger.info(
+            "Using {} image path for PIL inputs",
+            "legacy JPEG roundtrip" if self.legacy_image_roundtrip else "direct PIL",
+        )
         # if self.fps and not self.use_custom_video_loader:
         #     raise ValueError("FPS is only applicable if use_custom_video_loader is True")
         self.max_image_size = max_image_size
@@ -125,6 +138,8 @@ class VGLLM(lmms):
             setattr(config, "decompose_hidden_size", decompose_hidden_size)
         if nrsr_hidden_size is not None:
             setattr(config, "nrsr_hidden_size", nrsr_hidden_size)
+        if fusion_gate_question_dim is not None:
+            setattr(config, "fusion_gate_question_dim", fusion_gate_question_dim)
         if fusion_align_mode is not None:
             setattr(config, "fusion_align_mode", fusion_align_mode)
         if fusion_ortho_mode is not None:
@@ -169,8 +184,21 @@ class VGLLM(lmms):
             setattr(config, "use_learnable_prefix", use_learnable_prefix)
         if learnable_prefix_len is not None:
             setattr(config, "learnable_prefix_len", learnable_prefix_len)
-        if text_gate_bert_name_or_path is not None:
-            setattr(config, "text_gate_bert_name_or_path", text_gate_bert_name_or_path)
+        text_gate_name_override = (
+            text_gate_sentence_bert_name_or_path
+            if text_gate_sentence_bert_name_or_path is not None
+            else text_gate_bert_name_or_path
+        )
+        text_gate_max_length_override = (
+            text_gate_sentence_bert_max_length
+            if text_gate_sentence_bert_max_length is not None
+            else text_gate_bert_max_length
+        )
+        apply_text_gate_sentence_bert_config(
+            config,
+            name_or_path=text_gate_name_override,
+            max_length=text_gate_max_length_override,
+        )
 
         if (
             getattr(config, "use_geometry_encoder", False)
@@ -198,14 +226,14 @@ class VGLLM(lmms):
         self.max_num_frames = max_num_frames
         self.processor = AutoProcessor.from_pretrained(pretrained, max_pixels=max_pixels, min_pixels=min_pixels, padding_side="left")
         self._tokenizer = AutoTokenizer.from_pretrained(pretrained, padding_side="left")
-        self._text_gate_bert_tokenizer = None
+        self._text_gate_sentence_bert_tokenizer = None
         if (
             getattr(config, "use_geometry_encoder", False)
             and str(getattr(config, "feature_fusion_method", "add")).lower() in {"adver", "adver_ortho"}
-            and getattr(config, "text_gate_bert_name_or_path", None)
+            and resolve_text_gate_sentence_bert_name_or_path(config)
         ):
-            self._text_gate_bert_tokenizer = AutoTokenizer.from_pretrained(
-                config.text_gate_bert_name_or_path,
+            self._text_gate_sentence_bert_tokenizer = AutoTokenizer.from_pretrained(
+                resolve_text_gate_sentence_bert_name_or_path(config),
                 padding_side="right",
                 use_fast=True,
             )
@@ -454,16 +482,16 @@ class VGLLM(lmms):
                 return_tensors="pt",
                 do_rescale=False
             )
-            if self._text_gate_bert_tokenizer is not None:
-                bert_batch = self._text_gate_bert_tokenizer(
+            if self._text_gate_sentence_bert_tokenizer is not None:
+                sentence_bert_batch = self._text_gate_sentence_bert_tokenizer(
                     list(contexts),
                     padding=True,
                     truncation=True,
-                    max_length=getattr(self.model.config, "text_gate_bert_max_length", 64),
+                    max_length=resolve_text_gate_sentence_bert_max_length(self.model.config),
                     return_tensors="pt",
                 )
-                inputs["bert_question_input_ids"] = bert_batch["input_ids"]
-                inputs["bert_question_attention_mask"] = bert_batch["attention_mask"]
+                inputs["sentence_bert_question_input_ids"] = sentence_bert_batch["input_ids"]
+                inputs["sentence_bert_question_attention_mask"] = sentence_bert_batch["attention_mask"]
             device = "cuda" if self.device_map == "auto" else self.device
             if getattr(self.model.config, "use_geometry_encoder", False) or getattr(self.model.config, "use_vggt_feature", False):
                 inputs["geometry_encoder_inputs"] = [feat.to(device) for feat in geometry_encoder_inputs]

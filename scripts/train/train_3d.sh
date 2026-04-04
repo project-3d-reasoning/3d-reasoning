@@ -12,6 +12,7 @@ source "${SCRIPT_DIR}/../utils/select_available_gpus.sh"
 source "${SCRIPT_DIR}/../utils/archive_train_log.sh"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
+
 # Set NUM_GPUS to request N GPUs. If unset, request all local GPUs.
 if [ -n "${NUM_GPUS:-}" ]; then
     REQUESTED_GPUS="$NUM_GPUS"
@@ -33,21 +34,23 @@ TUNE_MM_VISION=False
 TUNE_MM_VISION_LORA=False
 TUNE_GEOMETRY_ENCODER=False
 TUNE_GEOMETRY_ENCODER_LORA=False
-FEATURE_FUSION_METHOD="add"      # choices: add/concat/cross_attention/gated/weighted/adver/adver_ortho/decompose_add/decompose_concat/nrsr_add/nrsr_concat/knn_concat
+FEATURE_FUSION_METHOD="adver"      # choices: add/concat/cross_attention/gated/weighted/adver/adver_ortho/decompose_add/decompose_concat/nrsr_add/nrsr_concat/knn_concat
 FUSION_NUM_LAYERS=2                    # 没用Number of Transformer-style CA blocks for cross_attention/knn_concat
 FUSION_KNN_K=5                         # 没用Number of nearest neighbors from other frames for knn_concat; self token is added automatically
 FUSION_KNN_MIN_VALID_RATIO=0.5         #  没用Minimum confidence mass ratio in the center patch window before a patch/token is marked valid
 FUSION_KNN_POS_MLP_HIDDEN_SIZE=3096     # 没用Hidden width of the relative-position MLP for knn_concat
 FUSION_RECON_MASK_RATIO=0.3              # Patch/token mask ratio for masked reconstruction in adver mode
+FUSION_GATE_TEMPERATURE=2.0            # Temperature for sigmoid(logits / T) in the adver gate; smaller means sharper gate
 ADVER_COMPUTE_ALIGN_LOSS=False           # Whether to compute loss_align in adver/adver_ortho; keep False to skip the extra branch during training
+ADVER_FREEZE_LLM_STEPS=40              # With tune_mm_llm: freeze decoder+lm_head for first N global steps in adver/adver_ortho; 0 disables
 FUSION_ALIGN_MODE="infonce"               # choices: cosine/infonce
 FUSION_ORTHO_MODE="hsic"                 # choices: cosine/hsic/mine; only used by decompose_* methods
 FUSION_LAMBDA_ALIGN=0                 # Initial lambda for shared alignment loss in decompose_* methods
 FUSION_ALIGN_TARGET_RATIO=0         # Late-stage target loss_shared_weighted / loss_ce ratio
 FUSION_ALIGN_LAMBDA_MAX=5.0              # Cap for dynamic shared alignment lambda
 FUSION_LAMBDA_ORTHO=0                 # Initial lambda for orthogonality loss
-FUSION_ORTHO_TARGET_RATIO=0          # Late-stage target loss_ortho_weighted / loss_ce ratio
-FUSION_ORTHO_LAMBDA_MAX=5.0             # Cap for dynamic orthogonality lambda
+FUSION_ORTHO_TARGET_RATIO=0.05          # Late-stage target loss_ortho_weighted / loss_ce ratio
+FUSION_ORTHO_LAMBDA_MAX=50             # Cap for dynamic orthogonality lambda
 FUSION_LAMBDA_RECON=0                  # Initial lambda for reconstruction loss in decompose_* methods
 FUSION_RECON_TARGET_RATIO=0          # Late-stage target loss_recon_weighted / loss_ce ratio
 FUSION_RECON_LAMBDA_MAX=5.0              # Cap for dynamic reconstruction lambda
@@ -56,28 +59,37 @@ FUSION_LAMBDA_NRSR_DYNAMIC=True        # 没用
 FUSION_LAMBDA_NRSR_STAGE2_RATIO=0.1    # 没用
 FUSION_LAMBDA_NRSR_STAGE3_RATIO=0.1    # 没用
 FUSION_LAMBDA_WARMUP=True               
-FUSION_LAMBDA_WARMUP_STEPS=500           
+FUSION_LAMBDA_WARMUP_STEPS=500        
 FUSION_MINE_Q_WARMUP_STEPS=500            # q_net-only warmup updates per epoch when FUSION_ORTHO_MODE=mine
-USE_LABEL_WEIGHT_MASKS=true
+FUSION_GATE_LR="5e-4"                     # Dedicated LR for gate-related params
+FUSION_FEATURE_3D_LR="1e-4"               # Dedicated LR for trainable feature_3d branches in feature_fusion
+USE_LABEL_WEIGHT_MASKS=false
 # Run scripts/utils/build_label_weight_masks.py beforehand to populate this sidecar directory.
 LABEL_WEIGHT_MASKS_DIR="data/train/label_weight_masks"
 LABEL_WEIGHT_DEFAULT=1.0
-LABEL_WEIGHT_SCANREFER_FRAME=1
+LABEL_WEIGHT_SCANREFER_FRAME=1.5
 LABEL_WEIGHT_SCANREFER_BBOX=1
 LABEL_WEIGHT_SCAN2CAP_CATEGORY=1
 LABEL_WEIGHT_SCAN2CAP_ATTRIBUTE=1
 LABEL_WEIGHT_SCAN2CAP_RELATION=1
-LABEL_WEIGHT_SCANNET_DET_LABEL=1
+LABEL_WEIGHT_SCANNET_DET_LABEL=1.5
 LABEL_WEIGHT_SCANNET_DET_BBOX=1
-LABEL_WEIGHT_DYNAMIC_IOU_ALPHA=1.0
+LABEL_WEIGHT_DYNAMIC_IOU_ALPHA=0.3
 LABEL_WEIGHT_DYNAMIC_IOU_EPS=1e-6
 USE_LEARNABLE_PREFIX=false
 LEARNABLE_PREFIX_LEN=0
-TEXT_GATE_BERT_NAME_OR_PATH="/data7t-root/huggingface/hub/bert"
-OUTPUT_DIR="7b-add-span"                   # Directory for saving checkpoints
+TEXT_GATE_SENTENCE_BERT_NAME_OR_PATH="/data7t-root/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/snapshots/c9745ed1d9f207416be6d2e6f8de32d1f16199bf"
+OUTPUT_DIR="7b-adver-with-gate4residual"                   # Directory for saving checkpoints
 CACHE_DIR="./cache"                        # [TrainingArguments] Cache directory for models
 mkdir -p "$OUTPUT_DIR"
 setup_train_log_archive "$REPO_ROOT" "$OUTPUT_DIR"
+EXTRA_TRAIN_ARGS=()
+if [ -n "${FUSION_GATE_LR:-}" ]; then
+    EXTRA_TRAIN_ARGS+=(--fusion_gate_lr "$FUSION_GATE_LR")
+fi
+if [ -n "${FUSION_FEATURE_3D_LR:-}" ]; then
+    EXTRA_TRAIN_ARGS+=(--fusion_feature_3d_lr "$FUSION_FEATURE_3D_LR")
+fi
 
 # ======================
 # Model Configuration
@@ -175,7 +187,9 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --fusion_knn_min_valid_ratio $FUSION_KNN_MIN_VALID_RATIO \
             --fusion_knn_pos_mlp_hidden_size $FUSION_KNN_POS_MLP_HIDDEN_SIZE \
             --fusion_recon_mask_ratio $FUSION_RECON_MASK_RATIO \
+            --fusion_gate_temperature $FUSION_GATE_TEMPERATURE \
             --adver_compute_align_loss $ADVER_COMPUTE_ALIGN_LOSS \
+            --adver_freeze_llm_steps $ADVER_FREEZE_LLM_STEPS \
             --fusion_align_mode $FUSION_ALIGN_MODE \
             --fusion_ortho_mode $FUSION_ORTHO_MODE \
             --fusion_lambda_align $FUSION_LAMBDA_ALIGN \
@@ -196,6 +210,7 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --fusion_mine_q_warmup_steps $FUSION_MINE_Q_WARMUP_STEPS \
             --use_learnable_prefix $USE_LEARNABLE_PREFIX \
             --learnable_prefix_len $LEARNABLE_PREFIX_LEN \
-            --text_gate_bert_name_or_path $TEXT_GATE_BERT_NAME_OR_PATH \
+            --text_gate_sentence_bert_name_or_path $TEXT_GATE_SENTENCE_BERT_NAME_OR_PATH \
+            "${EXTRA_TRAIN_ARGS[@]}" \
             "$@" \
             > ${OUTPUT_DIR}/train.log 2>&1

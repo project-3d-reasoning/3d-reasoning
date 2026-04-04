@@ -34,7 +34,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
 
-from transformers import BertModel
+from transformers import AutoModel
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache, SlidingWindowCache, StaticCache
 from transformers.generation import GenerationMixin
@@ -56,6 +56,10 @@ from .geometry_encoders import create_geometry_encoder, GeometryEncoderConfig
 from .feature_fusion import FeatureFusionModule, FeatureFusionConfig, GeometryFeatureMerger
 from .loss import normalize_pointcloud, check_and_fix_inf_nan
 from qwen_vl.label_weighting import LABEL_WEIGHT_CODE_IGNORE, get_label_weight_value_table
+from qwen_vl.text_gate import (
+    resolve_text_gate_sentence_bert_cache_dir,
+    resolve_text_gate_sentence_bert_name_or_path,
+)
 
 
 if is_flash_attn_2_available():
@@ -1528,6 +1532,8 @@ class Qwen2_5_VLCausalLMOutputWithPast(ModelOutput):
     loss_recon: Optional[torch.FloatTensor] = None
     loss_nrsr_kl: Optional[torch.FloatTensor] = None
     gate_shared_ratio: Optional[torch.FloatTensor] = None
+    gate_missing_question_summary: Optional[torch.FloatTensor] = None
+    fusion_monitor_stats: Optional[Dict[str, torch.FloatTensor]] = None
     mine_unique_features: Optional[torch.FloatTensor] = None
     mine_2d_features: Optional[torch.FloatTensor] = None
     aligned_labels: Optional[torch.LongTensor] = None
@@ -1618,6 +1624,8 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
     def __init__(self, config):
         super().__init__(config)
         self.visual = Qwen2_5_VisionTransformerPretrainedModel._from_config(config.vision_config)
+        # Keep the legacy attribute name so older BERT-based checkpoints still map to
+        # the same state-dict keys after switching the implementation to Sentence-BERT.
         self.text_gate_bert = None
         self.text_gate_projection = None
         
@@ -1640,15 +1648,17 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
 
         # Initialize weights and apply final processing
         self.post_init()
+        if getattr(self, "feature_fusion", None) is not None:
+            self.feature_fusion.reset_adver_gate_bias(-2.0)
         if self.learnable_prefix_embeddings is not None:
             with torch.no_grad():
                 self.learnable_prefix_embeddings.zero_()
         if (
             getattr(config, "use_geometry_encoder", False)
-            and str(getattr(config, "feature_fusion_method", "add")).lower() == "adver"
-            and getattr(config, "text_gate_bert_name_or_path", None)
+            and str(getattr(config, "feature_fusion_method", "add")).lower() in {"adver", "adver_ortho"}
+            and resolve_text_gate_sentence_bert_name_or_path(config)
         ):
-            self._init_text_gate_bert(config)
+            self._init_text_gate_sentence_bert(config)
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -1694,6 +1704,8 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             decompose_hidden_size=getattr(config, "decompose_hidden_size", None),
             nrsr_hidden_size=getattr(config, "nrsr_hidden_size", None),
             recon_mask_ratio=getattr(config, "fusion_recon_mask_ratio", 0.3),
+            gate_temperature=getattr(config, "fusion_gate_temperature", 1.0),
+            gate_question_dim=getattr(config, "fusion_gate_question_dim", 16),
             adver_compute_align_loss=bool(getattr(config, "adver_compute_align_loss", False)),
             align_mode=getattr(config, "fusion_align_mode", "cosine"),
             align_temperature=getattr(config, "fusion_align_temperature", 0.07),
@@ -1711,22 +1723,21 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         self.fusion_ortho_target_ratio = getattr(config, "fusion_ortho_target_ratio", None)
         self.fusion_lambda_nrsr = getattr(config, "fusion_lambda_nrsr", 1.0)
 
-    def _init_text_gate_bert(self, config):
-        bert_name_or_path = getattr(config, "text_gate_bert_name_or_path", None)
-        if not bert_name_or_path:
+    def _init_text_gate_sentence_bert(self, config):
+        sentence_bert_name_or_path = resolve_text_gate_sentence_bert_name_or_path(config)
+        if not sentence_bert_name_or_path:
             return
 
-        self.text_gate_bert = BertModel.from_pretrained(
-            bert_name_or_path,
-            add_pooling_layer=False,
-            cache_dir=getattr(config, "text_gate_bert_cache_dir", None),
+        self.text_gate_bert = AutoModel.from_pretrained(
+            sentence_bert_name_or_path,
+            cache_dir=resolve_text_gate_sentence_bert_cache_dir(config),
         )
         for param in self.text_gate_bert.parameters():
             param.requires_grad = False
         self.text_gate_bert.eval()
 
-        bert_hidden_size = int(self.text_gate_bert.config.hidden_size)
-        self.text_gate_projection = nn.Linear(bert_hidden_size, config.hidden_size)
+        sentence_bert_hidden_size = int(self.text_gate_bert.config.hidden_size)
+        self.text_gate_projection = nn.Linear(sentence_bert_hidden_size, config.hidden_size)
         self.text_gate_projection.weight.data.normal_(mean=0.0, std=config.initializer_range)
         if self.text_gate_projection.bias is not None:
             self.text_gate_projection.bias.data.zero_()
@@ -1947,30 +1958,30 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
 
     def _encode_text_gate_questions(
         self,
-        bert_question_input_ids: Optional[torch.LongTensor],
-        bert_question_attention_mask: Optional[torch.Tensor],
+        sentence_bert_question_input_ids: Optional[torch.LongTensor],
+        sentence_bert_question_attention_mask: Optional[torch.Tensor],
         target_device: torch.device,
         target_dtype: torch.dtype,
     ) -> Optional[torch.Tensor]:
         if (
             self.text_gate_bert is None
             or self.text_gate_projection is None
-            or bert_question_input_ids is None
-            or bert_question_attention_mask is None
+            or sentence_bert_question_input_ids is None
+            or sentence_bert_question_attention_mask is None
         ):
             return None
 
-        bert_question_input_ids = bert_question_input_ids.to(target_device)
-        bert_question_attention_mask = bert_question_attention_mask.to(target_device)
+        sentence_bert_question_input_ids = sentence_bert_question_input_ids.to(target_device)
+        sentence_bert_question_attention_mask = sentence_bert_question_attention_mask.to(target_device)
         with torch.no_grad():
             bert_outputs = self.text_gate_bert(
-                input_ids=bert_question_input_ids,
-                attention_mask=bert_question_attention_mask,
+                input_ids=sentence_bert_question_input_ids,
+                attention_mask=sentence_bert_question_attention_mask,
                 return_dict=True,
             )
             bert_summary = self._mean_pool_text_hidden_states(
                 bert_outputs.last_hidden_state,
-                bert_question_attention_mask,
+                sentence_bert_question_attention_mask,
             )
         question_summaries = self.text_gate_projection(bert_summary.to(dtype=target_dtype))
         return question_summaries.to(device=target_device, dtype=target_dtype)
@@ -1982,11 +1993,12 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         question_summaries: Optional[torch.Tensor] = None,
         return_aux_losses: bool = False,
         return_prefix_embeddings: bool = False,
+        return_monitor_stats: bool = False,
     ):
         """Process geometry features using the geometry encoder."""
         fusion_method = str(getattr(self.config, "feature_fusion_method", "add")).lower()
         if fusion_method == "knn_concat":
-            if return_aux_losses:
+            if return_aux_losses or return_monitor_stats:
                 fused = self._process_geometry_features_knn(image_embeds, geometry_encoder_inputs)
                 if return_prefix_embeddings:
                     return fused, None, None
@@ -2008,6 +2020,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         image_cursor = 0
         aux_sums = {}
         aux_weight = None
+        monitor_moment_sums: Dict[str, torch.Tensor] = {}
         mine_unique_features = []
         mine_2d_features = []
 
@@ -2031,7 +2044,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 sample_image_embeds = sample_image_embeds.reshape(geo_embeds.shape)
                 image_cursor += sample_num_tokens
 
-                need_details = return_aux_losses or return_prefix_embeddings
+                need_details = return_aux_losses or return_prefix_embeddings or return_monitor_stats
                 if need_details:
                     sample_fused, sample_details = self.feature_fusion(
                         sample_image_embeds,
@@ -2039,6 +2052,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                         question_summary=sample_question_summary,
                         return_aux_losses=return_aux_losses,
                         return_details=return_prefix_embeddings,
+                        return_monitor_stats=return_monitor_stats,
                     )
                     sample_details = sample_details or {}
                     sample_prefix = sample_details.pop("prefix_embeddings", None)
@@ -2052,22 +2066,52 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
 
                 fused_samples.append(sample_fused.reshape(-1, sample_fused.shape[-1]))
 
-                if return_aux_losses:
-                    sample_weight = sample_fused.new_tensor(float(sample_num_tokens))
+                if return_aux_losses or return_monitor_stats:
+                    sample_weight = torch.tensor(float(sample_num_tokens), device=sample_fused.device, dtype=torch.float32)
                     aux_weight = sample_weight if aux_weight is None else aux_weight + sample_weight
-                    for key in ("loss_shared", "loss_ortho", "loss_recon", "loss_nrsr_kl", "gate_shared_ratio"):
+                    scalar_keys = (
+                        "gate_shared_ratio",
+                        "gate_missing_question_summary",
+                    )
+                    if return_aux_losses:
+                        scalar_keys = (
+                            "loss_shared",
+                            "loss_ortho",
+                            "loss_recon",
+                            "loss_nrsr_kl",
+                        ) + scalar_keys
+                    for key in scalar_keys:
                         value = sample_details.get(key)
                         if value is None:
                             continue
-                        value = value.to(sample_weight.device, sample_weight.dtype)
+                        value = value.to(device=sample_weight.device, dtype=sample_weight.dtype)
                         if key not in aux_sums:
                             aux_sums[key] = value * sample_weight
                         else:
                             aux_sums[key] = aux_sums[key] + (value * sample_weight)
-                    if sample_details.get("mine_unique_features") is not None:
-                        mine_unique_features.append(sample_details["mine_unique_features"])
-                    if sample_details.get("mine_2d_features") is not None:
-                        mine_2d_features.append(sample_details["mine_2d_features"])
+                    if return_monitor_stats:
+                        for key, value in sample_details.items():
+                            if key.endswith(("_sum", "_sq_sum", "_count")):
+                                value = value.to(device=sample_weight.device, dtype=torch.float32)
+                                if key not in monitor_moment_sums:
+                                    monitor_moment_sums[key] = value
+                                else:
+                                    monitor_moment_sums[key] = monitor_moment_sums[key] + value
+                                continue
+                            if key in scalar_keys or key in {"prefix_embeddings", "mine_unique_features", "mine_2d_features"}:
+                                continue
+                            if value is None or not torch.is_tensor(value) or value.numel() != 1:
+                                continue
+                            value = value.to(device=sample_weight.device, dtype=sample_weight.dtype)
+                            if key not in aux_sums:
+                                aux_sums[key] = value * sample_weight
+                            else:
+                                aux_sums[key] = aux_sums[key] + (value * sample_weight)
+                    if return_aux_losses:
+                        if sample_details.get("mine_unique_features") is not None:
+                            mine_unique_features.append(sample_details["mine_unique_features"])
+                        if sample_details.get("mine_2d_features") is not None:
+                            mine_2d_features.append(sample_details["mine_2d_features"])
 
             if return_prefix_embeddings:
                 if sample_prefix is None and self.learnable_prefix_len > 0:
@@ -2081,23 +2125,45 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
 
         image_embeds = torch.cat(fused_samples, dim=0) if fused_samples else image_embeds
 
-        if return_aux_losses and aux_weight is not None:
-            fusion_aux_losses = {
-                key: value / aux_weight.clamp_min(1.0)
-                for key, value in aux_sums.items()
-            }
-            if mine_unique_features:
-                fusion_aux_losses["mine_unique_features"] = torch.cat(mine_unique_features, dim=0)
-            if mine_2d_features:
-                fusion_aux_losses["mine_2d_features"] = torch.cat(mine_2d_features, dim=0)
+        if (return_aux_losses or return_monitor_stats) and (aux_weight is not None or monitor_moment_sums):
+            fusion_aux_losses = {}
+            if aux_weight is not None:
+                fusion_aux_losses.update(
+                    {
+                        key: value / aux_weight.clamp_min(1.0)
+                        for key, value in aux_sums.items()
+                    }
+                )
+            if return_monitor_stats and monitor_moment_sums:
+                stat_prefixes = sorted(
+                    key[:-len("_count")]
+                    for key in monitor_moment_sums
+                    if key.endswith("_count")
+                )
+                for prefix in stat_prefixes:
+                    count = monitor_moment_sums.get(f"{prefix}_count")
+                    stat_sum = monitor_moment_sums.get(f"{prefix}_sum")
+                    stat_sq_sum = monitor_moment_sums.get(f"{prefix}_sq_sum")
+                    if count is None or stat_sum is None or stat_sq_sum is None:
+                        continue
+                    count = count.clamp_min(1.0)
+                    mean = stat_sum / count
+                    var = (stat_sq_sum / count) - torch.square(mean)
+                    fusion_aux_losses[f"{prefix}_mean"] = mean
+                    fusion_aux_losses[f"{prefix}_std"] = torch.sqrt(var.clamp_min(0.0))
+            if return_aux_losses:
+                if mine_unique_features:
+                    fusion_aux_losses["mine_unique_features"] = torch.cat(mine_unique_features, dim=0)
+                if mine_2d_features:
+                    fusion_aux_losses["mine_2d_features"] = torch.cat(mine_2d_features, dim=0)
 
         stacked_prefix_embeddings = None
         if return_prefix_embeddings and prefix_embeddings:
             stacked_prefix_embeddings = torch.stack(prefix_embeddings, dim=0)
 
-        if return_aux_losses and return_prefix_embeddings:
+        if (return_aux_losses or return_monitor_stats) and return_prefix_embeddings:
             return image_embeds, fusion_aux_losses, stacked_prefix_embeddings
-        if return_aux_losses:
+        if return_aux_losses or return_monitor_stats:
             return image_embeds, fusion_aux_losses
         if return_prefix_embeddings:
             return image_embeds, stacked_prefix_embeddings
@@ -2108,8 +2174,14 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
         geometry_encoder_path = kwargs.pop("geometry_encoder_path", None)
         model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+        loading_info = None
+        if isinstance(model, tuple):
+            model, loading_info = model
         if geometry_encoder_path:
             model.geometry_encoder.load_model(geometry_encoder_path)
+
+        if loading_info is not None:
+            return model, loading_info
         return model
 
     def get_input_embeddings(self):
@@ -2771,6 +2843,8 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         cache_position: Optional[torch.LongTensor] = None,
         second_per_grid_ts: Optional[torch.Tensor] = None,
         geometry_encoder_inputs: Optional[List[torch.Tensor]] = None,
+        sentence_bert_question_input_ids: Optional[torch.LongTensor] = None,
+        sentence_bert_question_attention_mask: Optional[torch.Tensor] = None,
         bert_question_input_ids: Optional[torch.LongTensor] = None,
         bert_question_attention_mask: Optional[torch.Tensor] = None,
         label_weight_codes: Optional[torch.Tensor] = None,
@@ -2824,6 +2898,10 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         fusion_aux_losses = None
         dynamic_prefix_embeddings = None
+        if sentence_bert_question_input_ids is None:
+            sentence_bert_question_input_ids = bert_question_input_ids
+        if sentence_bert_question_attention_mask is None:
+            sentence_bert_question_attention_mask = bert_question_attention_mask
 
         if inputs_embeds is None:
             inputs_embeds = self.model.embed_tokens(input_ids)
@@ -2835,10 +2913,10 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 if getattr(self.config, 'use_geometry_encoder', False) and geometry_encoder_inputs is not None:
                     fusion_method = str(getattr(self.config, "feature_fusion_method", "add")).lower()
                     question_summaries = None
-                    if fusion_method == "adver":
+                    if fusion_method in {"adver", "adver_ortho"}:
                         question_summaries = self._encode_text_gate_questions(
-                            bert_question_input_ids=bert_question_input_ids,
-                            bert_question_attention_mask=bert_question_attention_mask,
+                            sentence_bert_question_input_ids=sentence_bert_question_input_ids,
+                            sentence_bert_question_attention_mask=sentence_bert_question_attention_mask,
                             target_device=inputs_embeds.device,
                             target_dtype=inputs_embeds.dtype,
                         )
@@ -2857,7 +2935,10 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                                 or float(getattr(self, "fusion_lambda_recon", 1.0)) > 0.0
                             )
                         elif fusion_method == "adver_ortho":
-                            need_fusion_aux_losses = float(getattr(self, "fusion_lambda_ortho", 1.0)) > 0.0
+                            need_fusion_aux_losses = (
+                                float(getattr(self, "fusion_lambda_ortho", 1.0)) > 0.0
+                                or getattr(self, "fusion_ortho_target_ratio", None) is not None
+                            )
                         else:
                             need_fusion_aux_losses = fusion_method in {
                                 "decompose_add",
@@ -2870,6 +2951,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                         and self.learnable_prefix_len > 0
                         and fusion_method == "adver_ortho"
                     )
+                    need_fusion_monitor_stats = labels is not None and fusion_method in {"adver", "adver_ortho"}
                     if need_fusion_aux_losses and need_dynamic_visual_prefix:
                         image_embeds, fusion_aux_losses, dynamic_prefix_embeddings = self._process_geometry_features(
                             image_embeds,
@@ -2877,6 +2959,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                             question_summaries=question_summaries,
                             return_aux_losses=True,
                             return_prefix_embeddings=True,
+                            return_monitor_stats=need_fusion_monitor_stats,
                         )
                     elif need_fusion_aux_losses:
                         image_embeds, fusion_aux_losses = self._process_geometry_features(
@@ -2884,20 +2967,38 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                             geometry_encoder_inputs,
                             question_summaries=question_summaries,
                             return_aux_losses=True,
+                            return_monitor_stats=need_fusion_monitor_stats,
                         )
                     elif need_dynamic_visual_prefix:
-                        image_embeds, dynamic_prefix_embeddings = self._process_geometry_features(
-                            image_embeds,
-                            geometry_encoder_inputs,
-                            question_summaries=question_summaries,
-                            return_prefix_embeddings=True,
-                        )
+                        if need_fusion_monitor_stats:
+                            image_embeds, fusion_aux_losses, dynamic_prefix_embeddings = self._process_geometry_features(
+                                image_embeds,
+                                geometry_encoder_inputs,
+                                question_summaries=question_summaries,
+                                return_prefix_embeddings=True,
+                                return_monitor_stats=True,
+                            )
+                        else:
+                            image_embeds, dynamic_prefix_embeddings = self._process_geometry_features(
+                                image_embeds,
+                                geometry_encoder_inputs,
+                                question_summaries=question_summaries,
+                                return_prefix_embeddings=True,
+                            )
                     else:
-                        image_embeds = self._process_geometry_features(
-                            image_embeds,
-                            geometry_encoder_inputs,
-                            question_summaries=question_summaries,
-                        )
+                        if need_fusion_monitor_stats:
+                            image_embeds, fusion_aux_losses = self._process_geometry_features(
+                                image_embeds,
+                                geometry_encoder_inputs,
+                                question_summaries=question_summaries,
+                                return_monitor_stats=True,
+                            )
+                        else:
+                            image_embeds = self._process_geometry_features(
+                                image_embeds,
+                                geometry_encoder_inputs,
+                                question_summaries=question_summaries,
+                            )
 
                 n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
                 n_image_features = image_embeds.shape[0]
@@ -3055,6 +3156,8 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         loss_recon = None
         loss_nrsr_kl = None
         gate_shared_ratio = None
+        gate_missing_question_summary = None
+        fusion_monitor_stats = None
         mine_unique_features = None
         mine_2d_features = None
         if labels is not None:
@@ -3113,6 +3216,27 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 gate_shared_ratio_raw = fusion_aux_losses.get("gate_shared_ratio")
                 if gate_shared_ratio_raw is not None:
                     gate_shared_ratio = gate_shared_ratio_raw.to(loss.device, loss.dtype)
+                gate_missing_question_summary_raw = fusion_aux_losses.get("gate_missing_question_summary")
+                if gate_missing_question_summary_raw is not None:
+                    gate_missing_question_summary = gate_missing_question_summary_raw.to(loss.device, loss.dtype)
+                fusion_monitor_stats_raw = {}
+                for key, value in fusion_aux_losses.items():
+                    if key in {
+                        "loss_shared",
+                        "loss_ortho",
+                        "loss_recon",
+                        "loss_nrsr_kl",
+                        "gate_shared_ratio",
+                        "gate_missing_question_summary",
+                        "mine_unique_features",
+                        "mine_2d_features",
+                    }:
+                        continue
+                    if value is None or not torch.is_tensor(value) or value.numel() != 1:
+                        continue
+                    fusion_monitor_stats_raw[key] = value.to(loss.device, loss.dtype)
+                if fusion_monitor_stats_raw:
+                    fusion_monitor_stats = fusion_monitor_stats_raw
                 mine_unique_features = fusion_aux_losses.get("mine_unique_features")
                 mine_2d_features = fusion_aux_losses.get("mine_2d_features")
                 if loss_shared is not None:
@@ -3140,6 +3264,8 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             loss_recon=loss_recon,
             loss_nrsr_kl=loss_nrsr_kl,
             gate_shared_ratio=gate_shared_ratio,
+            gate_missing_question_summary=gate_missing_question_summary,
+            fusion_monitor_stats=fusion_monitor_stats,
             mine_unique_features=mine_unique_features,
             mine_2d_features=mine_2d_features,
             aligned_labels=labels,
@@ -3182,10 +3308,18 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
 
         # Qwen2-5-VL position_ids are prepareed with rope_deltas in forward
         model_inputs["position_ids"] = None
-        if "bert_question_input_ids" in kwargs:
-            model_inputs["bert_question_input_ids"] = kwargs["bert_question_input_ids"]
-        if "bert_question_attention_mask" in kwargs:
-            model_inputs["bert_question_attention_mask"] = kwargs["bert_question_attention_mask"]
+        sentence_bert_question_input_ids = kwargs.get(
+            "sentence_bert_question_input_ids",
+            kwargs.get("bert_question_input_ids"),
+        )
+        sentence_bert_question_attention_mask = kwargs.get(
+            "sentence_bert_question_attention_mask",
+            kwargs.get("bert_question_attention_mask"),
+        )
+        if sentence_bert_question_input_ids is not None:
+            model_inputs["sentence_bert_question_input_ids"] = sentence_bert_question_input_ids
+        if sentence_bert_question_attention_mask is not None:
+            model_inputs["sentence_bert_question_attention_mask"] = sentence_bert_question_attention_mask
 
         if cache_position[0] != 0:
             model_inputs["pixel_values"] = None

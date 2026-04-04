@@ -1,5 +1,6 @@
 import re
 import os
+import ast
 import torch
 import pandas as pd
 from pathlib import Path
@@ -10,6 +11,7 @@ from PIL import Image
 from loguru import logger as eval_logger
 from scipy.spatial.transform import Rotation as R
 from lmms_eval.tasks.threedod.utils import EulerDepthInstance3DBoxes
+from qwen_vl.geometry_tokenization import decode_bbox_values, rewrite_prompt_text
 
 with open(Path(__file__).parent / "scanrefer.yaml", "r") as f:
     raw_data = f.readlines()
@@ -36,6 +38,8 @@ def scanrefer_doc_to_visual(doc):
 
 def scanrefer_doc_to_text(doc, lmms_eval_specific_kwargs=None):
     prompt = doc["prompt"]
+    if os.environ.get("VGLLM_GEOMETRY_TOKENS", "").lower() in {"1", "true", "yes"}:
+        prompt = rewrite_prompt_text(prompt, dataset_name="scanrefer")
     return prompt
 
 
@@ -59,7 +63,7 @@ def scanrefer_process_results(doc, results):
     for line in lines:
         if "bbox_3d" in line:
             try:
-                pred_dict = eval(line.strip())
+                pred_dict = ast.literal_eval(line.strip().strip(","))
             except Exception as e:
                 eval_logger.error(f"Error parsing bbox_3d: {line.strip()}")
             break
@@ -75,7 +79,8 @@ def scanrefer_process_results(doc, results):
             
             frame_idx = pred_dict["frame"]
             extrinsic = np.array(doc["axis_align_matrix"]) @ np.array(doc["cam2global"][frame_idx])
-            pred_bbox = scanrefer_bbox_to_9dof(pred_dict["bbox_3d"], convention="ZXY", extrinsic=extrinsic)
+            pred_bbox_values = decode_bbox_values(pred_dict["bbox_3d"])
+            pred_bbox = scanrefer_bbox_to_9dof(pred_bbox_values, convention="ZXY", extrinsic=extrinsic)
             iou = EulerDepthInstance3DBoxes.overlaps(
                 EulerDepthInstance3DBoxes(torch.tensor([pred_bbox]), convention="ZXY"),
                 EulerDepthInstance3DBoxes(torch.tensor([gt_bbox]), convention="ZXY")

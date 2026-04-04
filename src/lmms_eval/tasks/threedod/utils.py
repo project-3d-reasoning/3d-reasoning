@@ -1,5 +1,6 @@
 import re
 import os
+import ast
 import pandas as pd
 from pathlib import Path
 import yaml
@@ -13,6 +14,7 @@ from typing import Union
 from pytorch3d.ops import box3d_overlap
 from pytorch3d.transforms import euler_angles_to_matrix
 from terminaltables import AsciiTable
+from qwen_vl.geometry_tokenization import decode_bbox_values, rewrite_prompt_text
 
 cate8 = [
     "chair", "cabinet", "table", "bin", "couch", "bed", "bathtub", "toilet",
@@ -311,6 +313,8 @@ def threedod_doc_to_visual(doc):
 
 def threedod_doc_to_text(doc, lmms_eval_specific_kwargs=None):
     prompt = doc["conversations"][0]["value"].replace("<image>", "")
+    if os.environ.get("VGLLM_GEOMETRY_TOKENS", "").lower() in {"1", "true", "yes"}:
+        prompt = rewrite_prompt_text(prompt, dataset_name="threedod")
     return prompt
 
 
@@ -372,7 +376,7 @@ def threedod_process_results(doc, results):
         if "bbox_3d" not in line and "label" not in line:
             continue
         try:
-            pred_box = eval(line)
+            pred_box = ast.literal_eval(line)
             pred.append(pred_box)
         except Exception as e:
             eval_logger.error(f"Error parsing prediction bbox: {line}, Error: {e}")
@@ -385,7 +389,7 @@ def threedod_process_results(doc, results):
     
     for bbox in pred:
         try:
-            pred_bbox = np.array(bbox["bbox_3d"], dtype=float)
+            pred_bbox = np.array(decode_bbox_values(bbox["bbox_3d"]), dtype=float)
             # pred_bbox[:6] = pred_bbox[:6] / 100.
             pred_bbox_dict[bbox["label"]].append(pred_bbox)
         except Exception as e:

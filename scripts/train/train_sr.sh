@@ -58,7 +58,7 @@ FUSION_LAMBDA_WARMUP_STEPS=100
 FUSION_MINE_Q_WARMUP_STEPS=500            # q_net-only warmup updates per epoch when FUSION_ORTHO_MODE=mine
 USE_LEARNABLE_PREFIX=false
 LEARNABLE_PREFIX_LEN=0
-TEXT_GATE_BERT_NAME_OR_PATH="/data7t-root/huggingface/hub/bert"
+TEXT_GATE_SENTENCE_BERT_NAME_OR_PATH="/data7t-root/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/snapshots/c9745ed1d9f207416be6d2e6f8de32d1f16199bf"
 OUTPUT_DIR="PATH_TO_OUTPUT_DIR"                   # Directory for saving checkpoints
 CACHE_DIR="./cache"                        # [TrainingArguments] Cache directory for models
 mkdir -p "$OUTPUT_DIR"
@@ -152,5 +152,5 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --fusion_mine_q_warmup_steps $FUSION_MINE_Q_WARMUP_STEPS \
             --use_learnable_prefix $USE_LEARNABLE_PREFIX \
             --learnable_prefix_len $LEARNABLE_PREFIX_LEN \
-            --text_gate_bert_name_or_path $TEXT_GATE_BERT_NAME_OR_PATH \
+            --text_gate_sentence_bert_name_or_path $TEXT_GATE_SENTENCE_BERT_NAME_OR_PATH \
             > ${OUTPUT_DIR}/train.log 2>&1

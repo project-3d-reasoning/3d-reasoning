@@ -1,10 +1,15 @@
 """Feature fusion modules for combining 2D and 3D features."""
 
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple, Union
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Optional, Tuple, Union
-from dataclasses import dataclass
+from transformers.utils import logging
+
+
+logger = logging.get_logger(__name__)
 
 
 @dataclass
@@ -18,6 +23,8 @@ class FeatureFusionConfig:
     decompose_hidden_size: Optional[int] = None
     nrsr_hidden_size: Optional[int] = None
     recon_mask_ratio: float = 0.3  # Patch/token mask ratio for masked reconstruction in adver mode.
+    gate_temperature: float = 1.0  # Temperature used by the adver gate sigmoid; smaller values make the gate sharper.
+    gate_question_dim: int = 16  # Output dim of the gate-side linear projection applied to question_summary.
     adver_compute_align_loss: bool = False  # Keep align-loss code path available, but disable it by default in adver/adver_ortho training to save time.
     align_mode: str = "cosine"  # "cosine"(default) or "infonce"
     align_temperature: float = 0.07
@@ -245,6 +252,39 @@ class FeatureFusionModule(nn.Module):
             )
         
         self._build_fusion_layers()
+
+    def load_state_dict(self, state_dict, strict=True):
+        """Map legacy `adver_shared_input_norm` (pre-MLP LN) to `adver_shared_output_norm` (post-MLP LN)."""
+        remapped = {}
+        for k, v in state_dict.items():
+            if k.startswith("adver_shared_input_norm."):
+                remapped[k.replace("adver_shared_input_norm.", "adver_shared_output_norm.", 1)] = v
+            else:
+                remapped[k] = v
+        gate_question_dim = int(getattr(self.config, "gate_question_dim", 16))
+        expected_shapes = {
+            "adver_gate_question_proj.weight": (gate_question_dim, self.hidden_size),
+            "adver_gate_question_proj.bias": (gate_question_dim,),
+            "adver_gate_question_norm.weight": (gate_question_dim,),
+            "adver_gate_question_norm.bias": (gate_question_dim,),
+            "adver_gate_mlp.0.weight": (
+                max(self.hidden_size, min(self.hidden_size * 2, max(int(self.config.decompose_hidden_size or self.hidden_size), self.hidden_size))),
+                512 + gate_question_dim,
+            ),
+        }
+        filtered = {}
+        for key, value in remapped.items():
+            expected_shape = expected_shapes.get(key)
+            if expected_shape is not None and tuple(value.shape) != tuple(expected_shape):
+                logger.warning(
+                    "Skipping mismatched feature-fusion gate parameter %s: checkpoint shape %s != model shape %s",
+                    key,
+                    tuple(value.shape),
+                    expected_shape,
+                )
+                continue
+            filtered[key] = value
+        return super().load_state_dict(filtered, strict=strict)
 
     def _compute_align_loss(self, shared_3d_f: torch.Tensor, features_2d_f: torch.Tensor) -> torch.Tensor:
         if self.align_mode == "infonce":
@@ -531,44 +571,111 @@ class FeatureFusionModule(nn.Module):
     def _compute_gated_shared_ratio(
         self,
         gated_shared_3d: torch.Tensor,
-        features_2d: torch.Tensor,
+        gated_feature_2d: torch.Tensor,
     ) -> torch.Tensor:
         with torch.no_grad():
             gated_norm = torch.linalg.vector_norm(gated_shared_3d.float(), dim=-1)
-            feature_norm = torch.linalg.vector_norm(features_2d.float(), dim=-1).clamp_min(1e-6)
+            feature_norm = torch.linalg.vector_norm(gated_feature_2d.float(), dim=-1).clamp_min(1e-6)
             return (gated_norm / feature_norm).mean()
+
+    def _build_tensor_moment_stats(self, name: str, tensor: torch.Tensor) -> Dict[str, torch.Tensor]:
+        with torch.no_grad():
+            tensor_f = tensor.detach().float()
+            return {
+                f"{name}_sum": tensor_f.sum(),
+                f"{name}_sq_sum": torch.square(tensor_f).sum(),
+                f"{name}_count": tensor_f.new_tensor(float(tensor_f.numel())),
+            }
+
+    def _build_channel_reduced_scalar_stats(self, name: str, tensor: torch.Tensor) -> Dict[str, torch.Tensor]:
+        with torch.no_grad():
+            tensor_f = tensor.detach().float()
+            channel_mean = tensor_f.mean(dim=-1)
+            channel_std = tensor_f.std(dim=-1, unbiased=False)
+            return {
+                f"{name}_mean": channel_mean.mean(),
+                f"{name}_std": channel_std.mean(),
+            }
+
+    def _build_adver_monitor_moments(
+        self,
+        features_2d: torch.Tensor,
+        feature_3d: torch.Tensor,
+        gated_feature_3d: torch.Tensor,
+        gate_3d: Optional[torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        stats: Dict[str, torch.Tensor] = {}
+        stats.update(self._build_tensor_moment_stats("feature_2d", features_2d))
+        stats.update(self._build_tensor_moment_stats("feature_3d", feature_3d))
+        stats.update(self._build_tensor_moment_stats("gated_feature_3d", gated_feature_3d))
+        if gate_3d is None:
+            with torch.no_grad():
+                base = feature_3d.detach().float()
+                stats["gate_3d_mean"] = base.new_tensor(1.0)
+                stats["gate_3d_std"] = base.new_tensor(0.0)
+        else:
+            stats.update(self._build_channel_reduced_scalar_stats("gate_3d", gate_3d))
+        return stats
 
     def _apply_question_guided_shared_gate(
         self,
         features_2d: torch.Tensor,
-        shared_3d_hidden: torch.Tensor,
+        feature_3d: torch.Tensor,
         question_summary: Optional[torch.Tensor],
         return_gate_ratio: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
         if question_summary is None:
+            logger.warning(
+                "Question-guided shared gate was requested, but question_summary is None; "
+                "falling back to ungated 3D features."
+            )
             gate_shared_ratio = None
             if return_gate_ratio:
-                gate_shared_ratio = self._compute_gated_shared_ratio(shared_3d_hidden, features_2d)
-            return shared_3d_hidden, gate_shared_ratio
+                gate_shared_ratio = self._compute_gated_shared_ratio(feature_3d, features_2d)
+            fused = features_2d + feature_3d
+            return fused, feature_3d, gate_shared_ratio, None
 
         question_summary = question_summary.to(device=features_2d.device, dtype=features_2d.dtype)
-        features_2d_norm = self.adver_gate_2d_norm(features_2d)
-        question_summary_norm = self.adver_gate_question_norm(question_summary)
-        question_summary_expanded = question_summary_norm.view(1, 1, 1, -1).expand_as(features_2d_norm)
+        feature_delta = torch.abs(feature_3d - features_2d)
+        feature_delta_proj = self.adver_gate_diff_norm(self.adver_gate_diff_proj(feature_delta))
+        question_summary_proj = self.adver_gate_question_norm(self.adver_gate_question_proj(question_summary))
+        question_summary_expanded = question_summary_proj.view(1, 1, 1, -1).expand(
+            feature_delta_proj.shape[0],
+            feature_delta_proj.shape[1],
+            feature_delta_proj.shape[2],
+            question_summary_proj.shape[-1],
+        )
         gate_input = torch.cat(
             [
-                features_2d_norm,
+                feature_delta_proj,
                 question_summary_expanded,
-                features_2d_norm * question_summary_expanded,
             ],
             dim=-1,
         )
-        gate = torch.sigmoid(self.adver_gate_mlp(gate_input))
-        gated_shared_3d = shared_3d_hidden * gate
+        gate_logits = self.adver_gate_mlp(gate_input)
+        gate_temperature = max(float(getattr(self.config, "gate_temperature", 1.0)), 1e-6)
+        # Use a channel-wise gate so each patch can reweight 2D/3D features
+        # independently per hidden dimension instead of sharing a single scalar.
+        gate_3d = torch.sigmoid(gate_logits / gate_temperature)
+        gated_feature_3d = feature_3d * gate_3d
+        fused = features_2d + gated_feature_3d
         gate_shared_ratio = None
         if return_gate_ratio:
-            gate_shared_ratio = self._compute_gated_shared_ratio(gated_shared_3d, features_2d)
-        return gated_shared_3d, gate_shared_ratio
+            gate_shared_ratio = self._compute_gated_shared_ratio(gated_feature_3d, features_2d)
+        return fused, gated_feature_3d, gate_shared_ratio, gate_3d
+
+    def reset_adver_gate_bias(self, value: float = -2.0, weight_scale: float = 0.01) -> None:
+        gate_mlp = getattr(self, "adver_gate_mlp", None)
+        final_linear = gate_mlp[-1] if isinstance(gate_mlp, nn.Sequential) and len(gate_mlp) > 0 else None
+        if isinstance(final_linear, nn.Linear):
+            nn.init.uniform_(final_linear.weight, -float(weight_scale), float(weight_scale))
+            if final_linear.bias is not None:
+                nn.init.constant_(final_linear.bias, float(value))
     
     def _build_fusion_layers(self):
         """Build fusion layers based on method."""
@@ -637,6 +744,10 @@ class FeatureFusionModule(nn.Module):
                 self.hidden_size,
                 min(self.hidden_size * 2, max(adver_latent_size, self.hidden_size)),
             )
+            adver_gate_proj_dim = 512
+            adver_gate_question_dim = int(getattr(self.config, "gate_question_dim", 16))
+            if adver_gate_question_dim <= 0:
+                raise ValueError("gate_question_dim must be positive when using adver/adver_ortho fusion.")
             recon_hidden = max(self.hidden_size, min(self.hidden_size * 2, adver_latent_size * 2))
             self.adver_prefix_len = max(int(getattr(self.config, "prefix_len", 0) or 0), 0)
             self.adver_shared_encoder = self._build_projection_mlp(
@@ -644,10 +755,13 @@ class FeatureFusionModule(nn.Module):
                 self.hidden_size,
                 hidden_dim=adver_hidden,
             )
-            self.adver_gate_2d_norm = nn.LayerNorm(self.hidden_size)
-            self.adver_gate_question_norm = nn.LayerNorm(self.hidden_size)
+            self.adver_shared_output_norm = nn.LayerNorm(self.hidden_size)
+            self.adver_gate_diff_proj = nn.Linear(self.hidden_size, adver_gate_proj_dim)
+            self.adver_gate_question_proj = nn.Linear(self.hidden_size, adver_gate_question_dim)
+            self.adver_gate_diff_norm = nn.LayerNorm(adver_gate_proj_dim)
+            self.adver_gate_question_norm = nn.LayerNorm(adver_gate_question_dim)
             self.adver_gate_mlp = nn.Sequential(
-                nn.Linear(self.hidden_size * 3, adver_hidden),
+                nn.Linear(adver_gate_proj_dim + adver_gate_question_dim, adver_hidden),
                 nn.GELU(),
                 nn.Dropout(self.config.dropout),
                 nn.Linear(adver_hidden, self.hidden_size),
@@ -1044,6 +1158,7 @@ class FeatureFusionModule(nn.Module):
         question_summary: Optional[torch.Tensor] = None,
         return_aux_losses: bool = False,
         return_details: bool = False,
+        return_monitor_stats: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         _, h_grid, w_grid, _ = features_3d.shape
         if self.fusion_method == "add":
@@ -1083,63 +1198,88 @@ class FeatureFusionModule(nn.Module):
             return self._knn_cross_attention(features_2d, features_3d, patch_world, patch_valid)
 
         elif self.fusion_method == "adver":
-            shared_3d_hidden = self.adver_shared_encoder(features_3d)
-            shared_3d_fused, gate_shared_ratio = self._apply_question_guided_shared_gate(
+            shared_3d_hidden = self.adver_shared_output_norm(self.adver_shared_encoder(features_3d))
+            fused, feature_3d_fused, gate_shared_ratio, gate_3d = self._apply_question_guided_shared_gate(
                 features_2d,
-                shared_3d_hidden,
+                features_3d,
                 question_summary,
-                return_gate_ratio=return_aux_losses or return_details,
+                return_gate_ratio=return_aux_losses or return_monitor_stats,
             )
-            fused = features_2d + shared_3d_fused
 
-            if not return_aux_losses and not return_details:
+            if not return_aux_losses and not return_details and not return_monitor_stats:
                 return fused
 
-            align_loss = None
-            if self.config.adver_compute_align_loss:
-                align_2d = self.adver_align_proj_2d(features_2d)
-                align_3d = self.adver_align_proj_3d(shared_3d_hidden)
-                align_loss = self._compute_align_loss(align_3d.float(), align_2d.float())
+            aux_losses: Dict[str, torch.Tensor] = {}
+            if return_monitor_stats:
+                aux_losses.update(
+                    self._build_adver_monitor_moments(
+                        features_2d,
+                        features_3d,
+                        feature_3d_fused,
+                        gate_3d,
+                    )
+                )
+            if return_aux_losses or return_monitor_stats:
+                if gate_shared_ratio is not None:
+                    aux_losses["gate_shared_ratio"] = gate_shared_ratio
+                aux_losses["gate_missing_question_summary"] = features_2d.new_tensor(
+                    1.0 if question_summary is None else 0.0
+                )
 
-            masked_positions = self._build_patch_recon_mask(features_2d)
-            recon_2d = self._reconstruct_2d_from_cross_attention(shared_3d_hidden, features_2d)
-            recon_loss = self._compute_masked_recon_loss(recon_2d, features_2d, masked_positions)
+            if return_aux_losses:
+                align_loss = None
+                if self.config.adver_compute_align_loss:
+                    align_2d = self.adver_align_proj_2d(features_2d)
+                    align_3d = self.adver_align_proj_3d(shared_3d_hidden)
+                    align_loss = self._compute_align_loss(align_3d.float(), align_2d.float())
 
-            aux_losses = {
-                "loss_recon": recon_loss,
-                "gate_shared_ratio": gate_shared_ratio,
-            }
-            if align_loss is not None:
-                aux_losses["loss_shared"] = align_loss
+                masked_positions = self._build_patch_recon_mask(features_2d)
+                recon_2d = self._reconstruct_2d_from_cross_attention(shared_3d_hidden, features_2d)
+                recon_loss = self._compute_masked_recon_loss(recon_2d, features_2d, masked_positions)
+                aux_losses["loss_recon"] = recon_loss
+                if align_loss is not None:
+                    aux_losses["loss_shared"] = align_loss
             return fused, aux_losses
 
         elif self.fusion_method == "adver_ortho":
-            shared_3d_hidden = self.adver_shared_encoder(features_3d)
+            shared_3d_hidden = self.adver_shared_output_norm(self.adver_shared_encoder(features_3d))
             unique_3d_hidden = self.adver_unique_encoder(features_3d)
-            # Keep the question-guided gate implementation available, but bypass it in
-            # adver_ortho so the shared branch is always fully used.
-            shared_3d_fused = shared_3d_hidden
-            fused = features_2d + shared_3d_fused
+            fused, feature_3d_fused, gate_shared_ratio, gate_3d = self._apply_question_guided_shared_gate(
+                features_2d,
+                features_3d,
+                question_summary,
+                return_gate_ratio=return_aux_losses or return_monitor_stats,
+            )
 
             prefix_embeddings = None
             if return_details:
                 prefix_embeddings = self._compress_adver_prefix(unique_3d_hidden)
 
-            if not return_aux_losses and not return_details:
+            if not return_aux_losses and not return_details and not return_monitor_stats:
                 return fused
 
             aux_losses = {}
+            if return_monitor_stats:
+                aux_losses.update(
+                    self._build_adver_monitor_moments(
+                        features_2d,
+                        features_3d,
+                        feature_3d_fused,
+                        gate_3d,
+                    )
+                )
+            if return_aux_losses or return_monitor_stats:
+                if gate_shared_ratio is not None:
+                    aux_losses["gate_shared_ratio"] = gate_shared_ratio
+                aux_losses["gate_missing_question_summary"] = features_2d.new_tensor(
+                    1.0 if question_summary is None else 0.0
+                )
             if return_aux_losses:
                 shared_flat = shared_3d_hidden.float().reshape(-1, shared_3d_hidden.shape[-1])
                 unique_flat = unique_3d_hidden.float().reshape(-1, unique_3d_hidden.shape[-1])
                 ortho_loss = self._compute_rbf_hsic_flat(unique_flat, shared_flat)
 
-                aux_losses.update(
-                    {
-                        "loss_ortho": ortho_loss,
-                        "gate_shared_ratio": features_2d.new_tensor(1.0),
-                    }
-                )
+                aux_losses["loss_ortho"] = ortho_loss
             if prefix_embeddings is not None:
                 aux_losses["prefix_embeddings"] = prefix_embeddings
             return fused, aux_losses

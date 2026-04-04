@@ -28,10 +28,12 @@ from transformers.trainer import (
 from transformers.trainer_utils import seed_worker
 
 from qwen_vl.label_weighting import (
+    LABEL_WEIGHT_CODE_SCANREFER_FRAME,
     LABEL_WEIGHT_CODE_SCANREFER_BBOX,
     LABEL_WEIGHT_CODE_SCANNET_DET_BBOX,
     get_label_weight_value_table,
 )
+from qwen_vl.geometry_tokenization import parse_bbox_inner_values
 
 
 _NUMBER_PATTERN = re.compile(r"-?\d+(?:\.\d+)?")
@@ -224,174 +226,13 @@ def print_trainable_parameters(self) -> None:
 
 
 def create_optimizer(self):
-
-    opt_model = self.model
-
     if self.optimizer is None:
-        decay_parameters = get_parameter_names(opt_model, ALL_LAYERNORM_LAYERS)
-        decay_parameters = [name for name in decay_parameters if "bias" not in name]
-        if self.args.mm_projector_lr is not None and self.args.mm_projector_lr != 0:
-            projector_parameters = [
-                name for name, _ in opt_model.named_parameters() if "merger" in name
-            ]
-            if self.args.vision_tower_lr is not None and self.args.vision_tower_lr != 0:
-                vision_tower_parameters = [
-                    name for name, _ in opt_model.named_parameters() if "visual" in name
-                ]
-                optimizer_grouped_parameters = [
-                    {
-                        "params": [
-                            p
-                            for n, p in opt_model.named_parameters()
-                            if (
-                                n in decay_parameters
-                                and n not in projector_parameters
-                                and n not in vision_tower_parameters
-                                and p.requires_grad
-                            )
-                        ],
-                        "weight_decay": self.args.weight_decay,
-                    },
-                    {
-                        "params": [
-                            p
-                            for n, p in opt_model.named_parameters()
-                            if (
-                                n in decay_parameters
-                                and n not in projector_parameters
-                                and n in vision_tower_parameters
-                                and p.requires_grad
-                            )
-                        ],
-                        "weight_decay": self.args.weight_decay,
-                        "lr": self.args.vision_tower_lr,
-                    },
-                    {
-                        "params": [
-                            p
-                            for n, p in opt_model.named_parameters()
-                            if (
-                                n not in decay_parameters
-                                and n not in projector_parameters
-                                and n not in vision_tower_parameters
-                                and p.requires_grad
-                            )
-                        ],
-                        "weight_decay": 0.0,
-                    },
-                    {
-                        "params": [
-                            p
-                            for n, p in opt_model.named_parameters()
-                            if (
-                                n not in decay_parameters
-                                and n not in projector_parameters
-                                and n in vision_tower_parameters
-                                and p.requires_grad
-                            )
-                        ],
-                        "weight_decay": 0.0,
-                        "lr": self.args.vision_tower_lr,
-                    },
-                    {
-                        "params": [
-                            p
-                            for n, p in opt_model.named_parameters()
-                            if (
-                                n in decay_parameters
-                                and n in projector_parameters
-                                and p.requires_grad
-                            )
-                        ],
-                        "weight_decay": self.args.weight_decay,
-                        "lr": self.args.mm_projector_lr,
-                    },
-                    {
-                        "params": [
-                            p
-                            for n, p in opt_model.named_parameters()
-                            if (
-                                n not in decay_parameters
-                                and n in projector_parameters
-                                and p.requires_grad
-                            )
-                        ],
-                        "weight_decay": 0.0,
-                        "lr": self.args.mm_projector_lr,
-                    },
-                ]
-            else:
-                optimizer_grouped_parameters = [
-                    {
-                        "params": [
-                            p
-                            for n, p in opt_model.named_parameters()
-                            if (
-                                n in decay_parameters
-                                and n not in projector_parameters
-                                and p.requires_grad
-                            )
-                        ],
-                        "weight_decay": self.args.weight_decay,
-                    },
-                    {
-                        "params": [
-                            p
-                            for n, p in opt_model.named_parameters()
-                            if (
-                                n not in decay_parameters
-                                and n not in projector_parameters
-                                and p.requires_grad
-                            )
-                        ],
-                        "weight_decay": 0.0,
-                    },
-                    {
-                        "params": [
-                            p
-                            for n, p in opt_model.named_parameters()
-                            if (
-                                n in decay_parameters
-                                and n in projector_parameters
-                                and p.requires_grad
-                            )
-                        ],
-                        "weight_decay": self.args.weight_decay,
-                        "lr": self.args.mm_projector_lr,
-                    },
-                    {
-                        "params": [
-                            p
-                            for n, p in opt_model.named_parameters()
-                            if (
-                                n not in decay_parameters
-                                and n in projector_parameters
-                                and p.requires_grad
-                            )
-                        ],
-                        "weight_decay": 0.0,
-                        "lr": self.args.mm_projector_lr,
-                    },
-                ]
-        else:
-            optimizer_grouped_parameters = [
-                {
-                    "params": [
-                        p
-                        for n, p in opt_model.named_parameters()
-                        if (n in decay_parameters and p.requires_grad)
-                    ],
-                    "weight_decay": self.args.weight_decay,
-                },
-                {
-                    "params": [
-                        p
-                        for n, p in opt_model.named_parameters()
-                        if (n not in decay_parameters and p.requires_grad)
-                    ],
-                    "weight_decay": 0.0,
-                },
-            ]
+        named_parameters = {
+            name: param for name, param in self.model.named_parameters() if param.requires_grad
+        }
+        optimizer_grouped_parameters = _build_optimizer_grouped_parameters(
+            self, named_parameters
+        )
 
         optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(
             self.args
@@ -399,6 +240,89 @@ def create_optimizer(self):
         self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
 
     return self.optimizer
+
+
+def _build_optimizer_grouped_parameters(
+    trainer: Trainer, named_parameters: Dict[str, torch.nn.Parameter]
+) -> List[Dict[str, Any]]:
+    if not named_parameters:
+        return []
+
+    opt_model = trainer.model
+    decay_parameters = set(get_parameter_names(opt_model, ALL_LAYERNORM_LAYERS))
+    decay_parameters = {name for name in decay_parameters if "bias" not in name}
+    projector_lr = getattr(trainer.args, "mm_projector_lr", None)
+    vision_tower_lr = getattr(trainer.args, "vision_tower_lr", None)
+    fusion_gate_lr = getattr(trainer.args, "fusion_gate_lr", None)
+    fusion_feature_3d_lr = getattr(trainer.args, "fusion_feature_3d_lr", None)
+
+    projector_parameters = set()
+    if projector_lr is not None and projector_lr != 0:
+        projector_parameters = {
+            name for name, _ in opt_model.named_parameters() if "merger" in name
+        }
+
+    vision_tower_parameters = set()
+    if vision_tower_lr is not None and vision_tower_lr != 0:
+        vision_tower_parameters = {
+            name for name, _ in opt_model.named_parameters() if "visual" in name
+        }
+
+    gate_parameters = set()
+    if fusion_gate_lr is not None and fusion_gate_lr != 0:
+        gate_parameters = {
+            name
+            for name, _ in opt_model.named_parameters()
+            if name.startswith("feature_fusion.adver_gate_")
+            or name.startswith("text_gate_projection")
+        }
+
+    feature_3d_parameters = set()
+    if fusion_feature_3d_lr is not None and fusion_feature_3d_lr != 0:
+        feature_3d_prefixes = (
+            "feature_fusion.adver_shared_encoder",
+            "feature_fusion.adver_unique_encoder",
+            "feature_fusion.adver_align_proj_3d",
+            "feature_fusion.adver_reconstruct_cross_attention",
+            "feature_fusion.adver_reconstruct_memory_norm",
+            "feature_fusion.adver_reconstruct_query_norm",
+            "feature_fusion.adver_reconstruct_output_norm",
+            "feature_fusion.adver_reconstruct_mlp",
+            "feature_fusion.adver_reconstruct_2d",
+        )
+        feature_3d_parameters = {
+            name for name, _ in opt_model.named_parameters() if name.startswith(feature_3d_prefixes)
+        }
+
+    def _get_group_lr(name: str) -> Optional[float]:
+        if name in projector_parameters:
+            return float(projector_lr)
+        if name in gate_parameters:
+            return float(fusion_gate_lr)
+        if name in feature_3d_parameters:
+            return float(fusion_feature_3d_lr)
+        if name in vision_tower_parameters and name not in projector_parameters:
+            return float(vision_tower_lr)
+        return None
+
+    grouped_parameter_names: Dict[Tuple[float, Optional[float]], List[str]] = {}
+    for name in named_parameters:
+        weight_decay = trainer.args.weight_decay if name in decay_parameters else 0.0
+        group_key = (float(weight_decay), _get_group_lr(name))
+        grouped_parameter_names.setdefault(group_key, []).append(name)
+
+    optimizer_grouped_parameters = []
+    for (weight_decay, group_lr), group_names in grouped_parameter_names.items():
+        if not group_names:
+            continue
+        group = {
+            "params": [named_parameters[name] for name in group_names],
+            "weight_decay": weight_decay,
+        }
+        if group_lr is not None:
+            group["lr"] = group_lr
+        optimizer_grouped_parameters.append(group)
+    return optimizer_grouped_parameters
 
 
 class VGTrainer(Trainer):
@@ -418,6 +342,7 @@ class VGTrainer(Trainer):
         self._aux_monitor_logs: Dict[str, float] = {}
         self._aux_monitor_sums: Dict[str, float] = {}
         self._aux_monitor_counts: Dict[str, int] = {}
+        self._latest_dynamic_iou_stats: Dict[str, float] = self._default_dynamic_iou_monitor_stats()
         # EMA for monitoring and dynamic lambda adjustment of decompose auxiliary losses.
         self._loss_ce_ema: Optional[float] = None
         self._aux_loss_emas: Dict[str, float] = {}
@@ -447,6 +372,14 @@ class VGTrainer(Trainer):
             },
         }
 
+    @staticmethod
+    def _default_dynamic_iou_monitor_stats() -> Dict[str, float]:
+        return {
+            "dynamic_iou_scanrefer_success_rate": 0.0,
+            "dynamic_iou_scannet_det_success_rate": 0.0,
+            "dynamic_iou_success_rate": 0.0,
+        }
+
     def _unwrap_model(self, model: torch.nn.Module) -> torch.nn.Module:
         while hasattr(model, "module"):
             model = model.module
@@ -470,12 +403,37 @@ class VGTrainer(Trainer):
             return outputs.get(name)
         return getattr(outputs, name, None)
 
+    def _reduce_output_scalar(self, value: Any, loss: torch.Tensor) -> Optional[float]:
+        if value is None:
+            return None
+        if torch.is_tensor(value):
+            reduced = value.to(loss.device, loss.dtype).detach().float()
+            if reduced.numel() != 1:
+                reduced = reduced.mean()
+        else:
+            reduced = torch.tensor(float(value), device=loss.device, dtype=torch.float32)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            world_size = torch.distributed.get_world_size()
+            torch.distributed.all_reduce(reduced, op=torch.distributed.ReduceOp.SUM)
+            reduced = reduced / world_size
+        return float(reduced.item())
+
     def _get_dynamic_iou_params(self, model: torch.nn.Module) -> Tuple[float, float]:
         base_model = self._unwrap_model(model)
         config = getattr(base_model, "config", None)
         alpha = float(getattr(config, "label_weight_dynamic_iou_alpha", 0.0) or 0.0)
         eps = float(getattr(config, "label_weight_dynamic_iou_eps", 1e-6) or 1e-6)
         return alpha, max(eps, 1e-12)
+
+    def _should_skip_invalid_dynamic_iou(self, model: torch.nn.Module) -> bool:
+        base_model = self._unwrap_model(model)
+        config = getattr(base_model, "config", None)
+        return bool(getattr(config, "label_weight_dynamic_iou_skip_invalid", True))
+
+    def _normalize_label_weight_by_weight_sum(self, model: torch.nn.Module) -> bool:
+        base_model = self._unwrap_model(model)
+        config = getattr(base_model, "config", None)
+        return bool(getattr(config, "label_weight_loss_normalize_by_weight_sum", True))
 
     def _get_tokenizer(self):
         tokenizer = getattr(self, "processing_class", None)
@@ -487,6 +445,9 @@ class VGTrainer(Trainer):
 
     @staticmethod
     def _parse_bbox_numbers(text: str) -> Optional[List[float]]:
+        parsed_values = parse_bbox_inner_values(text)
+        if parsed_values is not None:
+            return parsed_values
         numbers = _NUMBER_PATTERN.findall(text)
         if len(numbers) != 9:
             return None
@@ -632,7 +593,10 @@ class VGTrainer(Trainer):
         if tokenizer is None:
             return token_weights
 
-        has_scanrefer = bool((shift_label_weight_codes == LABEL_WEIGHT_CODE_SCANREFER_BBOX).any())
+        has_scanrefer = bool(
+            (shift_label_weight_codes == LABEL_WEIGHT_CODE_SCANREFER_BBOX).any()
+            or (shift_label_weight_codes == LABEL_WEIGHT_CODE_SCANREFER_FRAME).any()
+        )
         has_scannet_det = bool((shift_label_weight_codes == LABEL_WEIGHT_CODE_SCANNET_DET_BBOX).any())
         if not has_scanrefer and not has_scannet_det:
             return token_weights
@@ -640,15 +604,27 @@ class VGTrainer(Trainer):
         dynamic_weights = token_weights.detach().clone()
         pred_ids = shift_logits.argmax(dim=-1).detach().cpu()
         label_ids = shift_labels.detach().cpu()
+        skip_invalid_dynamic_iou = self._should_skip_invalid_dynamic_iou(model)
         scanrefer_targets = inputs.get("scanrefer_targets") or []
         scannet_det_boxes = inputs.get("scannet_det_boxes") or []
+        scanrefer_needed_samples = 0
+        scanrefer_success_samples = 0
+        scannet_det_needed_samples = 0
+        scannet_det_success_samples = 0
 
         for sample_idx in range(shift_labels.size(0)):
             sample_codes = shift_label_weight_codes[sample_idx]
-            needs_scanrefer = bool((sample_codes == LABEL_WEIGHT_CODE_SCANREFER_BBOX).any())
+            needs_scanrefer = bool(
+                (sample_codes == LABEL_WEIGHT_CODE_SCANREFER_BBOX).any()
+                or (sample_codes == LABEL_WEIGHT_CODE_SCANREFER_FRAME).any()
+            )
             needs_scannet_det = bool((sample_codes == LABEL_WEIGHT_CODE_SCANNET_DET_BBOX).any())
             if not needs_scanrefer and not needs_scannet_det:
                 continue
+            if needs_scanrefer:
+                scanrefer_needed_samples += 1
+            if needs_scannet_det:
+                scannet_det_needed_samples += 1
 
             pred_text = self._decode_supervised_text(tokenizer, pred_ids[sample_idx], label_ids[sample_idx])
             gt_text = self._decode_supervised_text(tokenizer, label_ids[sample_idx], label_ids[sample_idx])
@@ -668,18 +644,23 @@ class VGTrainer(Trainer):
                             gt_box = None
                 pred_frame, pred_box = self._parse_scanrefer_prediction(pred_text)
                 scanrefer_iou = 0.0
-                if (
-                    gt_frame is not None
-                    and pred_frame is not None
-                    and gt_box is not None
-                    and pred_box is not None
+                valid_scanrefer_target = gt_frame is not None and gt_box is not None
+                valid_scanrefer_pred = pred_frame is not None and pred_box is not None
+                scanrefer_mask = sample_codes.eq(LABEL_WEIGHT_CODE_SCANREFER_BBOX) | sample_codes.eq(
+                    LABEL_WEIGHT_CODE_SCANREFER_FRAME
+                )
+                can_compute_iou = (
+                    valid_scanrefer_target
+                    and valid_scanrefer_pred
                     and pred_frame == gt_frame
-                ):
-                    scanrefer_iou = self._compute_box_iou(pred_box, gt_box)
+                )
+                if not can_compute_iou:
+                    continue
+                scanrefer_success_samples += 1
+                scanrefer_iou = self._compute_box_iou(pred_box, gt_box)
                 scanrefer_weight = self._clamp_dynamic_weight(1.0 - alpha * math.log(scanrefer_iou + eps))
-                bbox_mask = sample_codes == LABEL_WEIGHT_CODE_SCANREFER_BBOX
                 dynamic_weights[sample_idx] = torch.where(
-                    bbox_mask,
+                    scanrefer_mask,
                     dynamic_weights[sample_idx].new_tensor(scanrefer_weight).detach(),
                     dynamic_weights[sample_idx],
                 )
@@ -693,6 +674,7 @@ class VGTrainer(Trainer):
                 gt_text_box_list = [bbox for bbox, _, _ in gt_box_matches]
 
                 if gt_box_list and gt_text_box_list and len(gt_box_list) == len(gt_text_box_list):
+                    scannet_det_success_samples += 1
                     box_ious = self._compute_ordered_box_ious(pred_box_list, gt_box_list)
                     valid_positions = torch.nonzero(shift_labels[sample_idx].ne(-100), as_tuple=False).squeeze(-1)
                     for box_idx, (_, char_start, char_end) in enumerate(gt_box_matches):
@@ -725,6 +707,18 @@ class VGTrainer(Trainer):
                             dynamic_weights[sample_idx],
                         )
 
+        needed_samples = scanrefer_needed_samples + scannet_det_needed_samples
+        success_samples = scanrefer_success_samples + scannet_det_success_samples
+        self._latest_dynamic_iou_stats = {
+            "dynamic_iou_scanrefer_success_rate": float(
+                scanrefer_success_samples / max(scanrefer_needed_samples, 1)
+            ),
+            "dynamic_iou_scannet_det_success_rate": float(
+                scannet_det_success_samples / max(scannet_det_needed_samples, 1)
+            ),
+            "dynamic_iou_success_rate": float(success_samples / max(needed_samples, 1)),
+        }
+
         return dynamic_weights
 
     def _recompute_label_weighted_loss(
@@ -734,6 +728,7 @@ class VGTrainer(Trainer):
         outputs: Any,
         fallback_loss: torch.Tensor,
     ) -> torch.Tensor:
+        self._latest_dynamic_iou_stats = self._default_dynamic_iou_monitor_stats()
         labels = self._get_output_field(outputs, "aligned_labels")
         if labels is None:
             labels = inputs.get("labels")
@@ -772,6 +767,7 @@ class VGTrainer(Trainer):
             alpha, _ = self._get_dynamic_iou_params(model)
             has_dynamic_codes = bool(
                 (shift_label_weight_codes == LABEL_WEIGHT_CODE_SCANREFER_BBOX).any()
+                or (shift_label_weight_codes == LABEL_WEIGHT_CODE_SCANREFER_FRAME).any()
                 or (shift_label_weight_codes == LABEL_WEIGHT_CODE_SCANNET_DET_BBOX).any()
             )
             if alpha > 0.0 and has_dynamic_codes:
@@ -788,9 +784,18 @@ class VGTrainer(Trainer):
         flat_labels = shift_labels.view(-1)
         flat_weights = token_weights.view(-1)
         token_loss = torch.nn.functional.cross_entropy(flat_logits, flat_labels, reduction="none")
+        normalize_by_weight_sum = self._normalize_label_weight_by_weight_sum(model)
         weight_sum = flat_weights.sum()
         if float(weight_sum.item()) > 0.0:
-            loss_ce = (token_loss * flat_weights).sum() / weight_sum
+            weighted_loss_sum = (token_loss * flat_weights).sum()
+            if normalize_by_weight_sum:
+                loss_ce = weighted_loss_sum / weight_sum
+            else:
+                valid_count = flat_labels.ne(-100).sum().to(weighted_loss_sum.dtype)
+                if float(valid_count.item()) > 0.0:
+                    loss_ce = weighted_loss_sum / valid_count
+                else:
+                    loss_ce = weighted_loss_sum.new_zeros(())
         elif bool(valid_mask.any()):
             loss_ce = token_loss[flat_labels.ne(-100)].mean()
         else:
@@ -1000,6 +1005,11 @@ class VGTrainer(Trainer):
             return
 
         base_model = self._unwrap_model(model)
+        aux_logs: Dict[str, float] = {
+            "loss_ce": float(loss.detach().float().item()),
+            "label_weight_mask_factor": float(self._get_label_weight_mask_factor()),
+        }
+        aux_logs.update(self._latest_dynamic_iou_stats)
         aux_terms = []
         aux_specs = (
             ("loss_shared", "fusion_lambda_align"),
@@ -1020,120 +1030,117 @@ class VGTrainer(Trainer):
                 )
             )
 
-        if not aux_terms:
-            loss_ce = loss.detach().float()
-            self._accumulate_aux_monitor_logs(
-                {
-                "loss_ce": float(loss_ce.item()),
-                "label_weight_mask_factor": float(self._get_label_weight_mask_factor()),
-                }
-            )
-            return
+        if aux_terms:
+            loss_ce = loss
+            for _, aux_loss, lambda_value, _ in aux_terms:
+                loss_ce = loss_ce - (lambda_value * aux_loss)
 
-        loss_ce = loss
-        for _, aux_loss, lambda_value, _ in aux_terms:
-            loss_ce = loss_ce - (lambda_value * aux_loss)
-
-        # Convert to float scalars (possibly average across DDP ranks).
-        loss_ce_val = loss_ce.detach().float()
-        values = [loss_ce_val]
-        values.extend(aux_loss.detach().float() for _, aux_loss, _, _ in aux_terms)
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            world_size = torch.distributed.get_world_size()
-            # All-reduce scalars for consistent dynamic lambda across workers.
-            reduce_t = torch.stack(values).to(loss.device)
-            torch.distributed.all_reduce(reduce_t, op=torch.distributed.ReduceOp.SUM)
-            reduce_t = reduce_t / world_size
-            values = [reduce_t[i] for i in range(reduce_t.shape[0])]
-
-        loss_ce_val_f = float(values[0].item())
-        aux_values = {}
-        for idx, (loss_name, _, _, _) in enumerate(aux_terms, start=1):
-            aux_values[loss_name] = float(values[idx].item())
-
-        dynamic_aux_names = [
-            loss_name
-            for loss_name, config in self._dynamic_aux_configs.items()
-            if aux_values.get(loss_name) is not None and config.get("target_ratio") is not None
-        ]
-        if dynamic_aux_names:
-            self._loss_ce_ema = self._update_ema(self._loss_ce_ema, loss_ce_val_f)
-
-        aux_logs: Dict[str, float] = {
-            "loss_ce": loss_ce_val_f,
-            "label_weight_mask_factor": float(self._get_label_weight_mask_factor()),
-        }
-
-        aux_log_specs = (
-            ("loss_shared", "fusion_lambda_align"),
-            ("loss_ortho", "fusion_lambda_ortho"),
-            ("loss_recon", "fusion_lambda_recon"),
-        )
-        should_adjust_dynamic = self._should_adjust_dynamic_aux_lambda()
-        for loss_name, lambda_attr in aux_log_specs:
-            loss_value_raw = aux_values.get(loss_name)
-            if loss_value_raw is None:
-                continue
-
-            config = self._dynamic_aux_configs.get(loss_name)
-            lambda_value = float(getattr(base_model, lambda_attr, 1.0))
-            schedule_factor = self._get_aux_schedule_factor(loss_name)
-            if config is not None and config.get("target_ratio") is not None:
-                previous_ema = self._aux_loss_emas.get(loss_name)
-                self._aux_loss_emas[loss_name] = self._update_ema(previous_ema, loss_value_raw)
-                scheduled_target_ratio = float(config["target_ratio"]) * float(schedule_factor)
-                if should_adjust_dynamic and self._loss_ce_ema is not None and schedule_factor > 0.0:
-                    lambda_target = scheduled_target_ratio * float(self._loss_ce_ema) / (
-                        float(self._aux_loss_emas[loss_name]) + self._ema_eps
-                    )
-                    lambda_target = max(
-                        float(config["lambda_min"]),
-                        min(float(config["lambda_max"]), float(lambda_target)),
-                    )
-                    self._set_aux_lambda_base(
-                        base_model,
-                        str(config["lambda_attr"]),
-                        float(lambda_target) / float(schedule_factor),
-                    )
-                    lambda_value = float(lambda_target)
-                elif schedule_factor <= 0.0:
-                    lambda_value = 0.0
-                aux_logs[f"{lambda_attr}_dyn"] = float(lambda_value)
-                aux_logs[f"{loss_name}_ratio_target"] = float(scheduled_target_ratio)
-
-            aux_logs.update(
-                {
-                    loss_name: float(loss_value_raw),
-                    f"{loss_name}_weighted": float(lambda_value) * float(loss_value_raw),
-                }
-            )
-
-        loss_nrsr_val_f = aux_values.get("loss_nrsr_kl")
-        if loss_nrsr_val_f is not None:
-            lambda_nrsr = float(getattr(base_model, "fusion_lambda_nrsr", 1.0))
-            loss_nrsr_weighted = float(lambda_nrsr) * float(loss_nrsr_val_f)
-            nrsr_ratio = loss_nrsr_weighted / (loss_ce_val_f + self._ema_eps)
-            nrsr_progress = self._training_progress()
-            nrsr_ratio_target = self._nrsr_target_ratio_from_progress(nrsr_progress)
-            aux_logs.update(
-                {
-                    "loss_nrsr_kl": float(loss_nrsr_val_f),
-                    "loss_nrsr_kl_weighted": loss_nrsr_weighted,
-                    "fusion_lambda_nrsr_dyn": float(lambda_nrsr),
-                    "loss_nrsr_ratio": float(nrsr_ratio),
-                    "loss_nrsr_ratio_target": float(nrsr_ratio_target),
-                    "nrsr_progress": float(nrsr_progress),
-                }
-            )
-
-        gate_shared_ratio = self._get_output_field(outputs, "gate_shared_ratio")
-        if gate_shared_ratio is not None:
-            gate_shared_ratio = gate_shared_ratio.to(loss.device, loss.dtype).detach().float()
+            # Convert to float scalars (possibly average across DDP ranks).
+            loss_ce_val = loss_ce.detach().float()
+            values = [loss_ce_val]
+            values.extend(aux_loss.detach().float() for _, aux_loss, _, _ in aux_terms)
             if torch.distributed.is_available() and torch.distributed.is_initialized():
                 world_size = torch.distributed.get_world_size()
-                torch.distributed.all_reduce(gate_shared_ratio, op=torch.distributed.ReduceOp.SUM)
-                gate_shared_ratio = gate_shared_ratio / world_size
-            aux_logs["gate_shared_ratio"] = float(gate_shared_ratio.item())
+                # All-reduce scalars for consistent dynamic lambda across workers.
+                reduce_t = torch.stack(values).to(loss.device)
+                torch.distributed.all_reduce(reduce_t, op=torch.distributed.ReduceOp.SUM)
+                reduce_t = reduce_t / world_size
+                values = [reduce_t[i] for i in range(reduce_t.shape[0])]
+
+            loss_ce_val_f = float(values[0].item())
+            aux_logs["loss_ce"] = loss_ce_val_f
+            aux_values = {}
+            for idx, (loss_name, _, _, _) in enumerate(aux_terms, start=1):
+                aux_values[loss_name] = float(values[idx].item())
+
+            dynamic_aux_names = [
+                loss_name
+                for loss_name, config in self._dynamic_aux_configs.items()
+                if aux_values.get(loss_name) is not None and config.get("target_ratio") is not None
+            ]
+            if dynamic_aux_names:
+                self._loss_ce_ema = self._update_ema(self._loss_ce_ema, loss_ce_val_f)
+
+            aux_log_specs = (
+                ("loss_shared", "fusion_lambda_align"),
+                ("loss_ortho", "fusion_lambda_ortho"),
+                ("loss_recon", "fusion_lambda_recon"),
+            )
+            should_adjust_dynamic = self._should_adjust_dynamic_aux_lambda()
+            for loss_name, lambda_attr in aux_log_specs:
+                loss_value_raw = aux_values.get(loss_name)
+                if loss_value_raw is None:
+                    continue
+
+                config = self._dynamic_aux_configs.get(loss_name)
+                lambda_value = float(getattr(base_model, lambda_attr, 1.0))
+                schedule_factor = self._get_aux_schedule_factor(loss_name)
+                if config is not None and config.get("target_ratio") is not None:
+                    previous_ema = self._aux_loss_emas.get(loss_name)
+                    self._aux_loss_emas[loss_name] = self._update_ema(previous_ema, loss_value_raw)
+                    scheduled_target_ratio = float(config["target_ratio"]) * float(schedule_factor)
+                    if should_adjust_dynamic and self._loss_ce_ema is not None and schedule_factor > 0.0:
+                        lambda_target = scheduled_target_ratio * float(self._loss_ce_ema) / (
+                            float(self._aux_loss_emas[loss_name]) + self._ema_eps
+                        )
+                        lambda_target = max(
+                            float(config["lambda_min"]),
+                            min(float(config["lambda_max"]), float(lambda_target)),
+                        )
+                        self._set_aux_lambda_base(
+                            base_model,
+                            str(config["lambda_attr"]),
+                            float(lambda_target) / float(schedule_factor),
+                        )
+                        lambda_value = float(lambda_target)
+                    elif schedule_factor <= 0.0:
+                        lambda_value = 0.0
+                    aux_logs[f"{lambda_attr}_dyn"] = float(lambda_value)
+                    aux_logs[f"{loss_name}_ratio_target"] = float(scheduled_target_ratio)
+
+                aux_logs.update(
+                    {
+                        loss_name: float(loss_value_raw),
+                        f"{loss_name}_weighted": float(lambda_value) * float(loss_value_raw),
+                    }
+                )
+
+            loss_nrsr_val_f = aux_values.get("loss_nrsr_kl")
+            if loss_nrsr_val_f is not None:
+                lambda_nrsr = float(getattr(base_model, "fusion_lambda_nrsr", 1.0))
+                loss_nrsr_weighted = float(lambda_nrsr) * float(loss_nrsr_val_f)
+                nrsr_ratio = loss_nrsr_weighted / (loss_ce_val_f + self._ema_eps)
+                nrsr_progress = self._training_progress()
+                nrsr_ratio_target = self._nrsr_target_ratio_from_progress(nrsr_progress)
+                aux_logs.update(
+                    {
+                        "loss_nrsr_kl": float(loss_nrsr_val_f),
+                        "loss_nrsr_kl_weighted": loss_nrsr_weighted,
+                        "fusion_lambda_nrsr_dyn": float(lambda_nrsr),
+                        "loss_nrsr_ratio": float(nrsr_ratio),
+                        "loss_nrsr_ratio_target": float(nrsr_ratio_target),
+                        "nrsr_progress": float(nrsr_progress),
+                    }
+                )
+
+        gate_shared_ratio = self._get_output_field(outputs, "gate_shared_ratio")
+        gate_shared_ratio_value = self._reduce_output_scalar(gate_shared_ratio, loss)
+        if gate_shared_ratio_value is not None:
+            aux_logs["gate_shared_ratio"] = gate_shared_ratio_value
+
+        gate_missing_question_summary = self._get_output_field(outputs, "gate_missing_question_summary")
+        gate_missing_question_summary_value = self._reduce_output_scalar(gate_missing_question_summary, loss)
+        if gate_missing_question_summary_value is not None:
+            aux_logs["gate_missing_question_summary"] = gate_missing_question_summary_value
+
+        fusion_monitor_stats = self._get_output_field(outputs, "fusion_monitor_stats")
+        if isinstance(fusion_monitor_stats, dict):
+            for key, value in fusion_monitor_stats.items():
+                if key in aux_logs:
+                    continue
+                reduced_value = self._reduce_output_scalar(value, loss)
+                if reduced_value is not None:
+                    aux_logs[key] = reduced_value
 
         self._accumulate_aux_monitor_logs(aux_logs)
 
