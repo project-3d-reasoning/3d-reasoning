@@ -78,14 +78,14 @@ class BBoxFormatProbeCallback(TrainerCallback):
         if model is None:
             return
 
-        if self._probe_samples is None:
-            self._probe_samples = self._load_probe_samples()
-        if not self._probe_samples:
-            return
-
         was_training = model.training
         model.eval()
         try:
+            if self._probe_samples is None:
+                self._probe_samples = self._load_probe_samples()
+            if not self._probe_samples:
+                return
+
             summary = {
                 "global_step": global_step,
                 "scanrefer": {"ok": 0, "total": 0},
@@ -116,6 +116,11 @@ class BBoxFormatProbeCallback(TrainerCallback):
                     summary["scannet_det"]["ok"],
                     summary["scannet_det"]["total"],
                 )
+            )
+        except Exception as exc:
+            print(
+                f"[bbox_probe] step {global_step} | probe_failed: "
+                f"{type(exc).__name__}: {exc}"
             )
         finally:
             if was_training:
