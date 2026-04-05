@@ -1,8 +1,5 @@
-import base64
-from io import BytesIO
 from typing import List, Optional, Tuple, Union
 
-import copy
 import decord
 import numpy as np
 import torch
@@ -21,7 +18,6 @@ from lmms_eval import utils
 from lmms_eval.api.instance import Instance
 from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model
-from lmms_eval.models.model_utils.load_video import read_video_pyav_base64
 
 from qwen_vl.bbox_special_tokens import (
     add_bbox_tokens,
@@ -29,12 +25,6 @@ from qwen_vl.bbox_special_tokens import (
 )
 from qwen_vl.model.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGenerationWithVGGT
 from qwen_vl.data.utils import load_and_preprocess_images
-
-try:
-    # from qwen_vl_utils import process_vision_info
-    from qwen_vl_utils import extract_vision_info
-except ImportError:
-    eval_logger.warning("Failed to import qwen_vl_utils; Please install it via `pip install qwen-vl-utils`")
 
 
 @register_model("vgllm")
@@ -230,10 +220,11 @@ class VGLLM(lmms):
                     raise ValueError(f"Expected `gen_kwargs['until']` to be of type Union[str,list] but got {type(until)}")
 
             messages = []
-            processed_visuals = []
+            batch_image_groups = []
             for i, context in enumerate(contexts):
 
                 message = [{"role": "system", "content": "You are a helpful assistant."}]
+                current_images = []
 
                 if len(visuals) > 0:
                     visual = visuals[i] if i < len(visuals) else None
@@ -250,28 +241,23 @@ class VGLLM(lmms):
                         visual_content = []
                         for frame in frames:
                             image = Image.fromarray(frame).convert("RGB")
+                            current_images.append(image)
                             visual_content.append({"type": "image", "image": image})
                         message.append({"role": "user", "content": visual_content + [{"type": "text", "text": context}]})
 
                     elif isinstance(visual, Image.Image):  # Single image
-                        base64_image = visual.convert("RGB")
-                        buffer = BytesIO()
-                        base64_image.save(buffer, format="JPEG")
-                        base64_bytes = base64.b64encode(buffer.getvalue())
-                        base64_string = base64_bytes.decode("utf-8")
-                        message.append({"role": "user", "content": [{"type": "image", "image": f"data:image/jpeg;base64,{base64_string}"}, {"type": "text", "text": context}]})
+                        image = visual.convert("RGB")
+                        current_images.append(image)
+                        message.append({"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": context}]})
                     elif isinstance(visual, (list, tuple)) and all(isinstance(v, Image.Image) for v in visual):  # Multiple images
                         image_content = []
                         image_count = 0
                         for v in visual:
-                            base64_image = v.convert("RGB")
-                            buffer = BytesIO()
-                            base64_image.save(buffer, format="JPEG")
-                            base64_bytes = base64.b64encode(buffer.getvalue())
-                            base64_string = base64_bytes.decode("utf-8")
+                            image = v.convert("RGB")
+                            current_images.append(image)
                             if self.add_frame_index:
                                 image_content.append({"type": "text", "text": "Frame-{}: ".format(image_count)})    
-                            image_content.append({"type": "image", "image": f"data:image/jpeg;base64,{base64_string}"})
+                            image_content.append({"type": "image", "image": image})
                             image_count += 1
                         message.append({"role": "user", "content": image_content + [{"type": "text", "text": context}]})
                     else:
@@ -280,47 +266,28 @@ class VGLLM(lmms):
                     message.append({"role": "user", "content": [{"type": "text", "text": context}]})
 
                 messages.append(message)
+                batch_image_groups.append(current_images)
 
             text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            # image_inputs, video_inputs = process_vision_info(messages)
 
             geometry_encoder_inputs = []
             image_inputs = []
             patch_size = self.processor.image_processor.patch_size
             merge_size = self.processor.image_processor.merge_size
-            for message in messages:
-                vision_info = extract_vision_info(message)
-                cur_geometry_encoder_inputs = []
-                for ele in vision_info:
-                    if "image" in ele:
-                        image = ele["image"]
-                        if isinstance(image, Image.Image):
-                            pass
-                        elif isinstance(image, str) and "base64," in image:
-                            _, base64_data = image.split("base64,", 1)
-                            data = base64.b64decode(base64_data)
-                            # fix memory leak issue while using BytesIO
-                            with BytesIO(data) as bio:
-                                image = copy.deepcopy(Image.open(bio))
-                        else:
-                            raise NotImplementedError("Unsupported image type")
+            for batch_images in batch_image_groups:
+                if len(batch_images) == 0:
+                    geometry_encoder_inputs.append(torch.empty((0, 3, 0, 0), dtype=torch.float32))
+                    continue
 
-                    else:
-                        raise NotImplementedError("Unsupported vision info type")
-
-                    assert isinstance(image, Image.Image), f"Unsupported image type: {type(image)}"
-                    image = load_and_preprocess_images([image])[0]
-                    cur_geometry_encoder_inputs.append(copy.deepcopy(image))
+                processed_images = load_and_preprocess_images(batch_images)
+                geometry_encoder_inputs.append(processed_images)
+                for image in processed_images:
                     _, height, width = image.shape
-                    # merge_size = 2
                     if (width // patch_size) % merge_size > 0:
                         width = width - (width // patch_size) % merge_size * patch_size
                     if (height // patch_size) % merge_size > 0:
                         height = height - (height // patch_size) % merge_size * patch_size
-                    image = image[:, :height, :width]
-                    image_inputs.append(image)
-
-                geometry_encoder_inputs.append(torch.stack(cur_geometry_encoder_inputs))
+                    image_inputs.append(image[:, :height, :width].contiguous())
             inputs = self.processor(
                 text=text,
                 images=image_inputs,

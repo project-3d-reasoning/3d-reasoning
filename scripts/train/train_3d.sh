@@ -11,10 +11,10 @@ NPROC_PER_NODE=$(nvidia-smi --list-gpus | wc -l)  # Automatically detects availa
 # ======================
 # Path Configuration
 # ======================
-MODEL_PATH="/data7t-root/huggingface/hub/models--zd11024--vgllm-3d-vggt-8b/snapshots/82e48eee69a4e168b1a25e26ab752d965db3b408"  # [ModelArguments] Pretrained model path
+MODEL_PATH="/inspire/hdd/project/qproject-fundationmodel/public/yxliu/test/Demongorgan/VG-LLM/models/Qwen2.5-VL-7B-Instruct"  # [ModelArguments] Pretrained model path
 GEOMETRY_ENCODER_TYPE="vggt"
 GEOMETRY_ENCODER_PATH="facebook/VGGT-1B"
-OUTPUT_DIR="7b-add-newtokens"                   # Directory for saving checkpoints
+OUTPUT_DIR="output/7b-add-newtokens"                   # Directory for saving checkpoints
 CACHE_DIR="./cache"                        # [TrainingArguments] Cache directory for models
 mkdir -p $OUTPUT_DIR
 

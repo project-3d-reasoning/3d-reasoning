@@ -2,9 +2,9 @@ set -e
 export LMMS_EVAL_LAUNCHER="accelerate"
 
 export NCCL_NVLS_ENABLE=0
-benchmark=scan2cap # choices: [scan2cap, scanrefer, scannet_4frames, scannet_6frames]
+benchmark=scannet_4frames # choices: [scan2cap, scanrefer, scannet_4frames, scannet_6frames]
 output_path=logs/$(TZ="Asia/Shanghai" date "+%Y%m%d")
-model_path=/data7t-root/huggingface/hub/models--zd11024--vgllm-3d-vggt-4b/snapshots/dcefbd815c35cc58236585396e5b13ebafe17055
+model_path=output/7b-add-newtokens
 USE_BBOX_SPECIAL_TOKENS=True
 
 model_args_str="pretrained=$model_path,use_flash_attention_2=true,max_num_frames=32,max_length=12800,use_bbox_special_tokens=$USE_BBOX_SPECIAL_TOKENS"
@@ -16,7 +16,7 @@ accelerate launch --num_processes=8  --main_process_port 29501 -m lmms_eval \
     --model vgllm \
     --model_args "$model_args_str" \
     --tasks ${benchmark} \
-    --batch_size 1 \
+    --batch_size 8 \
     --log_samples_suffix original \
     --log_samples \
     --output_path $output_path

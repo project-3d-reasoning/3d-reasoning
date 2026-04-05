@@ -2,6 +2,7 @@ import re
 import os
 import pandas as pd
 from pathlib import Path
+from functools import lru_cache
 import yaml
 import torch
 from PIL import Image
@@ -300,12 +301,16 @@ media_dir = yaml.safe_load("".join(safe_data))["metadata"]["media_dir"]
 def threedod_doc_to_visual(doc):
     image_files = doc["images"]
     images = [
-        Image.open(
-            os.path.join(media_dir, image_file)
-        ).convert("RGB")
+        _load_rgb_image(os.path.join(media_dir, image_file))
         for image_file in image_files
     ]
     return [images]
+
+
+@lru_cache(maxsize=128)
+def _load_rgb_image(image_path):
+    with Image.open(image_path) as image:
+        return image.convert("RGB")
 
 
 def threedod_doc_to_text(doc, lmms_eval_specific_kwargs=None):
@@ -317,50 +322,54 @@ def threedod_doc_to_text(doc, lmms_eval_specific_kwargs=None):
 
 
 def compute_ap(gt_bbox_dict, pred_bbox_dict, iou_threshold=0.25):
-
-    all_tp = defaultdict()
-    all_fp = defaultdict()
-    all_fn = defaultdict()
-    used_gt = defaultdict(set)
-    for category in pred_bbox_dict:
-        for bbox in pred_bbox_dict[category]:
-            gt_box_match = -1
-            max_iou = 0
-            for i, gt_box in enumerate(gt_bbox_dict[category]):
-                if i in used_gt[category]:
-                    continue
-                try:
-                    iou = EulerDepthInstance3DBoxes.overlaps(
-                        EulerDepthInstance3DBoxes(torch.tensor([bbox]), convention="ZXY"),
-                        EulerDepthInstance3DBoxes(torch.tensor([gt_box]), convention="ZXY")
-                    )
-                except Exception as e:
-                    eval_logger.error(f"Error calculating IOU: {e}")
-                    iou = 0
-                if iou > max_iou:
-                    max_iou = iou
-                    gt_box_match = i
-            
-            if max_iou > iou_threshold:
-                used_gt[category].add(gt_box_match)
-                all_tp[category] = all_tp.get(category, 0) + 1
-            else:
-                all_fp[category] = all_fp.get(category, 0) + 1
-    
-    for category in gt_bbox_dict:
-        for i, gt_box in enumerate(gt_bbox_dict[category]):
-            if i not in used_gt[category]:
-                all_fn[category] = all_fn.get(category, 0) + 1        
-
     categories = set(pred_bbox_dict.keys()) | set(gt_bbox_dict.keys())
-    ret = {
-        category: {
-            "tp": all_tp.get(category, 0),
-            "fp": all_fp.get(category, 0),
-            "fn": all_fn.get(category, 0),
+    ret = {}
+
+    for category in categories:
+        pred_boxes = pred_bbox_dict.get(category, [])
+        gt_boxes = gt_bbox_dict.get(category, [])
+
+        if not pred_boxes:
+            ret[category] = {"tp": 0, "fp": 0, "fn": len(gt_boxes)}
+            continue
+        if not gt_boxes:
+            ret[category] = {"tp": 0, "fp": len(pred_boxes), "fn": 0}
+            continue
+
+        try:
+            iou_matrix = EulerDepthInstance3DBoxes.overlaps(
+                EulerDepthInstance3DBoxes(torch.as_tensor(pred_boxes, dtype=torch.float32), convention="ZXY"),
+                EulerDepthInstance3DBoxes(torch.as_tensor(gt_boxes, dtype=torch.float32), convention="ZXY"),
+            )
+        except Exception as e:
+            eval_logger.error(f"Error calculating IOU: {e}")
+            ret[category] = {"tp": 0, "fp": len(pred_boxes), "fn": len(gt_boxes)}
+            continue
+
+        tp = 0
+        fp = 0
+        used_gt = torch.zeros(len(gt_boxes), dtype=torch.bool)
+        for pred_idx in range(len(pred_boxes)):
+            if used_gt.all():
+                fp += len(pred_boxes) - pred_idx
+                break
+
+            pred_ious = iou_matrix[pred_idx].clone()
+            pred_ious[used_gt] = -1
+            max_iou, gt_idx = pred_ious.max(dim=0)
+
+            if float(max_iou) > iou_threshold:
+                used_gt[int(gt_idx)] = True
+                tp += 1
+            else:
+                fp += 1
+
+        ret[category] = {
+            "tp": tp,
+            "fp": fp,
+            "fn": int((~used_gt).sum().item()),
         }
-        for category in categories
-    }
+
     return ret
    
 
