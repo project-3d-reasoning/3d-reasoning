@@ -11,7 +11,7 @@ NPROC_PER_NODE=$(nvidia-smi --list-gpus | wc -l)  # Automatically detects availa
 # ======================
 # Path Configuration
 # ======================
-MODEL_PATH="Qwen/Qwen2.5-VL-7B-Instruct/"  # [ModelArguments] Pretrained model path
+MODEL_PATH="/data7t-root/huggingface/hub/models--Qwen--Qwen2.5-VL-7B-Instruct/snapshots/cc594898137f460bfe9f0759e9844b3ce807cfb5"  # [ModelArguments] Pretrained model path
 GEOMETRY_ENCODER_TYPE="vggt"
 GEOMETRY_ENCODER_PATH="facebook/VGGT-1B"
 OUTPUT_DIR="PATH_TO_OUTPUT_DIR"                   # Directory for saving checkpoints
@@ -22,6 +22,10 @@ mkdir -p $OUTPUT_DIR
 # Model Configuration
 # ======================
 DATASETS="spar_234k,llava_hound_64k"                  # [DataArguments] Dataset with sampling rate
+USE_BBOX_SPECIAL_TOKENS=False
+BBOX_PROBE_INTERVAL=0
+BBOX_PROBE_NUM_SAMPLES=2
+BBOX_PROBE_MAX_NEW_TOKENS=256
 
 # ======================
 # Training Hyperparameters
@@ -70,6 +74,10 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --group_by_modality_length true \
             --seed 0 \
             --report_to "none" \
+            --use_bbox_special_tokens $USE_BBOX_SPECIAL_TOKENS \
+            --bbox_probe_interval $BBOX_PROBE_INTERVAL \
+            --bbox_probe_num_samples $BBOX_PROBE_NUM_SAMPLES \
+            --bbox_probe_max_new_tokens $BBOX_PROBE_MAX_NEW_TOKENS \
             --use_geometry_encoder true \
             --geometry_encoder_type $GEOMETRY_ENCODER_TYPE \
             --geometry_encoder_path $GEOMETRY_ENCODER_PATH \

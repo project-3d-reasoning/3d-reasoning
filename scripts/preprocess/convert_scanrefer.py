@@ -9,6 +9,9 @@ import numpy as np
 from tqdm import tqdm
 import pickle
 from lmms_eval.tasks.threedod.utils import EulerDepthInstance3DBoxes
+from qwen_vl.bbox_special_tokens import (
+    format_quantized_bbox_payload,
+)
 from utils import _9dof_transform_world2cam, sample_images_and_best_view, uniform_sample_images
 
 # modified from https://github.com/3dlg-hcvc/M3DRef-CLIP/blob/main/dataset/scanrefer/add_evaluation_labels.py
@@ -207,7 +210,7 @@ def main(data, args):
                     "frame": frame_id,
                     "bbox_3d": [round(x, 2) for i, x in enumerate(bbox_3d_in_cam)]
                 }
-                answer = f"```json\n\t{json.dumps(object_json)}\n```"
+                answer = format_quantized_bbox_payload(object_json)
                 output = process_data_item(item, scan, desc, answer, images, box, split=split, object_json=object_json)
                 all_data.append(output)
         else:

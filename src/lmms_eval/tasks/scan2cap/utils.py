@@ -13,6 +13,7 @@ import pickle
 from PIL import Image
 from terminaltables import AsciiTable
 from loguru import logger as eval_logger
+from qwen_vl.bbox_special_tokens import rewrite_scan2cap_prompt_with_position_tokens
 
 with open(Path(__file__).parent / "scan2cap.yaml", "r") as f:
     raw_data = f.readlines()
@@ -38,7 +39,9 @@ def scan2cap_doc_to_visual(doc):
 
 
 def scan2cap_doc_to_text(doc, lmms_eval_specific_kwargs=None):
-    question = doc["conversations"][0]["value"].replace("<image>", "")
+    question = rewrite_scan2cap_prompt_with_position_tokens(
+        doc["conversations"][0]["value"].replace("<image>", "")
+    )
     return question
 
 

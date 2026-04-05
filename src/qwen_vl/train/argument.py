@@ -9,6 +9,7 @@ class ModelArguments:
     tune_mm_llm: bool = field(default=False)
     tune_mm_mlp: bool = field(default=False)
     tune_mm_vision: bool = field(default=False)
+    use_bbox_special_tokens: bool = field(default=False)
 
     # Geometry encoder configuration
     use_geometry_encoder: bool = field(default=False)  # Whether to use 3D geometry encoder
@@ -47,3 +48,6 @@ class TrainingArguments(transformers.TrainingArguments):
     mm_projector_lr: Optional[float] = None
     vision_tower_lr: Optional[float] = None
     group_by_modality_length: bool = field(default=False)
+    bbox_probe_interval: int = field(default=0)
+    bbox_probe_num_samples: int = field(default=2)
+    bbox_probe_max_new_tokens: int = field(default=256)

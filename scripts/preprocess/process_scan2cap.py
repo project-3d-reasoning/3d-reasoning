@@ -22,6 +22,7 @@ import numpy as np
 from tqdm import tqdm
 from scipy import sparse
 from collections import defaultdict
+from qwen_vl.bbox_special_tokens import format_position_triplet_for_prompt
 from utils import uniform_sample_images
 
 
@@ -221,11 +222,12 @@ def main(args):
             tranformed_coord = (global2cam @ np.array(input_box[:3] + [1]).reshape(4, 1)).reshape(4)[:3].tolist()
             desc = item['description'].capitalize()
             transformed_coord = [round(i, 2) for i in tranformed_coord]
+            transformed_coord_tokens = format_position_triplet_for_prompt(transformed_coord)
 
             new_item = {
                 "conversations": [
                     {
-                        "value": f"{''.join(['<image>'] * len(images))}\nCarefully watch the video and describe the object located at {transformed_coord} in detail.",
+                        "value": f"{''.join(['<image>'] * len(images))}\nCarefully watch the video and describe the object located at {transformed_coord_tokens} in detail.",
                         "from": "human",
                     },
                     {

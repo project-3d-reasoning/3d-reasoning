@@ -10,6 +10,11 @@ from PIL import Image
 from loguru import logger as eval_logger
 from scipy.spatial.transform import Rotation as R
 from lmms_eval.tasks.threedod.utils import EulerDepthInstance3DBoxes
+from qwen_vl.bbox_special_tokens import (
+    decode_bbox_values,
+    parse_json_like_with_special_tokens,
+    restore_scanrefer_bbox_prompt,
+)
 
 with open(Path(__file__).parent / "scanrefer.yaml", "r") as f:
     raw_data = f.readlines()
@@ -35,7 +40,7 @@ def scanrefer_doc_to_visual(doc):
 
 
 def scanrefer_doc_to_text(doc, lmms_eval_specific_kwargs=None):
-    prompt = doc["prompt"]
+    prompt = restore_scanrefer_bbox_prompt(doc["prompt"])
     return prompt
 
 
@@ -53,16 +58,14 @@ def scanrefer_bbox_to_9dof(bbox, convention, extrinsic=None):
 
 
 def scanrefer_process_results(doc, results):
-    lines = results[0].strip('\n').strip("```").strip("json").strip("\n").split("\n")
     gt_bbox = doc["gt_bbox"]
     pred_dict = None
-    for line in lines:
-        if "bbox_3d" in line:
-            try:
-                pred_dict = eval(line.strip())
-            except Exception as e:
-                eval_logger.error(f"Error parsing bbox_3d: {line.strip()}")
-            break
+    try:
+        parsed_result = parse_json_like_with_special_tokens(results[0])
+        if isinstance(parsed_result, dict) and "bbox_3d" in parsed_result:
+            pred_dict = parsed_result
+    except Exception as e:
+        eval_logger.error(f"Error parsing bbox_3d: {results[0].strip()}")
     
     iou = 0
     pred_bbox = None
@@ -75,7 +78,11 @@ def scanrefer_process_results(doc, results):
             
             frame_idx = pred_dict["frame"]
             extrinsic = np.array(doc["axis_align_matrix"]) @ np.array(doc["cam2global"][frame_idx])
-            pred_bbox = scanrefer_bbox_to_9dof(pred_dict["bbox_3d"], convention="ZXY", extrinsic=extrinsic)
+            pred_bbox = scanrefer_bbox_to_9dof(
+                decode_bbox_values(pred_dict["bbox_3d"]),
+                convention="ZXY",
+                extrinsic=extrinsic,
+            )
             iou = EulerDepthInstance3DBoxes.overlaps(
                 EulerDepthInstance3DBoxes(torch.tensor([pred_bbox]), convention="ZXY"),
                 EulerDepthInstance3DBoxes(torch.tensor([gt_bbox]), convention="ZXY")

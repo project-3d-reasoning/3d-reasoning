@@ -30,12 +30,17 @@ sys.path.append(str(project_root))
 
 import qwen_vl.train.trainer
 import qwen_vl.train.sampler
+from qwen_vl.train.bbox_probe import BBoxFormatProbeCallback
 from trainer import replace_qwen2_vl_attention_class
 
 from transformers import (
     Qwen2VLForConditionalGeneration,
 )
 from qwen_vl.data.data_qwen import make_supervised_data_module
+from qwen_vl.bbox_special_tokens import (
+    add_bbox_tokens,
+    resize_model_embeddings_for_bbox_tokens,
+)
 
 from qwen_vl.train.argument import (
     ModelArguments,
@@ -184,6 +189,9 @@ def train(attn_implementation="flash_attention_2"):
         padding_side="right",
         use_fast=False,
     )
+    if model_args.use_bbox_special_tokens:
+        num_new_tokens = add_bbox_tokens(tokenizer)
+        resize_model_embeddings_for_bbox_tokens(model, tokenizer, num_new_tokens)
     set_model(model_args, model)
 
     if torch.distributed.get_rank() == 0:
@@ -193,10 +201,24 @@ def train(attn_implementation="flash_attention_2"):
     print(model.config)
     if model_args.use_geometry_encoder:
         setattr(data_args, "use_geometry_encoder", model_args.use_geometry_encoder)
+    setattr(data_args, "use_bbox_special_tokens", model_args.use_bbox_special_tokens)
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
     trainer = Trainer(
         model=model, processing_class=tokenizer, args=training_args, **data_module
     )
+    if training_args.bbox_probe_interval > 0:
+        trainer.add_callback(
+            BBoxFormatProbeCallback(
+                tokenizer=tokenizer,
+                image_processor=data_args.image_processor,
+                output_dir=training_args.output_dir,
+                probe_interval=training_args.bbox_probe_interval,
+                probe_num_samples=training_args.bbox_probe_num_samples,
+                probe_max_new_tokens=training_args.bbox_probe_max_new_tokens,
+                use_bbox_special_tokens=model_args.use_bbox_special_tokens,
+                use_geometry_encoder=model_args.use_geometry_encoder,
+            )
+        )
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         logging.info("checkpoint found, resume training")
@@ -205,6 +227,7 @@ def train(attn_implementation="flash_attention_2"):
         trainer.train()
     trainer.save_state()
     data_args.image_processor.save_pretrained(training_args.output_dir)
+    tokenizer.save_pretrained(training_args.output_dir)
 
     source_path = os.path.join(model_args.model_name_or_path, "chat_template.json")
     template_path = os.path.join(training_args.output_dir, "chat_template.json")

@@ -9,6 +9,9 @@ from scipy.spatial.transform import Rotation as R
 import numpy as np
 import open3d as o3d
 import random
+from qwen_vl.bbox_special_tokens import (
+    format_quantized_bbox_payload,
+)
 from utils import embodiedscan_bbox_to_o3d_geo, get_frame_id, o3d_geo_to_9dof
 
 
@@ -23,21 +26,16 @@ def create_question_answer(n_images, instances, args):
 Output a json list where each entry contains the object name in "label" and its 3D bounding box in "bbox_3d".
 The 3D bounding box format should be [x_center, y_center, z_center, x_size, y_size, z_size, yaw, roll, pitch]."""
 
+    answer_payload = []
+    for instance in instances:
+        answer_payload.append(
+            {
+                "label": instance["label"],
+                "bbox_3d": [round(float(x), 2) for x in instance["bbox_3d_in_cam"]],
+            }
+        )
 
-    def format_instance(instance):
-        box_3d = []
-        for i, x in enumerate(instance["bbox_3d_in_cam"]):
-            x = round(x, 2)
-            box_3d.append(x)
-
-        item = {
-            "label": instance["label"],
-            "bbox_3d": box_3d,
-        }
-        return json.dumps(item)
-
-    instances_str = ",\n\t".join([format_instance(instance) for instance in instances])
-    answer = "```json\n[\n\t" + instances_str + "\n]```"
+    answer = format_quantized_bbox_payload(answer_payload)
     return question, answer
 
 

@@ -23,6 +23,10 @@ from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model
 from lmms_eval.models.model_utils.load_video import read_video_pyav_base64
 
+from qwen_vl.bbox_special_tokens import (
+    add_bbox_tokens,
+    resize_model_embeddings_for_bbox_tokens,
+)
 from qwen_vl.model.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGenerationWithVGGT
 from qwen_vl.data.utils import load_and_preprocess_images
 
@@ -52,6 +56,7 @@ class VGLLM(lmms):
         max_image_size: Optional[int] = None,  # Only applicable if use_custom_video_loader is True
         max_length: Optional[int] = None,
         add_frame_index: bool=False,
+        use_bbox_special_tokens: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -101,6 +106,10 @@ class VGLLM(lmms):
         self.max_num_frames = max_num_frames
         self.processor = AutoProcessor.from_pretrained(pretrained, max_pixels=max_pixels, min_pixels=min_pixels, padding_side="left")
         self._tokenizer = AutoTokenizer.from_pretrained(pretrained, padding_side="left")
+        if use_bbox_special_tokens:
+            num_new_tokens = add_bbox_tokens(self._tokenizer)
+            add_bbox_tokens(self.processor.tokenizer)
+            resize_model_embeddings_for_bbox_tokens(self._model, self._tokenizer, num_new_tokens)
 
         if max_length is not None:
             eval_logger.warning(f"Setting max_length to {max_length}")

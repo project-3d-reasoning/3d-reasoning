@@ -22,6 +22,12 @@ from decord import VideoReader
 import transformers
 
 from . import data_list
+from qwen_vl.bbox_special_tokens import (
+    restore_scanrefer_bbox_prompt,
+    restore_threedod_bbox_prompt,
+    rewrite_bbox_response_with_special_tokens,
+    rewrite_scan2cap_prompt_with_position_tokens,
+)
 from .rope2d import get_rope_index_25, get_rope_index_2
 from .utils import prepare_image_inputs
 
@@ -147,6 +153,7 @@ class LazySupervisedDataset(Dataset):
             data_args, "video_min_total_pixels", 256 * 28 * 28
         )
         self.model_type = data_args.model_type
+        self.use_bbox_special_tokens = getattr(data_args, "use_bbox_special_tokens", False)
         if data_args.model_type == "qwen2.5vl":
             self.get_rope_index = get_rope_index_25
         else:
@@ -171,6 +178,7 @@ class LazySupervisedDataset(Dataset):
             for ann in annotations:
                 ann["data_path"] = data["data_path"]
                 ann["tag"] = data["tag"]
+                ann["dataset_name"] = data.get("dataset_name")
             list_data_dict += annotations
 
         print(f"Total training samples: {len(list_data_dict)}")
@@ -374,33 +382,36 @@ class LazySupervisedDataset(Dataset):
         return images
 
     def _get_item(self, i) -> Dict[str, torch.Tensor]:
-        sources = self.list_data_dict[i]
+        sources = copy.deepcopy(self.list_data_dict[i])
+        if self.use_bbox_special_tokens:
+            sources = self._rewrite_special_token_datasets(sources)
         if isinstance(i, int):
             sources = [sources]
         assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
+        source_item = sources[0]
         video = None
         
-        if "video" in sources[0]:
-            sources[0]["images"] = self.read_video_images(sources[0])
-            num_image = len(sources[0]["images"])
-            sources[0]["conversations"][0]["value"] = sources[0]["conversations"][0]["value"].replace(
+        if "video" in source_item:
+            source_item["images"] = self.read_video_images(source_item)
+            num_image = len(source_item["images"])
+            source_item["conversations"][0]["value"] = source_item["conversations"][0]["value"].replace(
                 DEFAULT_VIDEO_TOKEN, "".join([DEFAULT_IMAGE_TOKEN] * num_image)
             )
-            del sources[0]["video"]
+            del source_item["video"]
         
         # # replace <image>\n with <image>
-        sources[0]["conversations"][0]["value"] = sources[0]["conversations"][0]["value"].replace(
+        source_item["conversations"][0]["value"] = source_item["conversations"][0]["value"].replace(
             f"{DEFAULT_IMAGE_TOKEN}\n", DEFAULT_IMAGE_TOKEN
         )
 
         # rename images tag
-        if "images" in sources[0]:
-            sources[0]["image"] = sources[0]["images"]
+        if "images" in source_item:
+            source_item["image"] = source_item["images"]
 
         # notice that we use images as the tag
-        if "image" in sources[0]:
-            image_folder = self.list_data_dict[i]["data_path"]
-            image_file = self.list_data_dict[i]["image"]
+        if "image" in source_item:
+            image_folder = source_item["data_path"]
+            image_file = source_item["image"]
             if isinstance(image_file, List):
 
                 if isinstance(image_file[0], str):
@@ -413,7 +424,7 @@ class LazySupervisedDataset(Dataset):
                 else:
                     raise NotImplementedError
                 # draw visual markers
-                self.draw_visual_marks(image_file, sources[0].get("spar_info", None))
+                self.draw_visual_marks(image_file, source_item.get("spar_info", None))
 
                 image, grid_thw, geometry_encoder_inputs = [], [], []
                 for file in image_file:
@@ -438,9 +449,9 @@ class LazySupervisedDataset(Dataset):
                 data_dict["input_ids"],
                 torch.stack(grid_thw, dim=0),
             )
-        elif "video" in sources[0]:
-            video_file = self.list_data_dict[i]["video"]
-            video_folder = self.list_data_dict[i]["data_path"]
+        elif "video" in source_item:
+            video_file = source_item["video"]
+            video_folder = source_item["data_path"]
             if isinstance(video_file, List):
                 if len(video_file) > 1:
                     video_file = [
@@ -495,18 +506,39 @@ class LazySupervisedDataset(Dataset):
                 position_ids=position_ids,
             )
 
-        if "image" in self.list_data_dict[i]:
+        if "image" in source_item:
             data_dict["pixel_values"] = image
             data_dict["image_grid_thw"] = grid_thw
             if getattr(self.data_args, "use_geometry_encoder", False):
                 data_dict["geometry_encoder_inputs"] = geometry_encoder_inputs
         # video exist in the data
-        elif "video" in self.list_data_dict[i]:
+        elif "video" in source_item:
             data_dict["pixel_values_videos"] = video
             data_dict["video_grid_thw"] = grid_thw
         
-        data_dict["tag"] = self.list_data_dict[i].get("tag", "2d")
+        data_dict["tag"] = source_item.get("tag", "2d")
         return data_dict
+
+    def _rewrite_special_token_datasets(self, sample):
+        dataset_name = sample.get("dataset_name") or sample.get("metadata", {}).get("dataset")
+        conversations = sample.get("conversations", [])
+        if not conversations:
+            return sample
+
+        if dataset_name == "scanrefer":
+            sample["prompt"] = restore_scanrefer_bbox_prompt(sample.get("prompt", ""))
+            conversations[0]["value"] = restore_scanrefer_bbox_prompt(conversations[0]["value"])
+            if len(conversations) > 1:
+                conversations[1]["value"] = rewrite_bbox_response_with_special_tokens(conversations[1]["value"])
+        elif dataset_name == "scannet_det":
+            conversations[0]["value"] = restore_threedod_bbox_prompt(conversations[0]["value"])
+            if len(conversations) > 1:
+                conversations[1]["value"] = rewrite_bbox_response_with_special_tokens(conversations[1]["value"])
+        elif dataset_name == "scan2cap":
+            conversations[0]["value"] = rewrite_scan2cap_prompt_with_position_tokens(conversations[0]["value"])
+
+        sample["conversations"] = conversations
+        return sample
 
 
 def pad_and_cat(tensor_list):

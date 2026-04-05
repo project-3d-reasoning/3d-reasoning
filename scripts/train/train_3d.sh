@@ -11,10 +11,10 @@ NPROC_PER_NODE=$(nvidia-smi --list-gpus | wc -l)  # Automatically detects availa
 # ======================
 # Path Configuration
 # ======================
-MODEL_PATH="Qwen/Qwen2.5-VL-7B-Instruct/"  # [ModelArguments] Pretrained model path
+MODEL_PATH="/data7t-root/huggingface/hub/models--zd11024--vgllm-3d-vggt-8b/snapshots/82e48eee69a4e168b1a25e26ab752d965db3b408"  # [ModelArguments] Pretrained model path
 GEOMETRY_ENCODER_TYPE="vggt"
 GEOMETRY_ENCODER_PATH="facebook/VGGT-1B"
-OUTPUT_DIR="PATH_TO_OUTPUT_DIR"                   # Directory for saving checkpoints
+OUTPUT_DIR="7b-add-newtokens"                   # Directory for saving checkpoints
 CACHE_DIR="./cache"                        # [TrainingArguments] Cache directory for models
 mkdir -p $OUTPUT_DIR
 
@@ -22,6 +22,10 @@ mkdir -p $OUTPUT_DIR
 # Model Configuration
 # ======================
 DATASETS="scan2cap,scanrefer,scannet_det"                  # [DataArguments] Dataset with sampling rate
+USE_BBOX_SPECIAL_TOKENS=True
+BBOX_PROBE_INTERVAL=500
+BBOX_PROBE_NUM_SAMPLES=2
+BBOX_PROBE_MAX_NEW_TOKENS=256
 
 # ======================
 # Training Hyperparameters
@@ -63,14 +67,18 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --lr_scheduler_type "cosine" \
             --weight_decay 0.01 \
             --logging_steps 10 \
-            --save_steps 1000 \
-            --save_total_limit 1 \
+            --save_steps 500 \
+            --save_total_limit 3 \
             --deepspeed "scripts/zero2_opt.json" \
             --gradient_checkpointing \
             --dataloader_num_workers 4 \
             --group_by_modality_length true \
             --seed 0 \
             --report_to "none" \
+            --use_bbox_special_tokens $USE_BBOX_SPECIAL_TOKENS \
+            --bbox_probe_interval $BBOX_PROBE_INTERVAL \
+            --bbox_probe_num_samples $BBOX_PROBE_NUM_SAMPLES \
+            --bbox_probe_max_new_tokens $BBOX_PROBE_MAX_NEW_TOKENS \
             --use_geometry_encoder True \
             --geometry_encoder_type $GEOMETRY_ENCODER_TYPE \
             --geometry_encoder_path $GEOMETRY_ENCODER_PATH \

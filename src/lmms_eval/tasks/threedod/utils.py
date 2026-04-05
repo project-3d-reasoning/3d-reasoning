@@ -13,6 +13,11 @@ from typing import Union
 from pytorch3d.ops import box3d_overlap
 from pytorch3d.transforms import euler_angles_to_matrix
 from terminaltables import AsciiTable
+from qwen_vl.bbox_special_tokens import (
+    decode_bbox_values,
+    parse_json_like_with_special_tokens,
+    restore_threedod_bbox_prompt,
+)
 
 cate8 = [
     "chair", "cabinet", "table", "bin", "couch", "bed", "bathtub", "toilet",
@@ -304,7 +309,9 @@ def threedod_doc_to_visual(doc):
 
 
 def threedod_doc_to_text(doc, lmms_eval_specific_kwargs=None):
-    prompt = doc["conversations"][0]["value"].replace("<image>", "")
+    prompt = restore_threedod_bbox_prompt(
+        doc["conversations"][0]["value"].replace("<image>", "")
+    )
     return prompt
 
 
@@ -358,18 +365,15 @@ def compute_ap(gt_bbox_dict, pred_bbox_dict, iou_threshold=0.25):
    
 
 def threedod_process_results(doc, results):
-
-    lines = results[0].strip('\n').strip("```").strip("json").strip("\n").split("\n")
     pred = []
-    for line in lines:
-        line = line.strip().strip(",")
-        if "bbox_3d" not in line and "label" not in line:
-            continue
-        try:
-            pred_box = eval(line)
-            pred.append(pred_box)
-        except Exception as e:
-            eval_logger.error(f"Error parsing prediction bbox: {line}, Error: {e}")
+    try:
+        parsed_result = parse_json_like_with_special_tokens(results[0])
+        if isinstance(parsed_result, dict):
+            parsed_result = [parsed_result]
+        if isinstance(parsed_result, list):
+            pred = parsed_result
+    except Exception as e:
+        eval_logger.error(f"Error parsing prediction bbox: {results[0]}, Error: {e}")
 
     pred_bbox_dict = defaultdict(list)
     gt_bbox_dict = defaultdict(list)
@@ -379,7 +383,7 @@ def threedod_process_results(doc, results):
     
     for bbox in pred:
         try:
-            pred_bbox = np.array(bbox["bbox_3d"], dtype=float)
+            pred_bbox = np.array(decode_bbox_values(bbox["bbox_3d"]), dtype=float)
             # pred_bbox[:6] = pred_bbox[:6] / 100.
             pred_bbox_dict[bbox["label"]].append(pred_bbox)
         except Exception as e:

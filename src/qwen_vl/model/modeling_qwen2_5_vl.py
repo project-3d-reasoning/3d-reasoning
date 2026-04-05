@@ -2029,12 +2029,56 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
             shift_logits = shift_logits.view(-1, self.config.vocab_size)
             shift_labels = shift_labels.view(-1)
             # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
+            valid_mask = shift_labels.ne(-100)
+
+            bbox_coordinate_token_ids = getattr(self.config, "bbox_coordinate_token_ids", None) or []
+            bbox_coordinate_label_smoothing = float(
+                getattr(self.config, "bbox_coordinate_label_smoothing", 0.1)
+            )
+
+            if bbox_coordinate_token_ids:
+                coordinate_token_ids = torch.tensor(
+                    bbox_coordinate_token_ids,
+                    device=shift_labels.device,
+                    dtype=shift_labels.dtype,
+                )
+                coordinate_mask = torch.isin(shift_labels, coordinate_token_ids) & valid_mask
+            else:
+                coordinate_mask = torch.zeros_like(valid_mask, dtype=torch.bool)
+            non_coordinate_mask = valid_mask & ~coordinate_mask
+
+            loss_sum = shift_logits.new_tensor(0.0)
+            loss_count = shift_logits.new_tensor(0.0)
+
+            if non_coordinate_mask.any():
+                non_coordinate_loss = F.cross_entropy(
+                    shift_logits[non_coordinate_mask],
+                    shift_labels[non_coordinate_mask],
+                    reduction="mean",
+                )
+                non_coordinate_count = non_coordinate_mask.sum().to(shift_logits.dtype)
+                loss_sum = loss_sum + non_coordinate_loss * non_coordinate_count
+                loss_count = loss_count + non_coordinate_count
+
+            if coordinate_mask.any():
+                coordinate_loss = F.cross_entropy(
+                    shift_logits[coordinate_mask],
+                    shift_labels[coordinate_mask],
+                    reduction="mean",
+                    label_smoothing=bbox_coordinate_label_smoothing,
+                )
+                coordinate_count = coordinate_mask.sum().to(shift_logits.dtype)
+                loss_sum = loss_sum + coordinate_loss * coordinate_count
+                loss_count = loss_count + coordinate_count
+
+            if loss_count.item() > 0:
+                loss = loss_sum / loss_count
+            else:
+                loss = shift_logits.new_tensor(0.0)
 
         if not return_dict:
             output = (logits,) + outputs[1:]
