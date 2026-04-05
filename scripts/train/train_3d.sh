@@ -34,7 +34,7 @@ TUNE_MM_VISION=False
 TUNE_MM_VISION_LORA=False
 TUNE_GEOMETRY_ENCODER=False
 TUNE_GEOMETRY_ENCODER_LORA=False
-FEATURE_FUSION_METHOD="adver"      # choices: add/concat/cross_attention/gated/weighted/adver/adver_ortho/decompose_add/decompose_concat/nrsr_add/nrsr_concat/knn_concat
+FEATURE_FUSION_METHOD="add"      # choices: add/concat/cross_attention/gated/weighted/adver/adver_ortho/decompose_add/decompose_concat/nrsr_add/nrsr_concat/knn_concat
 FUSION_NUM_LAYERS=2                    # 没用Number of Transformer-style CA blocks for cross_attention/knn_concat
 FUSION_KNN_K=5                         # 没用Number of nearest neighbors from other frames for knn_concat; self token is added automatically
 FUSION_KNN_MIN_VALID_RATIO=0.5         #  没用Minimum confidence mass ratio in the center patch window before a patch/token is marked valid
@@ -66,6 +66,8 @@ FUSION_FEATURE_3D_LR="1e-4"               # Dedicated LR for trainable feature_3
 USE_LABEL_WEIGHT_MASKS=false
 # Run scripts/utils/build_label_weight_masks.py beforehand to populate this sidecar directory.
 LABEL_WEIGHT_MASKS_DIR="data/train/label_weight_masks"
+GEOMETRY_TOKENS=false
+GEOMETRY_TOKEN_FREEZE_EXISTING_ROWS=false
 LABEL_WEIGHT_DEFAULT=1.0
 LABEL_WEIGHT_SCANREFER_FRAME=1.5
 LABEL_WEIGHT_SCANREFER_BBOX=1
@@ -79,7 +81,7 @@ LABEL_WEIGHT_DYNAMIC_IOU_EPS=1e-6
 USE_LEARNABLE_PREFIX=false
 LEARNABLE_PREFIX_LEN=0
 TEXT_GATE_SENTENCE_BERT_NAME_OR_PATH="/data7t-root/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/snapshots/c9745ed1d9f207416be6d2e6f8de32d1f16199bf"
-OUTPUT_DIR="7b-adver-with-gate4residual"                   # Directory for saving checkpoints
+OUTPUT_DIR="7b-add-newtokens"                   # Directory for saving checkpoints
 CACHE_DIR="./cache"                        # [TrainingArguments] Cache directory for models
 mkdir -p "$OUTPUT_DIR"
 setup_train_log_archive "$REPO_ROOT" "$OUTPUT_DIR"
@@ -144,6 +146,8 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --tune_mm_vision_lora $TUNE_MM_VISION_LORA \
             --tune_mm_mlp False \
             --dataset_use $DATASETS \
+            --geometry_tokens $GEOMETRY_TOKENS \
+            --geometry_token_freeze_existing_rows $GEOMETRY_TOKEN_FREEZE_EXISTING_ROWS \
             "${LABEL_WEIGHT_ARGS[@]}" \
             --output_dir $OUTPUT_DIR \
             --cache_dir $CACHE_DIR \

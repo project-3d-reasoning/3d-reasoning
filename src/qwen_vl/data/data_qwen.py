@@ -494,12 +494,15 @@ class LazySupervisedDataset(Dataset):
             )
         transformed_conversations = sources[0]["conversations"]
 
+        has_image_inputs = False
+
         # rename images tag
         if "images" in sources[0]:
             sources[0]["image"] = sources[0]["images"]
 
         # notice that we use images as the tag
         if "image" in sources[0]:
+            has_image_inputs = True
             image_folder = original_source_item["data_path"]
             image_file = sources[0]["image"]
             if isinstance(image_file, List):
@@ -597,7 +600,7 @@ class LazySupervisedDataset(Dataset):
                 question_text=extract_question_text_from_conversations(original_conversations),
             )
 
-        if "image" in original_source_item:
+        if has_image_inputs:
             data_dict["pixel_values"] = image
             data_dict["image_grid_thw"] = grid_thw
             if getattr(self.data_args, "use_geometry_encoder", False):
