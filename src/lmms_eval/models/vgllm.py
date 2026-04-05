@@ -24,7 +24,7 @@ from qwen_vl.bbox_special_tokens import (
     resize_model_embeddings_for_bbox_tokens,
 )
 from qwen_vl.model.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGenerationWithVGGT
-from qwen_vl.data.utils import load_and_preprocess_images
+from qwen_vl.data.utils import prepare_generation_images
 
 
 @register_model("vgllm")
@@ -272,22 +272,12 @@ class VGLLM(lmms):
 
             geometry_encoder_inputs = []
             image_inputs = []
-            patch_size = self.processor.image_processor.patch_size
-            merge_size = self.processor.image_processor.merge_size
             for batch_images in batch_image_groups:
-                if len(batch_images) == 0:
-                    geometry_encoder_inputs.append(torch.empty((0, 3, 0, 0), dtype=torch.float32))
-                    continue
-
-                processed_images = load_and_preprocess_images(batch_images)
-                geometry_encoder_inputs.append(processed_images)
-                for image in processed_images:
-                    _, height, width = image.shape
-                    if (width // patch_size) % merge_size > 0:
-                        width = width - (width // patch_size) % merge_size * patch_size
-                    if (height // patch_size) % merge_size > 0:
-                        height = height - (height // patch_size) % merge_size * patch_size
-                    image_inputs.append(image[:, :height, :width].contiguous())
+                trimmed_images, geometry_features = prepare_generation_images(
+                    batch_images, self.processor.image_processor
+                )
+                geometry_encoder_inputs.append(geometry_features)
+                image_inputs.extend(trimmed_images)
             inputs = self.processor(
                 text=text,
                 images=image_inputs,

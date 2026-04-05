@@ -151,21 +151,53 @@ def load_and_preprocess_images(image_path_list, mode="crop", target_size=518):
     return images
 
 
+def trim_images_to_processor_requirements(images, image_processor):
+    """
+    Trim preprocessed image tensors so the visual-token count matches the
+    geometry features produced from the same images.
+    """
+    patch_size = getattr(image_processor, "patch_size")
+    merge_size = getattr(image_processor, "merge_size")
+
+    trimmed_images = []
+    for image in images:
+        _, height, width = image.shape
+
+        if (width // patch_size) % merge_size > 0:
+            width = width - (width // patch_size) % merge_size * patch_size
+        if (height // patch_size) % merge_size > 0:
+            height = height - (height // patch_size) % merge_size * patch_size
+
+        trimmed_images.append(image[:, :height, :width].contiguous())
+
+    return trimmed_images
+
+
+def prepare_generation_images(images, image_processor):
+    """
+    Shared preprocessing path for multi-image generation with optional geometry
+    features. Returns:
+    - trimmed_images: tensors passed to the visual processor
+    - geometry_encoder_inputs: tensors kept for the geometry encoder
+    """
+    if len(images) == 0:
+        empty = torch.empty((0, 3, 0, 0), dtype=torch.float32)
+        return [], empty
+
+    geometry_encoder_inputs = load_and_preprocess_images(images)
+    trimmed_images = trim_images_to_processor_requirements(
+        geometry_encoder_inputs, image_processor
+    )
+    return trimmed_images, geometry_encoder_inputs
+
+
 def prepare_image_inputs(image, image_processor):
 
-    images = load_and_preprocess_images([image])
-    geometry_encoder_inputs = copy.deepcopy(images[0])
-    merge_size: int = getattr(image_processor, "merge_size")
-    patch_size: int = getattr(image_processor, "patch_size")
-    _, height, width = images[0].shape
-
-    if width % (patch_size * merge_size) > 0:
-        width = width - (width % (patch_size * merge_size))
-    if height % (patch_size * merge_size) > 0:
-        height = height - (height % (patch_size * merge_size))
-
-    images = images[:,:, :height, :width]
-    visual_processed = image_processor(images, return_tensors="pt", do_rescale=False)
+    trimmed_images, geometry_images = prepare_generation_images([image], image_processor)
+    geometry_encoder_inputs = copy.deepcopy(geometry_images[0])
+    visual_processed = image_processor(
+        trimmed_images, return_tensors="pt", do_rescale=False
+    )
     image_tensor = visual_processed["pixel_values"]
     grid_thw = visual_processed["image_grid_thw"]
 

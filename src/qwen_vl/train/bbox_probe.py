@@ -1,6 +1,5 @@
 import copy
 import json
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -16,7 +15,7 @@ from qwen_vl.bbox_special_tokens import (
     restore_scanrefer_bbox_prompt,
     restore_threedod_bbox_prompt,
 )
-from qwen_vl.data.utils import load_and_preprocess_images
+from qwen_vl.data.utils import prepare_generation_images
 
 
 SYSTEM_MESSAGE = "You are a helpful assistant."
@@ -149,8 +148,19 @@ class BBoxFormatProbeCallback(TrainerCallback):
 
     def _probe_one_sample(self, model, sample: ProbeSample) -> Dict:
         prompt, image_paths = self._build_prompt_and_images(sample)
-        generated_text = self._generate_text(model=model, prompt=prompt, image_paths=image_paths)
-        format_ok, detail = self._validate_output(sample=sample, generated_text=generated_text)
+        try:
+            generated_text = self._generate_text(
+                model=model, prompt=prompt, image_paths=image_paths
+            )
+            format_ok, detail = self._validate_output(
+                sample=sample, generated_text=generated_text
+            )
+        except Exception as exc:
+            generated_text = ""
+            format_ok = False
+            detail = {
+                "error": f"probe_failed: {type(exc).__name__}: {exc}",
+            }
         return {
             "dataset": sample.dataset,
             "doc_id": sample.doc_id,
@@ -188,13 +198,23 @@ class BBoxFormatProbeCallback(TrainerCallback):
             add_generation_prompt=True,
         )
 
-        inputs = self._prepare_generation_inputs(text=text, images=pil_images)
+        trimmed_images, geometry_encoder_inputs = prepare_generation_images(
+            pil_images, self.image_processor
+        )
+        inputs = self._prepare_generation_inputs(text=text, images=trimmed_images)
+        input_length = inputs["input_ids"].shape[1]
+        max_length = self._get_model_max_length()
+        if max_length is not None and input_length > max_length:
+            raise ValueError(
+                f"input_too_long: {input_length} > model_max_length {max_length}"
+            )
+
         device = next(model.parameters()).device
         for key, value in list(inputs.items()):
             if isinstance(value, torch.Tensor):
                 inputs[key] = value.to(device)
         if self.use_geometry_encoder:
-            inputs["geometry_encoder_inputs"] = [load_and_preprocess_images(pil_images).to(device)]
+            inputs["geometry_encoder_inputs"] = [geometry_encoder_inputs.to(device)]
 
         with torch.no_grad():
             outputs = model.generate(
@@ -215,6 +235,14 @@ class BBoxFormatProbeCallback(TrainerCallback):
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
         )[0]
+
+    def _get_model_max_length(self) -> int | None:
+        max_length = getattr(self.tokenizer, "model_max_length", None)
+        if not isinstance(max_length, int):
+            return None
+        if max_length <= 0 or max_length >= 1_000_000:
+            return None
+        return max_length
 
     def _prepare_generation_inputs(self, text: str, images: List[Image.Image]) -> Dict[str, torch.Tensor]:
         image_inputs = self.image_processor(images=images, videos=None, return_tensors="pt", do_rescale=False)
