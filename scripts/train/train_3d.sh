@@ -14,7 +14,7 @@ NPROC_PER_NODE=$(nvidia-smi --list-gpus | wc -l)  # Automatically detects availa
 MODEL_PATH="/inspire/hdd/project/qproject-fundationmodel/public/yxliu/test/Demongorgan/VG-LLM/models/Qwen2.5-VL-7B-Instruct"  # [ModelArguments] Pretrained model path
 GEOMETRY_ENCODER_TYPE="vggt"
 GEOMETRY_ENCODER_PATH="/inspire/hdd/project/qproject-fundationmodel/public/yxliu/test/Demongorgan/VG-LLM/models/VGGT-1B"
-OUTPUT_DIR="output/7b-add-newtokens"                   # Directory for saving checkpoints
+OUTPUT_DIR="output/7b-add-newtokens-residual"                   # Directory for saving checkpoints
 CACHE_DIR="./cache"                        # [TrainingArguments] Cache directory for models
 mkdir -p $OUTPUT_DIR
 
