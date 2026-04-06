@@ -123,9 +123,15 @@ def match_scanrefer_bbox_with_embodiedscan(scan, scanrefer_bbox):
 def process_data_item(item, scan, desc, answer, images, box, split, object_json=None):
     image_tokens = "".join(["Frame-{}: <image>".format(i) for i in range(len(images))])
     # We select the frame with the clearest view of the object.
+    if args.bbox_coordinate_frame == "target_frame":
+        bbox_coordinate_prompt = 'its 3D bounding box in "bbox_3d" in the frame\'s coordinates.'
+    elif args.bbox_coordinate_frame == "first_frame":
+        bbox_coordinate_prompt = 'its 3D bounding box in "bbox_3d" in the first frame\'s coordinates.'
+    else:
+        raise NotImplementedError(f"Unsupported bbox coordinate frame: {args.bbox_coordinate_frame}")
     prompt=f"""Localize the first clear frame in the video showing the object described in the text.
 Text: {desc}
-Output a JSON dictionary with the frame index in "frame" and its 3D bounding box in "bbox_3d" in the frame's coordinates.
+Output a JSON dictionary with the frame index in "frame" and {bbox_coordinate_prompt}
 """
     question = f"{image_tokens}\n{prompt}"
     output = {
@@ -148,6 +154,7 @@ Output a JSON dictionary with the frame index in "frame" and its 3D bounding box
         },
         "target": object_json if split == "train" else None,
         "gt_bbox": box,
+        "bbox_coordinate_frame": args.bbox_coordinate_frame,
         "prompt": prompt,
     }
 
@@ -201,7 +208,14 @@ def main(data, args):
                     continue
 
                 axis_align_matrix = np.array(scan['axis_align_matrix'])
-                extrinsic = axis_align_matrix @ np.array(images[frame_id]["cam2global"])    # current camera to world
+                if args.bbox_coordinate_frame == "target_frame":
+                    coord_frame_idx = frame_id
+                elif args.bbox_coordinate_frame == "first_frame":
+                    coord_frame_idx = 0
+                else:
+                    raise NotImplementedError(f"Unsupported bbox coordinate frame: {args.bbox_coordinate_frame}")
+
+                extrinsic = axis_align_matrix @ np.array(images[coord_frame_idx]["cam2global"])
                 bbox_3d_in_cam = _9dof_transform_world2cam(box, extrinsic, convention="ZXY")
                 object_json = {
                     "frame": frame_id,
@@ -230,6 +244,13 @@ if __name__ == "__main__":
     parser.add_argument("--split", type=str, default="train", choices=["train", "val"])
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--include_cam_params", action="store_true")
+    parser.add_argument(
+        "--bbox_coordinate_frame",
+        type=str,
+        default="target_frame",
+        choices=["target_frame", "first_frame"],
+        help="Coordinate frame used for bbox_3d in the generated answer.",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)

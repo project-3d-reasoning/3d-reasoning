@@ -21,7 +21,7 @@ mkdir -p $OUTPUT_DIR
 # ======================
 # Model Configuration
 # ======================
-DATASETS="scan2cap,scanrefer,scannet_det"                  # [DataArguments] Dataset with sampling rate
+DATASETS="scan2cap,scanrefer_first_frame,scannet_det"                  # [DataArguments] Dataset with sampling rate
 
 # ======================
 # Training Hyperparameters

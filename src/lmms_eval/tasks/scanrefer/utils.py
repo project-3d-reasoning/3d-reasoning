@@ -55,6 +55,7 @@ def scanrefer_bbox_to_9dof(bbox, convention, extrinsic=None):
 def scanrefer_process_results(doc, results):
     lines = results[0].strip('\n').strip("```").strip("json").strip("\n").split("\n")
     gt_bbox = doc["gt_bbox"]
+    bbox_coordinate_frame = doc.get("bbox_coordinate_frame", "target_frame")
     pred_dict = None
     for line in lines:
         if "bbox_3d" in line:
@@ -74,7 +75,14 @@ def scanrefer_process_results(doc, results):
                 "Invalid bbox_3d format"
             
             frame_idx = pred_dict["frame"]
-            extrinsic = np.array(doc["axis_align_matrix"]) @ np.array(doc["cam2global"][frame_idx])
+            if bbox_coordinate_frame == "target_frame":
+                coord_frame_idx = frame_idx
+            elif bbox_coordinate_frame == "first_frame":
+                coord_frame_idx = 0
+            else:
+                raise ValueError(f"Unsupported bbox coordinate frame: {bbox_coordinate_frame}")
+
+            extrinsic = np.array(doc["axis_align_matrix"]) @ np.array(doc["cam2global"][coord_frame_idx])
             pred_bbox = scanrefer_bbox_to_9dof(pred_dict["bbox_3d"], convention="ZXY", extrinsic=extrinsic)
             iou = EulerDepthInstance3DBoxes.overlaps(
                 EulerDepthInstance3DBoxes(torch.tensor([pred_bbox]), convention="ZXY"),

@@ -57,6 +57,12 @@ SCANREFER = {
     "tag": "3d"
 }
 
+SCANREFER_FIRST_FRAME = {
+    "annotation_path": "data/train/scanrefer_train_32frames_first_frame.json",
+    "data_path": "data/media",
+    "tag": "3d"
+}
+
 SCAN2CAP = {
     "annotation_path": "data/train/scan2cap_train_32frames.json",
     "data_path": "data/media",
@@ -72,6 +78,7 @@ data_dict = {
     "llava_hound": LLAVA_HOUND,
     "scannet_det": SCANNET_DET,
     "scanrefer": SCANREFER,
+    "scanrefer_first_frame": SCANREFER_FIRST_FRAME,
     "scan2cap": SCAN2CAP,
     "spar_234k": SPAR_234K,
     "llava_hound_64k": LLAVA_HOUND_64K,

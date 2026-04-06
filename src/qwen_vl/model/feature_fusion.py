@@ -205,7 +205,7 @@ class FeatureFusionModule(nn.Module):
 
         _, h_grid, w_grid, _ = features_3d.shape
         if self.fusion_method == "add":
-            return features_2d + features_3d
+            return features_2d
             
         elif self.fusion_method == "concat":
             features_2d = self.norm1(features_2d)
