@@ -10,6 +10,11 @@ class ModelArguments:
     tune_mm_mlp: bool = field(default=False)
     tune_mm_vision: bool = field(default=False)
     use_bbox_special_tokens: bool = field(default=False)
+    bbox_coordinate_label_smoothing: float = field(default=0.1)
+    bbox_coordinate_smoothing_neighbor_radius: int = field(default=2)
+    use_bbox_residual_head: bool = field(default=False)
+    bbox_residual_loss_weight: float = field(default=0.25)
+    bbox_residual_loss_weight_warmup_ratio: float = field(default=0.0)
 
     # Geometry encoder configuration
     use_geometry_encoder: bool = field(default=False)  # Whether to use 3D geometry encoder

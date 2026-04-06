@@ -234,6 +234,21 @@ class BBoxFormatProbeCallback(TrainerCallback):
                 pad_token_id=self.tokenizer.pad_token_id,
             )
 
+        if hasattr(model, "refine_bbox_special_token_outputs"):
+            refined_texts = model.refine_bbox_special_token_outputs(
+                tokenizer=self.tokenizer,
+                sequences=outputs,
+                prompt_lengths=[inputs["input_ids"].shape[1]] * outputs.shape[0],
+                pad_token_id=self.tokenizer.pad_token_id,
+                pixel_values=inputs.get("pixel_values"),
+                pixel_values_videos=inputs.get("pixel_values_videos"),
+                image_grid_thw=inputs.get("image_grid_thw"),
+                video_grid_thw=inputs.get("video_grid_thw"),
+                second_per_grid_ts=inputs.get("second_per_grid_ts"),
+                geometry_encoder_inputs=inputs.get("geometry_encoder_inputs"),
+            )
+            return refined_texts[0]
+
         generated_ids = outputs[:, inputs["input_ids"].shape[1] :]
         return self.tokenizer.batch_decode(
             generated_ids,

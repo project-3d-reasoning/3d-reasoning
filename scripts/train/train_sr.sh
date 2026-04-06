@@ -23,6 +23,17 @@ mkdir -p $OUTPUT_DIR
 # ======================
 DATASETS="spar_234k,llava_hound_64k"                  # [DataArguments] Dataset with sampling rate
 USE_BBOX_SPECIAL_TOKENS=False
+MODEL_MAX_LENGTH=12800
+NUM_TRAIN_EPOCHS=1
+
+# BBox token / residual experiment knobs
+BBOX_COORDINATE_LABEL_SMOOTHING=0.02
+BBOX_COORDINATE_SMOOTHING_NEIGHBOR_RADIUS=2
+USE_BBOX_RESIDUAL_HEAD=False
+BBOX_RESIDUAL_LOSS_WEIGHT=0.25
+BBOX_RESIDUAL_LOSS_WEIGHT_WARMUP_RATIO=0.0
+
+# Probe is diagnostic only; keep this high enough when enabling bbox tasks
 BBOX_PROBE_INTERVAL=0
 BBOX_PROBE_NUM_SAMPLES=2
 BBOX_PROBE_MAX_NEW_TOKENS=256
@@ -52,7 +63,7 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --mm_projector_lr 1e-5 \
             --vision_tower_lr 1e-6 \
             --optim adamw_torch \
-            --model_max_length 12800 \
+            --model_max_length $MODEL_MAX_LENGTH \
             --data_flatten False \
             --max_pixels $((576*28*28)) \
             --min_pixels $((16*28*28)) \
@@ -61,7 +72,7 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --video_min_frames 4 \
             --video_max_frame_pixels $((1664*28*28)) \
             --video_min_frame_pixels $((256*28*28)) \
-            --num_train_epochs 1 \
+            --num_train_epochs $NUM_TRAIN_EPOCHS \
             --warmup_ratio 0.03 \
             --lr_scheduler_type "cosine" \
             --weight_decay 0.01 \
@@ -75,6 +86,11 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --seed 0 \
             --report_to "none" \
             --use_bbox_special_tokens $USE_BBOX_SPECIAL_TOKENS \
+            --bbox_coordinate_label_smoothing $BBOX_COORDINATE_LABEL_SMOOTHING \
+            --bbox_coordinate_smoothing_neighbor_radius $BBOX_COORDINATE_SMOOTHING_NEIGHBOR_RADIUS \
+            --use_bbox_residual_head $USE_BBOX_RESIDUAL_HEAD \
+            --bbox_residual_loss_weight $BBOX_RESIDUAL_LOSS_WEIGHT \
+            --bbox_residual_loss_weight_warmup_ratio $BBOX_RESIDUAL_LOSS_WEIGHT_WARMUP_RATIO \
             --bbox_probe_interval $BBOX_PROBE_INTERVAL \
             --bbox_probe_num_samples $BBOX_PROBE_NUM_SAMPLES \
             --bbox_probe_max_new_tokens $BBOX_PROBE_MAX_NEW_TOKENS \

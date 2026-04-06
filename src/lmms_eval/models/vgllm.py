@@ -75,7 +75,12 @@ class VGLLM(lmms):
 
         config = AutoConfig.from_pretrained(pretrained)
 
-        if getattr(config, "use_geometry_encoder", False) or getattr(config, "use_vggt_feature", False):
+        if (
+            getattr(config, "use_geometry_encoder", False)
+            or getattr(config, "use_vggt_feature", False)
+            or getattr(config, "use_bbox_special_tokens", False)
+            or getattr(config, "use_bbox_residual_head", False)
+        ):
             load_class = Qwen2_5_VLForConditionalGenerationWithVGGT
             eval_logger.info("Using Qwen2_5_VLForConditionalGenerationWithVGGT")
         else:
@@ -314,10 +319,26 @@ class VGLLM(lmms):
                 use_cache=self.use_cache,
             )
 
-            generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, cont)]
-            answers = self.processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-            for i, ans in enumerate(answers):
-                answers[i] = ans
+            if hasattr(self.model, "refine_bbox_special_token_outputs"):
+                answers = self.model.refine_bbox_special_token_outputs(
+                    tokenizer=self.processor.tokenizer,
+                    sequences=cont,
+                    prompt_lengths=[inputs.input_ids.shape[1]] * cont.shape[0],
+                    pad_token_id=pad_token_id,
+                    pixel_values=inputs.get("pixel_values"),
+                    pixel_values_videos=inputs.get("pixel_values_videos"),
+                    image_grid_thw=inputs.get("image_grid_thw"),
+                    video_grid_thw=inputs.get("video_grid_thw"),
+                    second_per_grid_ts=inputs.get("second_per_grid_ts"),
+                    geometry_encoder_inputs=inputs.get("geometry_encoder_inputs"),
+                )
+            else:
+                generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, cont)]
+                answers = self.processor.batch_decode(
+                    generated_ids_trimmed,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )
 
             for ans, context in zip(answers, contexts):
                 res.append(ans)

@@ -23,9 +23,10 @@ import transformers
 
 from . import data_list
 from qwen_vl.bbox_special_tokens import (
+    get_bbox_coordinate_token_ids,
     restore_scanrefer_bbox_prompt,
     restore_threedod_bbox_prompt,
-    rewrite_bbox_response_with_special_tokens,
+    rewrite_bbox_response_with_auxiliary_targets,
     rewrite_scan2cap_prompt_with_position_tokens,
 )
 from .rope2d import get_rope_index_25, get_rope_index_2
@@ -61,6 +62,8 @@ def preprocess_qwen_2_visual(
     tokenizer: transformers.PreTrainedTokenizer,
     grid_thw: List = [],
     visual_type: str = "image",
+    bbox_coordinate_token_ids: Optional[set[int]] = None,
+    bbox_response_residual_targets: Optional[Sequence[Sequence[float]]] = None,
 ) -> Dict:
     roles = {"human": "user", "gpt": "assistant"}
     system_message = "You are a helpful assistant."
@@ -73,6 +76,7 @@ def preprocess_qwen_2_visual(
 
     visual_replicate_index = 0
     input_ids, targets = [], []
+    all_bbox_residual_targets, all_bbox_residual_masks = [], []
 
     for i, source in enumerate(sources):
         try:
@@ -82,11 +86,17 @@ def preprocess_qwen_2_visual(
             print(sources)
 
         input_id, target = [], []
+        bbox_residual_target = []
+        bbox_residual_mask = []
+        sample_residual_targets = list(bbox_response_residual_targets[i]) if bbox_response_residual_targets else []
+        sample_residual_index = 0
 
         input_id += tokenizer.apply_chat_template(
             [{"role": "system", "content": system_message}]
         )
         target += [IGNORE_INDEX] * len(input_id)
+        bbox_residual_target += [0.0] * len(input_id)
+        bbox_residual_mask += [False] * len(input_id)
 
         for conv in source:
             try:
@@ -118,22 +128,49 @@ def preprocess_qwen_2_visual(
             conv = [{"role": role, "content": content}]
             encode_id = tokenizer.apply_chat_template(conv)
             input_id += encode_id
+            token_residual_target = [0.0] * len(encode_id)
+            token_residual_mask = [False] * len(encode_id)
             if role in ["user", "system"]:
                 target += [IGNORE_INDEX] * len(encode_id)
             else:
                 target_mask = encode_id.copy()
                 target_mask[:3] = [IGNORE_INDEX] * 3
                 target += target_mask
+                if bbox_coordinate_token_ids:
+                    coordinate_positions = [
+                        idx for idx, token_id in enumerate(encode_id)
+                        if idx >= 3 and token_id in bbox_coordinate_token_ids
+                    ]
+                    residual_count = min(
+                        len(coordinate_positions),
+                        len(sample_residual_targets) - sample_residual_index,
+                    )
+                    for offset in range(max(residual_count, 0)):
+                        position = coordinate_positions[offset]
+                        token_residual_target[position] = float(
+                            sample_residual_targets[sample_residual_index + offset]
+                        )
+                        token_residual_mask[position] = True
+                    sample_residual_index += max(residual_count, 0)
+
+            bbox_residual_target += token_residual_target
+            bbox_residual_mask += token_residual_mask
 
         assert len(input_id) == len(target), f"{len(input_id)} != {len(target)}"
         input_ids.append(input_id)
         targets.append(target)
+        all_bbox_residual_targets.append(bbox_residual_target)
+        all_bbox_residual_masks.append(bbox_residual_mask)
 
     input_ids = torch.tensor(input_ids, dtype=torch.long)
     targets = torch.tensor(targets, dtype=torch.long)
+    bbox_residual_targets = torch.tensor(all_bbox_residual_targets, dtype=torch.float32)
+    bbox_residual_masks = torch.tensor(all_bbox_residual_masks, dtype=torch.bool)
     return dict(
         input_ids=input_ids,
         labels=targets,
+        bbox_residual_targets=bbox_residual_targets,
+        bbox_residual_mask=bbox_residual_masks,
     )
 
 
@@ -154,6 +191,11 @@ class LazySupervisedDataset(Dataset):
         )
         self.model_type = data_args.model_type
         self.use_bbox_special_tokens = getattr(data_args, "use_bbox_special_tokens", False)
+        self.bbox_coordinate_token_ids = (
+            set(get_bbox_coordinate_token_ids(tokenizer))
+            if self.use_bbox_special_tokens
+            else set()
+        )
         if data_args.model_type == "qwen2.5vl":
             self.get_rope_index = get_rope_index_25
         else:
@@ -389,6 +431,9 @@ class LazySupervisedDataset(Dataset):
             sources = [sources]
         assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
         source_item = sources[0]
+        bbox_response_residual_targets = [
+            source.get("bbox_response_residual_targets", []) for source in sources
+        ]
         video = None
         
         if "video" in source_item:
@@ -442,7 +487,12 @@ class LazySupervisedDataset(Dataset):
             ]
             sources = copy.deepcopy([e["conversations"] for e in sources])
             data_dict = preprocess_qwen_2_visual(
-                sources, self.tokenizer, grid_thw=grid_thw_merged, visual_type="image"
+                sources,
+                self.tokenizer,
+                grid_thw=grid_thw_merged,
+                visual_type="image",
+                bbox_coordinate_token_ids=self.bbox_coordinate_token_ids,
+                bbox_response_residual_targets=bbox_response_residual_targets,
             )
             position_ids, _ = self.get_rope_index(
                 self.data_args.image_processor.merge_size,
@@ -478,7 +528,12 @@ class LazySupervisedDataset(Dataset):
             ]
             sources = copy.deepcopy([e["conversations"] for e in sources])
             data_dict = preprocess_qwen_2_visual(
-                sources, self.tokenizer, grid_thw=grid_thw_merged, visual_type="video"
+                sources,
+                self.tokenizer,
+                grid_thw=grid_thw_merged,
+                visual_type="video",
+                bbox_coordinate_token_ids=self.bbox_coordinate_token_ids,
+                bbox_response_residual_targets=bbox_response_residual_targets,
             )
             position_ids, _ = self.get_rope_index(
                 self.data_args.image_processor.merge_size,
@@ -490,7 +545,11 @@ class LazySupervisedDataset(Dataset):
             grid_thw_merged = None
             sources = copy.deepcopy([e["conversations"] for e in sources])
             data_dict = preprocess_qwen_2_visual(
-                sources, self.tokenizer, grid_thw=grid_thw_merged
+                sources,
+                self.tokenizer,
+                grid_thw=grid_thw_merged,
+                bbox_coordinate_token_ids=self.bbox_coordinate_token_ids,
+                bbox_response_residual_targets=bbox_response_residual_targets,
             )
             position_ids = (
                 torch.arange(0, data_dict["input_ids"].size(1))
@@ -503,6 +562,8 @@ class LazySupervisedDataset(Dataset):
             data_dict = dict(
                 input_ids=data_dict["input_ids"][0],
                 labels=data_dict["labels"][0],
+                bbox_residual_targets=data_dict["bbox_residual_targets"][0],
+                bbox_residual_mask=data_dict["bbox_residual_mask"][0],
                 position_ids=position_ids,
             )
 
@@ -529,11 +590,17 @@ class LazySupervisedDataset(Dataset):
             sample["prompt"] = restore_scanrefer_bbox_prompt(sample.get("prompt", ""))
             conversations[0]["value"] = restore_scanrefer_bbox_prompt(conversations[0]["value"])
             if len(conversations) > 1:
-                conversations[1]["value"] = rewrite_bbox_response_with_special_tokens(conversations[1]["value"])
+                (
+                    conversations[1]["value"],
+                    sample["bbox_response_residual_targets"],
+                ) = rewrite_bbox_response_with_auxiliary_targets(conversations[1]["value"])
         elif dataset_name == "scannet_det":
             conversations[0]["value"] = restore_threedod_bbox_prompt(conversations[0]["value"])
             if len(conversations) > 1:
-                conversations[1]["value"] = rewrite_bbox_response_with_special_tokens(conversations[1]["value"])
+                (
+                    conversations[1]["value"],
+                    sample["bbox_response_residual_targets"],
+                ) = rewrite_bbox_response_with_auxiliary_targets(conversations[1]["value"])
         elif dataset_name == "scan2cap":
             conversations[0]["value"] = rewrite_scan2cap_prompt_with_position_tokens(conversations[0]["value"])
 
@@ -562,9 +629,15 @@ class DataCollatorForSupervisedDataset(object):
     tokenizer: transformers.PreTrainedTokenizer
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
-        input_ids, labels, position_ids = tuple(
+        input_ids, labels, position_ids, bbox_residual_targets, bbox_residual_mask = tuple(
             [instance[key] for instance in instances]
-            for key in ("input_ids", "labels", "position_ids")
+            for key in (
+                "input_ids",
+                "labels",
+                "position_ids",
+                "bbox_residual_targets",
+                "bbox_residual_mask",
+            )
         )
         input_ids = torch.nn.utils.rnn.pad_sequence(
             input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
@@ -572,14 +645,24 @@ class DataCollatorForSupervisedDataset(object):
         labels = torch.nn.utils.rnn.pad_sequence(
             labels, batch_first=True, padding_value=IGNORE_INDEX
         )
+        bbox_residual_targets = torch.nn.utils.rnn.pad_sequence(
+            bbox_residual_targets, batch_first=True, padding_value=0.0
+        )
+        bbox_residual_mask = torch.nn.utils.rnn.pad_sequence(
+            bbox_residual_mask, batch_first=True, padding_value=False
+        )
         position_ids = pad_and_cat(position_ids)
         input_ids = input_ids[:, : self.tokenizer.model_max_length]
         labels = labels[:, : self.tokenizer.model_max_length]
+        bbox_residual_targets = bbox_residual_targets[:, : self.tokenizer.model_max_length]
+        bbox_residual_mask = bbox_residual_mask[:, : self.tokenizer.model_max_length]
         position_ids = position_ids[:, :, : self.tokenizer.model_max_length]
         batch = dict(
             input_ids=input_ids,
             labels=labels,
             attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
+            bbox_residual_targets=bbox_residual_targets,
+            bbox_residual_mask=bbox_residual_mask,
         )
         images = list(
             itertools.chain(
@@ -653,9 +736,15 @@ class FlattenedDataCollatorForSupervisedDataset(DataCollatorForSupervisedDataset
     tokenizer: transformers.PreTrainedTokenizer
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
-        input_ids, labels, position_ids = tuple(
+        input_ids, labels, position_ids, bbox_residual_targets, bbox_residual_mask = tuple(
             [instance[key] for instance in instances]
-            for key in ("input_ids", "labels", "position_ids")
+            for key in (
+                "input_ids",
+                "labels",
+                "position_ids",
+                "bbox_residual_targets",
+                "bbox_residual_mask",
+            )
         )
 
         seq_lens = torch.tensor(
@@ -664,6 +753,8 @@ class FlattenedDataCollatorForSupervisedDataset(DataCollatorForSupervisedDataset
         cumsum_seq_lens = torch.cumsum(seq_lens, dim=0, dtype=torch.int32)
         input_ids = torch.cat(input_ids, dim=0)
         labels = torch.cat(labels, dim=0)
+        bbox_residual_targets = torch.cat(bbox_residual_targets, dim=0)
+        bbox_residual_mask = torch.cat(bbox_residual_mask, dim=0)
         position_ids = torch.cat(position_ids, dim=2)
 
         batch = dict(
@@ -671,6 +762,8 @@ class FlattenedDataCollatorForSupervisedDataset(DataCollatorForSupervisedDataset
             labels=labels.unsqueeze(0),
             attention_mask=cumsum_seq_lens,
             position_ids=position_ids,
+            bbox_residual_targets=bbox_residual_targets.unsqueeze(0),
+            bbox_residual_mask=bbox_residual_mask.unsqueeze(0),
         )
         images = list(
             itertools.chain(

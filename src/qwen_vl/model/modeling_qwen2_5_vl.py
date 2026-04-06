@@ -49,6 +49,7 @@ from transformers.utils import (
     logging,
     replace_return_docstrings,
 )
+from qwen_vl.bbox_special_tokens import refine_bbox_response_with_residuals
 from .configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLVisionConfig
 from .vggt.models.vggt import VGGT
 from .geometry_encoders import create_geometry_encoder, GeometryEncoderConfig
@@ -1495,6 +1496,7 @@ class Qwen2_5_VLCausalLMOutputWithPast(ModelOutput):
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[torch.FloatTensor]] = None
     rope_deltas: Optional[torch.LongTensor] = None
+    bbox_token_residuals: Optional[torch.FloatTensor] = None
 
 
 QWEN2_5_VL_INPUTS_DOCSTRING = r"""
@@ -1589,6 +1591,9 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         self.model = Qwen2_5_VLModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.bbox_residual_head = None
+        if getattr(config, "use_bbox_residual_head", False):
+            self.bbox_residual_head = nn.Linear(config.hidden_size, 1)
         self.rope_deltas = None  # cache rope_deltas here
 
         # Initialize weights and apply final processing
@@ -1679,6 +1684,122 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
 
     def get_decoder(self):
         return self.model
+
+    def _predict_bbox_token_residuals(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+        if self.bbox_residual_head is None:
+            return None
+        if hidden_states.shape[1] == 0:
+            return hidden_states.new_zeros(hidden_states.shape[:2])
+        residuals = self.bbox_residual_head(hidden_states[..., :-1, :]).squeeze(-1)
+        residuals = 0.5 * torch.tanh(residuals)
+        return F.pad(residuals, (1, 0), value=0.0)
+
+    def _compute_bbox_coordinate_loss(
+        self,
+        coordinate_logits: torch.Tensor,
+        coordinate_labels: torch.Tensor,
+        label_smoothing: float,
+    ) -> torch.Tensor:
+        if coordinate_logits.numel() == 0:
+            return coordinate_logits.new_tensor(0.0)
+        if label_smoothing <= 0:
+            return F.cross_entropy(
+                coordinate_logits,
+                coordinate_labels,
+                reduction="mean",
+            )
+
+        neighbor_token_ids = getattr(self.config, "bbox_coordinate_neighbor_token_ids", None) or {}
+        log_probs = F.log_softmax(coordinate_logits, dim=-1)
+        loss_sum = coordinate_logits.new_tensor(0.0)
+        loss_count = coordinate_logits.new_tensor(0.0)
+
+        for token_id in torch.unique(coordinate_labels).tolist():
+            token_mask = coordinate_labels == token_id
+            token_log_probs = log_probs[token_mask]
+            token_nll = -token_log_probs[:, token_id]
+            neighbors = neighbor_token_ids.get(str(int(token_id)), [])
+            if neighbors:
+                neighbor_nll = -token_log_probs[:, neighbors].mean(dim=-1)
+                token_loss = (1.0 - label_smoothing) * token_nll + label_smoothing * neighbor_nll
+            else:
+                token_loss = token_nll
+            loss_sum = loss_sum + token_loss.sum()
+            loss_count = loss_count + token_mask.sum().to(coordinate_logits.dtype)
+
+        return loss_sum / loss_count.clamp_min(1.0)
+
+    @torch.no_grad()
+    def refine_bbox_special_token_outputs(
+        self,
+        tokenizer,
+        sequences: torch.LongTensor,
+        prompt_lengths: List[int],
+        pad_token_id: Optional[int] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.FloatTensor] = None,
+        image_grid_thw: Optional[torch.LongTensor] = None,
+        video_grid_thw: Optional[torch.LongTensor] = None,
+        second_per_grid_ts: Optional[torch.Tensor] = None,
+        geometry_encoder_inputs: Optional[List[torch.Tensor]] = None,
+    ) -> List[str]:
+        generated_ids = [
+            sequences[idx, int(prompt_length) :]
+            for idx, prompt_length in enumerate(prompt_lengths)
+        ]
+        decoded_texts = tokenizer.batch_decode(
+            generated_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+
+        coordinate_token_ids = getattr(self.config, "bbox_coordinate_token_ids", None) or []
+        if self.bbox_residual_head is None or not coordinate_token_ids:
+            return decoded_texts
+
+        if pad_token_id is not None:
+            attention_mask = sequences.ne(pad_token_id)
+        else:
+            attention_mask = torch.ones_like(sequences, dtype=torch.bool)
+
+        outputs = self(
+            input_ids=sequences,
+            attention_mask=attention_mask.long(),
+            position_ids=None,
+            use_cache=False,
+            return_dict=True,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            second_per_grid_ts=second_per_grid_ts,
+            geometry_encoder_inputs=geometry_encoder_inputs,
+        )
+        bbox_token_residuals = outputs.bbox_token_residuals
+        if bbox_token_residuals is None:
+            return decoded_texts
+
+        coordinate_token_id_set = {int(token_id) for token_id in coordinate_token_ids}
+        refined_texts = []
+        for batch_idx, decoded_text in enumerate(decoded_texts):
+            if not any(token in decoded_text for token in ("|position_", "|size_", "|angle_")):
+                refined_texts.append(decoded_text)
+                continue
+
+            residual_values = []
+            for position in range(int(prompt_lengths[batch_idx]), sequences.shape[1]):
+                if not attention_mask[batch_idx, position]:
+                    continue
+                if int(sequences[batch_idx, position].item()) in coordinate_token_id_set:
+                    residual_values.append(float(bbox_token_residuals[batch_idx, position].item()))
+            refined_texts.append(
+                refine_bbox_response_with_residuals(
+                    decoded_text,
+                    residual_values,
+                )
+            )
+
+        return refined_texts
 
     def get_rope_index(
         self,
@@ -1868,6 +1989,8 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
+        bbox_residual_targets: Optional[torch.FloatTensor] = None,
+        bbox_residual_mask: Optional[torch.BoolTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -2021,6 +2144,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
 
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
+        bbox_token_residuals = self._predict_bbox_token_residuals(hidden_states)
         loss = None
         if labels is not None:
             # Upcast to float if we need to compute the loss to avoid potential precision issues
@@ -2065,11 +2189,10 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 loss_count = loss_count + non_coordinate_count
 
             if coordinate_mask.any():
-                coordinate_loss = F.cross_entropy(
+                coordinate_loss = self._compute_bbox_coordinate_loss(
                     shift_logits[coordinate_mask],
                     shift_labels[coordinate_mask],
-                    reduction="mean",
-                    label_smoothing=bbox_coordinate_label_smoothing,
+                    bbox_coordinate_label_smoothing,
                 )
                 coordinate_count = coordinate_mask.sum().to(shift_logits.dtype)
                 loss_sum = loss_sum + coordinate_loss * coordinate_count
@@ -2079,6 +2202,35 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 loss = loss_sum / loss_count
             else:
                 loss = shift_logits.new_tensor(0.0)
+
+            bbox_residual_loss_weight = float(
+                getattr(
+                    self.config,
+                    "bbox_residual_loss_weight_current",
+                    getattr(self.config, "bbox_residual_loss_weight", 0.0),
+                )
+            )
+            if (
+                bbox_token_residuals is not None
+                and bbox_residual_targets is not None
+                and bbox_residual_mask is not None
+                and bbox_residual_loss_weight > 0
+            ):
+                shift_bbox_residuals = bbox_token_residuals[..., 1:].contiguous().view(-1)
+                shift_bbox_targets = (
+                    bbox_residual_targets[..., 1:].contiguous().to(shift_logits.device).view(-1)
+                )
+                shift_bbox_mask = (
+                    bbox_residual_mask[..., 1:].contiguous().to(shift_logits.device).view(-1)
+                )
+                valid_bbox_residual_mask = shift_bbox_mask & valid_mask
+                if valid_bbox_residual_mask.any():
+                    bbox_residual_loss = F.smooth_l1_loss(
+                        shift_bbox_residuals[valid_bbox_residual_mask],
+                        shift_bbox_targets[valid_bbox_residual_mask],
+                        reduction="mean",
+                    )
+                    loss = loss + bbox_residual_loss_weight * bbox_residual_loss
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -2091,6 +2243,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             rope_deltas=self.rope_deltas,
+            bbox_token_residuals=bbox_token_residuals,
         )
 
     def prepare_inputs_for_generation(

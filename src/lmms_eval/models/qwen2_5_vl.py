@@ -10,6 +10,7 @@ from loguru import logger as eval_logger
 from PIL import Image
 from tqdm import tqdm
 from transformers import (
+    AutoConfig,
     AutoProcessor,
     AutoTokenizer,
     Qwen2_5_VLForConditionalGeneration,
@@ -20,6 +21,7 @@ from lmms_eval.api.instance import Instance
 from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model
 from lmms_eval.models.model_utils.load_video import read_video_pyav_base64
+from qwen_vl.model.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGenerationWithVGGT
 
 try:
     from qwen_vl_utils import process_vision_info
@@ -73,15 +75,32 @@ class Qwen2_5_VL(lmms):
             self._device = torch.device(f"cuda:{accelerator.local_process_index}")
             self.device_map = f"cuda:{accelerator.local_process_index}"
 
+        config = AutoConfig.from_pretrained(pretrained)
+        if (
+            getattr(config, "use_geometry_encoder", False)
+            or getattr(config, "use_vggt_feature", False)
+            or getattr(config, "use_bbox_special_tokens", False)
+            or getattr(config, "use_bbox_residual_head", False)
+        ):
+            load_class = Qwen2_5_VLForConditionalGenerationWithVGGT
+        else:
+            load_class = Qwen2_5_VLForConditionalGeneration
+
         if use_flash_attention_2:
-            self._model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            self._model = load_class.from_pretrained(
                 pretrained,
+                config=config,
                 torch_dtype=torch.bfloat16,
                 device_map=self.device_map,
                 attn_implementation="flash_attention_2",
             ).eval()
         else:
-            self._model = Qwen2_5_VLForConditionalGeneration.from_pretrained(pretrained, torch_dtype="auto", device_map=self.device_map).eval()
+            self._model = load_class.from_pretrained(
+                pretrained,
+                config=config,
+                torch_dtype="auto",
+                device_map=self.device_map,
+            ).eval()
         self.max_pixels = max_pixels
         self.min_pixels = min_pixels
         self.max_num_frames = max_num_frames
@@ -303,10 +322,25 @@ class Qwen2_5_VL(lmms):
                 use_cache=self.use_cache,
             )
 
-            generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, cont)]
-            answers = self.processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-            for i, ans in enumerate(answers):
-                answers[i] = ans
+            if hasattr(self.model, "refine_bbox_special_token_outputs"):
+                answers = self.model.refine_bbox_special_token_outputs(
+                    tokenizer=self.processor.tokenizer,
+                    sequences=cont,
+                    prompt_lengths=[inputs.input_ids.shape[1]] * cont.shape[0],
+                    pad_token_id=pad_token_id,
+                    pixel_values=inputs.get("pixel_values"),
+                    pixel_values_videos=inputs.get("pixel_values_videos"),
+                    image_grid_thw=inputs.get("image_grid_thw"),
+                    video_grid_thw=inputs.get("video_grid_thw"),
+                    second_per_grid_ts=inputs.get("second_per_grid_ts"),
+                )
+            else:
+                generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, cont)]
+                answers = self.processor.batch_decode(
+                    generated_ids_trimmed,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )
 
             for ans, context in zip(answers, contexts):
                 res.append(ans)

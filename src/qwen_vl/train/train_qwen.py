@@ -31,6 +31,7 @@ sys.path.append(str(project_root))
 import qwen_vl.train.trainer
 import qwen_vl.train.sampler
 from qwen_vl.train.bbox_probe import BBoxFormatProbeCallback
+from qwen_vl.train.bbox_residual_schedule import BBoxResidualWeightWarmupCallback
 from trainer import replace_qwen2_vl_attention_class
 
 from transformers import (
@@ -90,10 +91,16 @@ def set_model(model_args, model):
         for n, p in model.model.named_parameters():
             p.requires_grad = True
         model.lm_head.requires_grad = True
+        if getattr(model, "bbox_residual_head", None) is not None:
+            for p in model.bbox_residual_head.parameters():
+                p.requires_grad = True
     else:
         for n, p in model.model.named_parameters():
             p.requires_grad = False
         model.lm_head.requires_grad = False
+        if getattr(model, "bbox_residual_head", None) is not None:
+            for p in model.bbox_residual_head.parameters():
+                p.requires_grad = False
 
     if model_args.use_geometry_encoder:
         # vggt is frozen
@@ -114,43 +121,45 @@ def train(attn_implementation="flash_attention_2"):
     os.makedirs(training_args.output_dir, exist_ok=True)
 
     if "qwen2.5" in model_args.model_name_or_path.lower():
-        if not model_args.use_geometry_encoder:
-            from transformers import Qwen2_5_VLForConditionalGeneration
-            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                model_args.model_name_or_path,
-                cache_dir=training_args.cache_dir,
-                attn_implementation=attn_implementation,
-                torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
+        from qwen_vl.model.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGenerationWithVGGT
+        config = AutoConfig.from_pretrained(model_args.model_name_or_path)
+        if hasattr(config, "use_geometry_encoder") and config.use_geometry_encoder != model_args.use_geometry_encoder:
+            raise ValueError(
+                "The use_geometry_encoder in config and model_args are not consistent. "
+                "Please check the model config."
             )
-        else:
-            from qwen_vl.model.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGenerationWithVGGT
-            config = AutoConfig.from_pretrained(model_args.model_name_or_path)
-            if hasattr(config, "use_geometry_encoder") and config.use_geometry_encoder != model_args.use_geometry_encoder:
-                raise ValueError(
-                    "The use_geometry_encoder in config and model_args are not consistent. "
-                    "Please check the model config."
-                )
 
-            for k in [
-                "use_geometry_encoder", 
-                "geometry_encoder_type", 
-                "reference_frame",
-                "feature_fusion_method", 
-                "fusion_num_layers",
-                "geometry_merger_type"
-            ]:
-                setattr(config, k, getattr(model_args, k))
+        for k in [
+            "use_geometry_encoder", 
+            "geometry_encoder_type", 
+            "reference_frame",
+            "feature_fusion_method", 
+            "fusion_num_layers",
+            "geometry_merger_type",
+            "use_bbox_special_tokens",
+            "bbox_coordinate_label_smoothing",
+            "bbox_coordinate_smoothing_neighbor_radius",
+            "use_bbox_residual_head",
+            "bbox_residual_loss_weight",
+            "bbox_residual_loss_weight_warmup_ratio",
+        ]:
+            setattr(config, k, getattr(model_args, k))
 
+        model_load_kwargs = dict(
+            pretrained_model_name_or_path=model_args.model_name_or_path,
+            config=config,
+            cache_dir=training_args.cache_dir,
+            attn_implementation=attn_implementation,
+            torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
+        )
+        if model_args.use_geometry_encoder:
             assert model_args.geometry_encoder_path is not None, \
                 "geometry_encoder_path must be set in the config when use_geometry_encoder is True."
-            model = Qwen2_5_VLForConditionalGenerationWithVGGT.from_pretrained(
-                pretrained_model_name_or_path=model_args.model_name_or_path,
-                config=config,
-                cache_dir=training_args.cache_dir,
-                attn_implementation=attn_implementation,
-                torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-                geometry_encoder_path=model_args.geometry_encoder_path
-            )
+            model_load_kwargs["geometry_encoder_path"] = model_args.geometry_encoder_path
+
+        model = Qwen2_5_VLForConditionalGenerationWithVGGT.from_pretrained(
+            **model_load_kwargs
+        )
 
         data_args.image_processor = AutoProcessor.from_pretrained(
             model_args.model_name_or_path,
@@ -191,7 +200,13 @@ def train(attn_implementation="flash_attention_2"):
     )
     if model_args.use_bbox_special_tokens:
         num_new_tokens = add_bbox_tokens(tokenizer)
-        resize_model_embeddings_for_bbox_tokens(model, tokenizer, num_new_tokens)
+        resize_model_embeddings_for_bbox_tokens(
+            model,
+            tokenizer,
+            num_new_tokens,
+            coordinate_label_smoothing=model_args.bbox_coordinate_label_smoothing,
+            coordinate_smoothing_neighbor_radius=model_args.bbox_coordinate_smoothing_neighbor_radius,
+        )
     set_model(model_args, model)
 
     if torch.distributed.get_rank() == 0:
@@ -206,6 +221,13 @@ def train(attn_implementation="flash_attention_2"):
     trainer = Trainer(
         model=model, processing_class=tokenizer, args=training_args, **data_module
     )
+    if model_args.use_bbox_residual_head and model_args.bbox_residual_loss_weight > 0:
+        trainer.add_callback(
+            BBoxResidualWeightWarmupCallback(
+                target_weight=model_args.bbox_residual_loss_weight,
+                warmup_ratio=model_args.bbox_residual_loss_weight_warmup_ratio,
+            )
+        )
     if training_args.bbox_probe_interval > 0:
         trainer.add_callback(
             BBoxFormatProbeCallback(
