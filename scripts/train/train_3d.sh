@@ -24,7 +24,7 @@ mkdir -p $OUTPUT_DIR
 DATASETS="scan2cap,scanrefer,scannet_det"                  # [DataArguments] Dataset with sampling rate
 USE_BBOX_SPECIAL_TOKENS=True
 MODEL_MAX_LENGTH=12800
-NUM_TRAIN_EPOCHS=2
+NUM_TRAIN_EPOCHS=1
 
 # BBox token / residual experiment knobs
 BBOX_COORDINATE_LABEL_SMOOTHING=0.02
@@ -42,7 +42,7 @@ BBOX_PROBE_MAX_NEW_TOKENS=12800
 # Training Hyperparameters
 # ======================
 export NCCL_NVLS_ENABLE=0
-LR=1e-5
+LR=5e-5
 total_batch_size=64
 GRADIENT_ACCUMULATION_STEPS=$(($total_batch_size / $NPROC_PER_NODE))
 
@@ -61,8 +61,8 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --per_device_train_batch_size 1 \
             --gradient_accumulation_steps $GRADIENT_ACCUMULATION_STEPS \
             --learning_rate $LR \
-            --mm_projector_lr 1e-5 \
-            --vision_tower_lr 1e-6 \
+            --mm_projector_lr 5e-5 \
+            --vision_tower_lr 5e-6 \
             --optim adamw_torch \
             --model_max_length $MODEL_MAX_LENGTH \
             --data_flatten False \
