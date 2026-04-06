@@ -23,7 +23,7 @@ import transformers
 
 from . import data_list
 from .rope2d import get_rope_index_25, get_rope_index_2
-from .utils import prepare_image_inputs
+from .utils import load_first_frame_coord_inputs, prepare_image_inputs
 
 IGNORE_INDEX = -100
 IMAGE_TOKEN_INDEX = 151655
@@ -402,12 +402,13 @@ class LazySupervisedDataset(Dataset):
             image_folder = self.list_data_dict[i]["data_path"]
             image_file = self.list_data_dict[i]["image"]
             if isinstance(image_file, List):
+                image_paths = None
 
                 if isinstance(image_file[0], str):
-                    image_file = [
+                    image_paths = [
                         os.path.join(image_folder, file) for file in image_file
                     ]
-                    image_file = [Image.open(img).convert("RGB") for img in image_file]
+                    image_file = [Image.open(img).convert("RGB") for img in image_paths]
                 elif isinstance(image_file[0], Image.Image):
                     pass
                 else:
@@ -416,6 +417,9 @@ class LazySupervisedDataset(Dataset):
                 self.draw_visual_marks(image_file, sources[0].get("spar_info", None))
 
                 image, grid_thw, geometry_encoder_inputs = [], [], []
+                coord_pe_points, coord_pe_masks = None, None
+                if getattr(self.data_args, "use_coord_pe", False) and image_paths is not None:
+                    coord_pe_points, coord_pe_masks = load_first_frame_coord_inputs(image_paths)
                 for file in image_file:
                     ret = prepare_image_inputs(file, self.data_args.image_processor)
                     image.append(ret["pixel_values"])
@@ -500,6 +504,9 @@ class LazySupervisedDataset(Dataset):
             data_dict["image_grid_thw"] = grid_thw
             if getattr(self.data_args, "use_geometry_encoder", False):
                 data_dict["geometry_encoder_inputs"] = geometry_encoder_inputs
+            if coord_pe_points is not None and coord_pe_masks is not None:
+                data_dict["coord_pe_points"] = coord_pe_points
+                data_dict["coord_pe_masks"] = coord_pe_masks
         # video exist in the data
         elif "video" in self.list_data_dict[i]:
             data_dict["pixel_values_videos"] = video
@@ -609,6 +616,9 @@ class DataCollatorForSupervisedDataset(object):
         if "geometry_encoder_inputs" in instances[0]:
             geometry_encoder_inputs = [torch.stack(instance["geometry_encoder_inputs"]) for instance in instances]
             batch["geometry_encoder_inputs"] = geometry_encoder_inputs
+            if "coord_pe_points" in instances[0]:
+                batch["coord_pe_points"] = [torch.stack(instance["coord_pe_points"]) for instance in instances]
+                batch["coord_pe_masks"] = [torch.stack(instance["coord_pe_masks"]) for instance in instances]
             assert len(set([instance["tag"] for instance in instances])) == 1, "all data in a batch should have the same tag"
             batch["tag"] = instances[0]["tag"]
         return batch

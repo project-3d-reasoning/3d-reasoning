@@ -19,6 +19,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from qwen_vl.model.vggt.models.vggt import VGGT  # noqa: E402
+from qwen_vl.model.vggt.utils.pose_enc import pose_encoding_to_extri_intri  # noqa: E402
 
 
 def parse_args():
@@ -83,6 +84,33 @@ def parse_args():
         "--save-json",
         type=Path,
         default=None,
+    )
+    parser.add_argument(
+        "--comparison-mode",
+        type=str,
+        default="pred_current_to_first_vs_gt_first",
+        choices=[
+            "pred_first_vs_gt_first",
+            "pred_current_vs_gt_current",
+            "pred_current_to_first_vs_gt_first",
+        ],
+        help=(
+            "How to compare predicted points against GT. "
+            "Use this to test whether VGGT outputs first-frame coordinates or per-frame camera coordinates."
+        ),
+    )
+    parser.add_argument(
+        "--prediction-source",
+        type=str,
+        default="point",
+        choices=["point", "depth_cam", "depth_gtcam", "depth_gtpose", "depth_gtintrinsics"],
+        help=(
+            "How to build predicted 3D points. "
+            "`depth_cam` uses predicted depth + predicted camera; "
+            "`depth_gtcam` uses predicted depth + GT pose/intrinsics; "
+            "`depth_gtpose` uses predicted depth + GT pose + predicted intrinsics; "
+            "`depth_gtintrinsics` uses predicted depth + predicted pose + GT intrinsics."
+        ),
     )
     return parser.parse_args()
 
@@ -159,6 +187,37 @@ def unproject_depth_to_cam(depth_m: np.ndarray, intrinsic: np.ndarray):
     return points, valid
 
 
+def invert_extrinsic_3x4(extrinsic: np.ndarray) -> np.ndarray:
+    rotation = extrinsic[:3, :3]
+    translation = extrinsic[:3, 3:4]
+    rotation_t = rotation.T
+    inv_translation = -rotation_t @ translation
+    inv = np.zeros((4, 4), dtype=np.float32)
+    inv[:3, :3] = rotation_t
+    inv[:3, 3:4] = inv_translation
+    inv[3, 3] = 1.0
+    return inv
+
+
+def depth_to_world_coords_points(depth_map: np.ndarray, extrinsic: np.ndarray, intrinsic: np.ndarray):
+    cam_coords_points, point_mask = unproject_depth_to_cam(depth_map, intrinsic)
+    cam_to_world = invert_extrinsic_3x4(extrinsic)
+    world_coords_points = transform_points(cam_coords_points, cam_to_world)
+    return world_coords_points, point_mask
+
+
+def unproject_depth_map_to_point_map_local(depth_map: np.ndarray, extrinsics_cam: np.ndarray, intrinsics_cam: np.ndarray):
+    world_points_list = []
+    for frame_idx in range(depth_map.shape[0]):
+        cur_world_points, _ = depth_to_world_coords_points(
+            depth_map[frame_idx].squeeze(-1),
+            extrinsics_cam[frame_idx],
+            intrinsics_cam[frame_idx],
+        )
+        world_points_list.append(cur_world_points)
+    return np.stack(world_points_list, axis=0)
+
+
 def transform_points(points: np.ndarray, transform: np.ndarray):
     ones = np.ones((*points.shape[:2], 1), dtype=np.float32)
     points_h = np.concatenate([points, ones], axis=-1)
@@ -168,8 +227,12 @@ def transform_points(points: np.ndarray, transform: np.ndarray):
 
 def load_sequence_inputs(image_rel_paths, data_root: Path, target_size: int):
     rgb_tensors = []
+    gt_points_current_frame = []
     gt_points_first_frame = []
     valid_masks = []
+    cam_to_first_transforms = []
+    cam_from_first_extrinsics = []
+    gt_intrinsics_processed = []
 
     first_pose = None
 
@@ -190,6 +253,7 @@ def load_sequence_inputs(image_rel_paths, data_root: Path, target_size: int):
         depth_intrinsic = read_matrix(depth_intrinsic_path)[:3, :3]
         depth_m, depth_intrinsic = preprocess_depth_and_intrinsics(depth_m, depth_intrinsic, target_size)
         cam_points, valid = unproject_depth_to_cam(depth_m, depth_intrinsic)
+        gt_intrinsics_processed.append(depth_intrinsic.astype(np.float32))
 
         pose = read_matrix(pose_path)
         if first_pose is None:
@@ -197,15 +261,23 @@ def load_sequence_inputs(image_rel_paths, data_root: Path, target_size: int):
             first_pose_inv = np.linalg.inv(first_pose).astype(np.float32)
 
         cam_to_first = (first_pose_inv @ pose).astype(np.float32)
+        cam_from_first = (np.linalg.inv(pose) @ first_pose).astype(np.float32)
         gt_points_first = transform_points(cam_points, cam_to_first)
 
+        gt_points_current_frame.append(cam_points)
         gt_points_first_frame.append(gt_points_first)
         valid_masks.append(valid)
+        cam_to_first_transforms.append(cam_to_first)
+        cam_from_first_extrinsics.append(cam_from_first[:3])
 
     images = torch.stack(rgb_tensors, dim=0)
+    gt_points_current = np.stack(gt_points_current_frame, axis=0)
     gt_points = np.stack(gt_points_first_frame, axis=0)
     valid_masks = np.stack(valid_masks, axis=0)
-    return images, gt_points, valid_masks
+    cam_to_first = np.stack(cam_to_first_transforms, axis=0)
+    cam_from_first = np.stack(cam_from_first_extrinsics, axis=0)
+    gt_intrinsics = np.stack(gt_intrinsics_processed, axis=0)
+    return images, gt_points_current, gt_points, valid_masks, cam_to_first, cam_from_first, gt_intrinsics
 
 
 def init_stats(thresholds, num_frames):
@@ -254,12 +326,15 @@ def build_unique_sequences(samples, dedupe_sequences):
     return list(ordered.values())
 
 
-def load_model(model_path: Path, device: str):
+def load_model(model_path: Path, device: str, prediction_source: str):
+    enable_camera = prediction_source in {"depth_cam", "depth_gtpose", "depth_gtintrinsics"}
+    enable_depth = prediction_source in {"depth_cam", "depth_gtcam", "depth_gtpose", "depth_gtintrinsics"}
+    enable_point = prediction_source == "point"
     model = VGGT.from_pretrained(
         str(model_path),
-        enable_camera=False,
-        enable_point=True,
-        enable_depth=False,
+        enable_camera=enable_camera,
+        enable_point=enable_point,
+        enable_depth=enable_depth,
         enable_track=False,
     )
     model.eval()
@@ -267,12 +342,135 @@ def load_model(model_path: Path, device: str):
     return model
 
 
-def predict_world_points(model: VGGT, images: torch.Tensor, device: str):
+def predict_world_points_point(model: VGGT, images: torch.Tensor, device: str):
     with torch.inference_mode():
         batch = images.unsqueeze(0).to(device=device, dtype=torch.float32)
         aggregated_tokens_list, patch_start_idx = model.aggregator(batch)
         pts3d, _ = model.point_head(aggregated_tokens_list, images=batch, patch_start_idx=patch_start_idx)
         return pts3d[0].detach().cpu().numpy().astype(np.float32)
+
+
+def predict_world_points_depth_cam(model: VGGT, images: torch.Tensor, device: str):
+    with torch.inference_mode():
+        batch = images.unsqueeze(0).to(device=device, dtype=torch.float32)
+        predictions = model(batch)
+        depth = predictions["depth"][0].detach().cpu()
+        pose_enc = predictions["pose_enc"].detach().cpu()
+
+        height, width = depth.shape[1], depth.shape[2]
+        extrinsics, intrinsics = pose_encoding_to_extri_intri(
+            pose_enc,
+            image_size_hw=(height, width),
+            pose_encoding_type="absT_quaR_FoV",
+            build_intrinsics=True,
+        )
+        world_points = unproject_depth_map_to_point_map_local(
+            depth.numpy(),
+            extrinsics[0].numpy(),
+            intrinsics[0].numpy(),
+        )
+        return world_points.astype(np.float32)
+
+
+def predict_world_points_depth_gtcam(
+    model: VGGT,
+    images: torch.Tensor,
+    device: str,
+    gt_extrinsics: np.ndarray,
+    gt_intrinsics: np.ndarray,
+):
+    with torch.inference_mode():
+        batch = images.unsqueeze(0).to(device=device, dtype=torch.float32)
+        predictions = model(batch)
+        depth = predictions["depth"][0].detach().cpu()
+        world_points = unproject_depth_map_to_point_map_local(depth.numpy(), gt_extrinsics, gt_intrinsics)
+        return world_points.astype(np.float32)
+
+
+def predict_world_points_depth_gtpose(
+    model: VGGT,
+    images: torch.Tensor,
+    device: str,
+    gt_extrinsics: np.ndarray,
+):
+    with torch.inference_mode():
+        batch = images.unsqueeze(0).to(device=device, dtype=torch.float32)
+        predictions = model(batch)
+        depth = predictions["depth"][0].detach().cpu()
+        pose_enc = predictions["pose_enc"].detach().cpu()
+
+        height, width = depth.shape[1], depth.shape[2]
+        _, intrinsics = pose_encoding_to_extri_intri(
+            pose_enc,
+            image_size_hw=(height, width),
+            pose_encoding_type="absT_quaR_FoV",
+            build_intrinsics=True,
+        )
+        world_points = unproject_depth_map_to_point_map_local(
+            depth.numpy(),
+            gt_extrinsics,
+            intrinsics[0].numpy(),
+        )
+        return world_points.astype(np.float32)
+
+
+def predict_world_points_depth_gtintrinsics(
+    model: VGGT,
+    images: torch.Tensor,
+    device: str,
+    gt_intrinsics: np.ndarray,
+):
+    with torch.inference_mode():
+        batch = images.unsqueeze(0).to(device=device, dtype=torch.float32)
+        predictions = model(batch)
+        depth = predictions["depth"][0].detach().cpu()
+        pose_enc = predictions["pose_enc"].detach().cpu()
+
+        height, width = depth.shape[1], depth.shape[2]
+        extrinsics, _ = pose_encoding_to_extri_intri(
+            pose_enc,
+            image_size_hw=(height, width),
+            pose_encoding_type="absT_quaR_FoV",
+            build_intrinsics=True,
+        )
+        world_points = unproject_depth_map_to_point_map_local(
+            depth.numpy(),
+            extrinsics[0].numpy(),
+            gt_intrinsics,
+        )
+        return world_points.astype(np.float32)
+
+
+def predict_world_points(
+    model: VGGT,
+    images: torch.Tensor,
+    device: str,
+    prediction_source: str,
+    gt_extrinsics: np.ndarray | None = None,
+    gt_intrinsics: np.ndarray | None = None,
+):
+    if prediction_source == "point":
+        return predict_world_points_point(model, images, device)
+    if prediction_source == "depth_cam":
+        return predict_world_points_depth_cam(model, images, device)
+    if prediction_source == "depth_gtcam":
+        return predict_world_points_depth_gtcam(model, images, device, gt_extrinsics, gt_intrinsics)
+    if prediction_source == "depth_gtpose":
+        return predict_world_points_depth_gtpose(model, images, device, gt_extrinsics)
+    if prediction_source == "depth_gtintrinsics":
+        return predict_world_points_depth_gtintrinsics(model, images, device, gt_intrinsics)
+    raise ValueError(f"Unsupported prediction_source: {prediction_source}")
+
+
+def transform_pred_points(pred_points: np.ndarray, cam_to_first: np.ndarray, comparison_mode: str):
+    if comparison_mode in {"pred_first_vs_gt_first", "pred_current_vs_gt_current"}:
+        return pred_points
+    if comparison_mode == "pred_current_to_first_vs_gt_first":
+        transformed = []
+        for frame_idx in range(pred_points.shape[0]):
+            transformed.append(transform_points(pred_points[frame_idx], cam_to_first[frame_idx]))
+        return np.stack(transformed, axis=0)
+    raise ValueError(f"Unsupported comparison_mode: {comparison_mode}")
 
 
 def main():
@@ -291,7 +489,7 @@ def main():
     if not sequences:
         raise ValueError("No sequences selected for evaluation.")
 
-    model = load_model(args.model_path, args.device)
+    model = load_model(args.model_path, args.device, args.prediction_source)
 
     overall_stats = None
     frame_stats = None
@@ -303,23 +501,38 @@ def main():
             image_rel_paths = image_rel_paths[: args.max_frames]
 
         seq_start = time.time()
-        images, gt_points_first, valid_masks = load_sequence_inputs(image_rel_paths, args.data_root, args.target_size)
-        pred_points_first = predict_world_points(model, images, args.device)
+        images, gt_points_current, gt_points_first, valid_masks, cam_to_first, cam_from_first, gt_intrinsics = load_sequence_inputs(
+            image_rel_paths, args.data_root, args.target_size
+        )
+        pred_points = predict_world_points(
+            model,
+            images,
+            args.device,
+            args.prediction_source,
+            gt_extrinsics=cam_from_first,
+            gt_intrinsics=gt_intrinsics,
+        )
+        pred_points_eval = transform_pred_points(pred_points, cam_to_first, args.comparison_mode)
 
-        if pred_points_first.shape != gt_points_first.shape:
+        if args.comparison_mode == "pred_current_vs_gt_current":
+            gt_points_eval = gt_points_current
+        else:
+            gt_points_eval = gt_points_first
+
+        if pred_points_eval.shape != gt_points_eval.shape:
             raise ValueError(
-                f"Prediction/GT shape mismatch: pred={pred_points_first.shape}, gt={gt_points_first.shape}"
+                f"Prediction/GT shape mismatch: pred={pred_points_eval.shape}, gt={gt_points_eval.shape}"
             )
 
-        num_frames = pred_points_first.shape[0]
+        num_frames = pred_points_eval.shape[0]
         if overall_stats is None:
             overall_stats, frame_stats = init_stats(args.thresholds, num_frames)
 
         seq_bucket, seq_frame_buckets = init_stats(args.thresholds, num_frames)
 
         for frame_idx in range(num_frames):
-            pred = pred_points_first[frame_idx]
-            gt = gt_points_first[frame_idx]
+            pred = pred_points_eval[frame_idx]
+            gt = gt_points_eval[frame_idx]
             valid = valid_masks[frame_idx] & np.isfinite(pred).all(axis=-1) & np.isfinite(gt).all(axis=-1)
             if not valid.any():
                 continue
@@ -345,6 +558,8 @@ def main():
         "ann_path": str(args.ann_path),
         "model_path": str(args.model_path),
         "device": args.device,
+        "comparison_mode": args.comparison_mode,
+        "prediction_source": args.prediction_source,
         "num_sequences_evaluated": len(sequences),
         "num_frames_per_sequence": len(frame_stats),
         "thresholds_m": args.thresholds,

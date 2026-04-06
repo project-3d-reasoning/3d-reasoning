@@ -52,7 +52,7 @@ from transformers.utils import (
 from .configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLVisionConfig
 from .vggt.models.vggt import VGGT
 from .geometry_encoders import create_geometry_encoder, GeometryEncoderConfig
-from .feature_fusion import FeatureFusionModule, FeatureFusionConfig, GeometryFeatureMerger
+from .feature_fusion import CoordinatePositionalEncoding, FeatureFusionModule, FeatureFusionConfig, GeometryFeatureMerger
 from .loss import normalize_pointcloud, check_and_fix_inf_nan
 
 
@@ -1624,12 +1624,19 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             num_layers=getattr(config, "fusion_num_layers", 1)
         )
         self.feature_fusion = FeatureFusionModule(fusion_config)
+        if getattr(config, "use_coord_pe", False):
+            self.coordinate_positional_encoding = CoordinatePositionalEncoding(
+                output_dim=config.hidden_size,
+                patch_size=self.geometry_encoder.patch_size,
+                spatial_merge_size=config.vision_config.spatial_merge_size,
+            )
 
-    def _process_geometry_features(self, image_embeds, geometry_encoder_inputs):
+    def _process_geometry_features(self, image_embeds, geometry_encoder_inputs, coord_pe_points=None, coord_pe_masks=None):
         """Process geometry features using the geometry encoder."""
 
         batch_size = len(geometry_encoder_inputs)
         geo_embeds = []
+        coord_embeds = [] if hasattr(self, "coordinate_positional_encoding") and coord_pe_points is not None and coord_pe_masks is not None else None
         for bn in range(batch_size):
             if geometry_encoder_inputs[bn].shape[0] > 0:
 
@@ -1643,12 +1650,19 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 # Reshape for merger
                 features = self.geometry_merger(features)
                 geo_embeds.append(features)
+                if coord_embeds is not None:
+                    coord_feature = self.coordinate_positional_encoding(
+                        coord_pe_points[bn].to(image_embeds.device),
+                        coord_pe_masks[bn].to(image_embeds.device),
+                    ).to(image_embeds.dtype)
+                    coord_embeds.append(coord_feature)
 
         geo_embeds = torch.cat(geo_embeds, dim=0) if geo_embeds else None
+        coord_embeds = torch.cat(coord_embeds, dim=0) if coord_embeds else None
         
         if geo_embeds is not None:
             image_embeds = image_embeds.view(geo_embeds.shape)
-            image_embeds = self.feature_fusion(image_embeds, geo_embeds)
+            image_embeds = self.feature_fusion(image_embeds, geo_embeds, coord_pe=coord_embeds)
             image_embeds = image_embeds.view(-1, image_embeds.shape[-1])
         
         return image_embeds
@@ -1880,6 +1894,8 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         cache_position: Optional[torch.LongTensor] = None,
         second_per_grid_ts: Optional[torch.Tensor] = None,
         geometry_encoder_inputs: Optional[List[torch.Tensor]] = None,
+        coord_pe_points: Optional[List[torch.Tensor]] = None,
+        coord_pe_masks: Optional[List[torch.Tensor]] = None,
         boxes: Optional[List[torch.Tensor]] = None,
         tag: str = None,
         **kwargs,
@@ -1937,7 +1953,12 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 
                 # Process 3D geometry features if enabled
                 if getattr(self.config, 'use_geometry_encoder', False) and geometry_encoder_inputs is not None:
-                    image_embeds = self._process_geometry_features(image_embeds, geometry_encoder_inputs)
+                    image_embeds = self._process_geometry_features(
+                        image_embeds,
+                        geometry_encoder_inputs,
+                        coord_pe_points=coord_pe_points,
+                        coord_pe_masks=coord_pe_masks,
+                    )
 
                 n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
                 n_image_features = image_embeds.shape[0]
@@ -2063,6 +2084,9 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         image_grid_thw=None,
         video_grid_thw=None,
         second_per_grid_ts=None,
+        geometry_encoder_inputs=None,
+        coord_pe_points=None,
+        coord_pe_masks=None,
         **kwargs,
     ):
         # Overwritten -- in specific circumstances we don't want to forward image inputs to the model
@@ -2079,6 +2103,9 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             image_grid_thw=image_grid_thw,
             video_grid_thw=video_grid_thw,
             second_per_grid_ts=second_per_grid_ts,
+            geometry_encoder_inputs=geometry_encoder_inputs,
+            coord_pe_points=coord_pe_points,
+            coord_pe_masks=coord_pe_masks,
             use_cache=use_cache,
             **kwargs,
         )
@@ -2089,6 +2116,9 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         if cache_position[0] != 0:
             model_inputs["pixel_values"] = None
             model_inputs["pixel_values_videos"] = None
+            model_inputs["geometry_encoder_inputs"] = None
+            model_inputs["coord_pe_points"] = None
+            model_inputs["coord_pe_masks"] = None
 
         return model_inputs
 
@@ -2137,6 +2167,13 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             return input_ids, model_kwargs
 
         visual_keys = ["pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw", "second_per_grid_ts"]
+
+        for key in ["geometry_encoder_inputs", "coord_pe_points", "coord_pe_masks"]:
+            if key in model_kwargs and model_kwargs[key] is not None:
+                expanded_values = []
+                for sample in model_kwargs[key]:
+                    expanded_values.extend([sample] * expand_size)
+                model_kwargs[key] = expanded_values
 
         def _expand_dict_for_generation_visual(dict_to_expand):
             image_grid_thw = model_kwargs.get("image_grid_thw", None)

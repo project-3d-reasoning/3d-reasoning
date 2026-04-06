@@ -132,7 +132,8 @@ def train(attn_implementation="flash_attention_2"):
                 "reference_frame",
                 "feature_fusion_method", 
                 "fusion_num_layers",
-                "geometry_merger_type"
+                "geometry_merger_type",
+                "use_coord_pe",
             ]:
                 setattr(config, k, getattr(model_args, k))
 
@@ -193,6 +194,8 @@ def train(attn_implementation="flash_attention_2"):
     print(model.config)
     if model_args.use_geometry_encoder:
         setattr(data_args, "use_geometry_encoder", model_args.use_geometry_encoder)
+    if model_args.use_coord_pe:
+        setattr(data_args, "use_coord_pe", model_args.use_coord_pe)
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
     trainer = Trainer(
         model=model, processing_class=tokenizer, args=training_args, **data_module

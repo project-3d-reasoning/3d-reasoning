@@ -2,6 +2,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional
 from dataclasses import dataclass
 
@@ -152,6 +153,77 @@ class CrossAttentionBlock(nn.Module):
         return x
 
 
+class CoordinatePositionalEncoding(nn.Module):
+    """Patch-level sinusoidal encoding from first-frame 3D coordinates."""
+
+    def __init__(
+        self,
+        output_dim: int,
+        patch_size: int = 14,
+        spatial_merge_size: int = 2,
+        base: float = 10000.0,
+        coord_scale: float = 10.0,
+    ):
+        super().__init__()
+        if output_dim % 2 != 0:
+            raise ValueError("output_dim must be even for sin/cos coordinate encoding")
+
+        self.output_dim = output_dim
+        self.patch_size = patch_size
+        self.spatial_merge_size = spatial_merge_size
+        self.pixel_merge_size = patch_size * spatial_merge_size
+        self.base = base
+        self.coord_scale = coord_scale
+
+        total_pairs = output_dim // 2
+        base_pairs = total_pairs // 3
+        remainder = total_pairs % 3
+        self.axis_pair_dims = [
+            base_pairs + (1 if axis_idx < remainder else 0)
+            for axis_idx in range(3)
+        ]
+        self.axis_embed_dims = [pair_dim * 2 for pair_dim in self.axis_pair_dims]
+
+    def _encode_axis(self, values: torch.Tensor, pair_dim: int) -> torch.Tensor:
+        if pair_dim == 0:
+            return values.new_zeros(values.shape + (0,))
+        omega = torch.arange(pair_dim, dtype=torch.float32, device=values.device)
+        omega = 1.0 / (self.base ** (omega / pair_dim))
+        out = values.float().unsqueeze(-1) * omega
+        emb = torch.cat([torch.sin(out), torch.cos(out)], dim=-1)
+        return emb.to(values.dtype)
+
+    def forward(self, coord_points: torch.Tensor, coord_mask: torch.Tensor) -> torch.Tensor:
+        if coord_points.dim() == 3:
+            coord_points = coord_points.unsqueeze(0)
+        if coord_mask.dim() == 2:
+            coord_mask = coord_mask.unsqueeze(0)
+
+        _, height, width, _ = coord_points.shape
+        valid_height = (height // self.pixel_merge_size) * self.pixel_merge_size
+        valid_width = (width // self.pixel_merge_size) * self.pixel_merge_size
+        coord_points = coord_points[:, :valid_height, :valid_width, :]
+        coord_mask = coord_mask[:, :valid_height, :valid_width].to(coord_points.dtype)
+
+        coord_points = coord_points.permute(0, 3, 1, 2)
+        coord_mask = coord_mask.unsqueeze(1)
+        kernel = self.pixel_merge_size
+        area = kernel * kernel
+
+        pooled_sum = F.avg_pool2d(coord_points * coord_mask, kernel_size=kernel, stride=kernel) * area
+        pooled_count = F.avg_pool2d(coord_mask, kernel_size=kernel, stride=kernel) * area
+        pooled_points = pooled_sum / pooled_count.clamp_min(1.0)
+        pooled_points = pooled_points.permute(0, 2, 3, 1) / self.coord_scale
+        patch_valid = (pooled_count.squeeze(1) > 0).unsqueeze(-1)
+
+        x_embed = self._encode_axis(pooled_points[..., 0], self.axis_pair_dims[0])
+        y_embed = self._encode_axis(pooled_points[..., 1], self.axis_pair_dims[1])
+        z_embed = self._encode_axis(pooled_points[..., 2], self.axis_pair_dims[2])
+        coord_embed = torch.cat([x_embed, y_embed, z_embed], dim=-1)
+        coord_embed = coord_embed * patch_valid.to(coord_embed.dtype)
+        return coord_embed
+
+
 class FeatureFusionModule(nn.Module):
     """Enhanced feature fusion module with multiple fusion strategies."""
     
@@ -192,7 +264,12 @@ class FeatureFusionModule(nn.Module):
             self.weight_2d = nn.Parameter(torch.tensor(0.5))
             self.weight_3d = nn.Parameter(torch.tensor(0.5))
     
-    def forward(self, features_2d: torch.Tensor, features_3d: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        features_2d: torch.Tensor,
+        features_3d: torch.Tensor,
+        coord_pe: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Fuse 2D and 3D features.
         
@@ -205,7 +282,10 @@ class FeatureFusionModule(nn.Module):
 
         _, h_grid, w_grid, _ = features_3d.shape
         if self.fusion_method == "add":
-            return features_2d
+            fused = features_2d + features_3d
+            if coord_pe is not None:
+                fused = fused + coord_pe
+            return fused
             
         elif self.fusion_method == "concat":
             features_2d = self.norm1(features_2d)

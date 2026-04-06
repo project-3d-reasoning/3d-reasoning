@@ -9,6 +9,7 @@ from PIL import Image
 from torchvision import transforms as TF
 import numpy as np
 import copy
+from pathlib import Path
 
 def load_and_preprocess_images(image_path_list, mode="crop", target_size=518):
     """
@@ -149,6 +150,98 @@ def load_and_preprocess_images(image_path_list, mode="crop", target_size=518):
             images = images.unsqueeze(0)
 
     return images
+
+
+def get_preprocess_params(width, height, target_size=518, patch_multiple=14):
+    new_width = target_size
+    new_height = int(round((height * (new_width / width)) / patch_multiple) * patch_multiple)
+    crop_top = 0
+    crop_bottom = new_height
+    if new_height > target_size:
+        crop_top = (new_height - target_size) // 2
+        crop_bottom = crop_top + target_size
+    return {
+        "new_width": new_width,
+        "new_height": new_height,
+        "crop_top": crop_top,
+        "crop_bottom": crop_bottom,
+    }
+
+
+def preprocess_depth_and_intrinsics(depth, intrinsic, target_size=518):
+    height, width = depth.shape
+    params = get_preprocess_params(width, height, target_size)
+
+    depth_img = Image.fromarray(depth)
+    depth_img = depth_img.resize((params["new_width"], params["new_height"]), Image.Resampling.NEAREST)
+    depth_resized = np.asarray(depth_img, dtype=np.float32)
+    if params["new_height"] > target_size:
+        depth_resized = depth_resized[params["crop_top"] : params["crop_bottom"], :]
+
+    scale_x = params["new_width"] / width
+    scale_y = params["new_height"] / height
+    intrinsic = intrinsic.copy()
+    intrinsic[0, 0] *= scale_x
+    intrinsic[1, 1] *= scale_y
+    intrinsic[0, 2] *= scale_x
+    intrinsic[1, 2] *= scale_y
+    if params["new_height"] > target_size:
+        intrinsic[1, 2] -= params["crop_top"]
+
+    return depth_resized, intrinsic
+
+
+def unproject_depth_to_cam(depth_m, intrinsic):
+    h, w = depth_m.shape
+    u, v = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+    fx, fy = intrinsic[0, 0], intrinsic[1, 1]
+    cx, cy = intrinsic[0, 2], intrinsic[1, 2]
+    x = (u - cx) * depth_m / fx
+    y = (v - cy) * depth_m / fy
+    z = depth_m
+    points = np.stack([x, y, z], axis=-1)
+    valid = depth_m > 1e-6
+    return points.astype(np.float32), valid
+
+
+def transform_points(points, transform):
+    rotation = transform[:3, :3]
+    translation = transform[:3, 3]
+    return (points @ rotation.T + translation).astype(np.float32)
+
+
+def load_first_frame_coord_inputs(image_path_list, target_size=518):
+    coord_points = []
+    coord_masks = []
+    first_pose = None
+    first_pose_inv = None
+
+    for image_path in image_path_list:
+        rgb_path = Path(image_path)
+        depth_path = rgb_path.with_suffix(".png")
+        pose_path = rgb_path.with_suffix(".txt")
+        depth_intrinsic_path = rgb_path.parent / "depth_intrinsic.txt"
+
+        if not (depth_path.exists() and pose_path.exists() and depth_intrinsic_path.exists()):
+            return None, None
+
+        depth_raw = np.asarray(Image.open(depth_path), dtype=np.float32)
+        depth_m = depth_raw / 1000.0
+        depth_intrinsic = np.loadtxt(depth_intrinsic_path, dtype=np.float32)[:3, :3]
+        depth_m, depth_intrinsic = preprocess_depth_and_intrinsics(depth_m, depth_intrinsic, target_size=target_size)
+        cam_points, valid = unproject_depth_to_cam(depth_m, depth_intrinsic)
+
+        pose = np.loadtxt(pose_path, dtype=np.float32)
+        if first_pose is None:
+            first_pose = pose
+            first_pose_inv = np.linalg.inv(first_pose).astype(np.float32)
+
+        cam_to_first = (first_pose_inv @ pose).astype(np.float32)
+        first_frame_points = transform_points(cam_points, cam_to_first)
+        coord_points.append(torch.from_numpy(first_frame_points))
+        coord_masks.append(torch.from_numpy(valid))
+
+    return coord_points, coord_masks
 
 
 def prepare_image_inputs(image, image_processor):

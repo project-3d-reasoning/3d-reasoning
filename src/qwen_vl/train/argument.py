@@ -18,6 +18,7 @@ class ModelArguments:
     feature_fusion_method: str = field(default="add")  # Method to fuse geometry and visual features ("add", "concat", "cross_attention", "gate")
     fusion_num_layers: int = field(default=1)  # Number of layers in the cross-attention module when feature_fusion_method is "cross_attention"
     geometry_merger_type: str = field(default="mlp")  # Type of geometry feature merger ("mlp", "avg")
+    use_coord_pe: bool = field(default=False)  # Whether to add first-frame coordinate positional encoding on top of the fused features
 
 @dataclass
 class DataArguments:
