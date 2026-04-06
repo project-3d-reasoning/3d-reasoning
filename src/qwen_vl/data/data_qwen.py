@@ -24,6 +24,7 @@ import transformers
 from . import data_list
 from qwen_vl.bbox_special_tokens import (
     get_bbox_coordinate_token_ids,
+    get_bbox_residual_token_ids,
     restore_scanrefer_bbox_prompt,
     restore_threedod_bbox_prompt,
     rewrite_bbox_response_with_auxiliary_targets,
@@ -63,6 +64,7 @@ def preprocess_qwen_2_visual(
     grid_thw: List = [],
     visual_type: str = "image",
     bbox_coordinate_token_ids: Optional[set[int]] = None,
+    bbox_residual_token_ids: Optional[set[int]] = None,
     bbox_response_residual_targets: Optional[Sequence[Sequence[float]]] = None,
 ) -> Dict:
     roles = {"human": "user", "gpt": "assistant"}
@@ -136,10 +138,15 @@ def preprocess_qwen_2_visual(
                 target_mask = encode_id.copy()
                 target_mask[:3] = [IGNORE_INDEX] * 3
                 target += target_mask
-                if bbox_coordinate_token_ids:
+                residual_target_token_ids = (
+                    bbox_residual_token_ids
+                    if bbox_residual_token_ids is not None
+                    else bbox_coordinate_token_ids
+                )
+                if residual_target_token_ids:
                     coordinate_positions = [
                         idx for idx, token_id in enumerate(encode_id)
-                        if idx >= 3 and token_id in bbox_coordinate_token_ids
+                        if idx >= 3 and token_id in residual_target_token_ids
                     ]
                     residual_count = min(
                         len(coordinate_positions),
@@ -193,6 +200,11 @@ class LazySupervisedDataset(Dataset):
         self.use_bbox_special_tokens = getattr(data_args, "use_bbox_special_tokens", False)
         self.bbox_coordinate_token_ids = (
             set(get_bbox_coordinate_token_ids(tokenizer))
+            if self.use_bbox_special_tokens
+            else set()
+        )
+        self.bbox_residual_token_ids = (
+            set(get_bbox_residual_token_ids(tokenizer))
             if self.use_bbox_special_tokens
             else set()
         )
@@ -492,6 +504,7 @@ class LazySupervisedDataset(Dataset):
                 grid_thw=grid_thw_merged,
                 visual_type="image",
                 bbox_coordinate_token_ids=self.bbox_coordinate_token_ids,
+                bbox_residual_token_ids=self.bbox_residual_token_ids,
                 bbox_response_residual_targets=bbox_response_residual_targets,
             )
             position_ids, _ = self.get_rope_index(
@@ -533,6 +546,7 @@ class LazySupervisedDataset(Dataset):
                 grid_thw=grid_thw_merged,
                 visual_type="video",
                 bbox_coordinate_token_ids=self.bbox_coordinate_token_ids,
+                bbox_residual_token_ids=self.bbox_residual_token_ids,
                 bbox_response_residual_targets=bbox_response_residual_targets,
             )
             position_ids, _ = self.get_rope_index(
@@ -549,6 +563,7 @@ class LazySupervisedDataset(Dataset):
                 self.tokenizer,
                 grid_thw=grid_thw_merged,
                 bbox_coordinate_token_ids=self.bbox_coordinate_token_ids,
+                bbox_residual_token_ids=self.bbox_residual_token_ids,
                 bbox_response_residual_targets=bbox_response_residual_targets,
             )
             position_ids = (

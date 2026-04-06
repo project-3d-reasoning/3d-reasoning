@@ -15,6 +15,9 @@ class ModelArguments:
     use_bbox_residual_head: bool = field(default=False)
     bbox_residual_loss_weight: float = field(default=0.25)
     bbox_residual_loss_weight_warmup_ratio: float = field(default=0.0)
+    bbox_position_residual_head_range: float = field(default=0.5)
+    bbox_size_residual_head_range: float = field(default=0.5)
+    bbox_angle_residual_head_range: float = field(default=0.5)
 
     # Geometry encoder configuration
     use_geometry_encoder: bool = field(default=False)  # Whether to use 3D geometry encoder

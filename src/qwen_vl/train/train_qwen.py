@@ -142,6 +142,9 @@ def train(attn_implementation="flash_attention_2"):
             "use_bbox_residual_head",
             "bbox_residual_loss_weight",
             "bbox_residual_loss_weight_warmup_ratio",
+            "bbox_position_residual_head_range",
+            "bbox_size_residual_head_range",
+            "bbox_angle_residual_head_range",
         ]:
             setattr(config, k, getattr(model_args, k))
 

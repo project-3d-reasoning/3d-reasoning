@@ -8,12 +8,14 @@ from typing import Any, List, Sequence
 
 
 BBOX_QUANTIZATION_STEP = 0.03
+BBOX_OUTPUT_COARSE_BIN_STRIDE = 4
 SCAN2CAP_POSITION_FINE_BINS = 4
 
 POSITION_PROMPT_TOKEN = "|position|"
 SIZE_PROMPT_TOKEN = "|size|"
 ANGLE_PROMPT_TOKEN = "|angle|"
 POSITION_COARSE_PROMPT_FAMILY = "position_coarse"
+SIZE_COARSE_FAMILY = "size_coarse"
 POSITION_FINE_PROMPT_FAMILY = "position_fine"
 PROMPT_PLACEHOLDER_TOKENS = [
     POSITION_PROMPT_TOKEN,
@@ -28,36 +30,69 @@ class QuantizationSpec:
     min_value: float
     max_value: float
     step: float = BBOX_QUANTIZATION_STEP
+    bin_stride: int = 1
+
+    @property
+    def fine_num_bins(self) -> int:
+        return int(round((self.max_value - self.min_value) / self.step)) + 1
 
     @property
     def num_bins(self) -> int:
-        return int(round((self.max_value - self.min_value) / self.step)) + 1
+        return int(math.ceil(self.fine_num_bins / self.bin_stride))
 
     @property
     def max_index(self) -> int:
         return self.num_bins - 1
 
+    @property
+    def token_step(self) -> float:
+        return self.step * self.bin_stride
+
 
 POSITION_SPEC = QuantizationSpec("position", -15.0, 15.0)
 SIZE_SPEC = QuantizationSpec("size", 0.0, 12.0)
+POSITION_OUTPUT_SPEC = QuantizationSpec(
+    POSITION_COARSE_PROMPT_FAMILY,
+    POSITION_SPEC.min_value,
+    POSITION_SPEC.max_value,
+    step=POSITION_SPEC.step,
+    bin_stride=BBOX_OUTPUT_COARSE_BIN_STRIDE,
+)
+SIZE_OUTPUT_SPEC = QuantizationSpec(
+    SIZE_COARSE_FAMILY,
+    SIZE_SPEC.min_value,
+    SIZE_SPEC.max_value,
+    step=SIZE_SPEC.step,
+    bin_stride=BBOX_OUTPUT_COARSE_BIN_STRIDE,
+)
 ANGLE_YAW_SPEC = QuantizationSpec("angle", -math.pi, math.pi)
 ANGLE_ROLL_SPEC = QuantizationSpec("angle", -math.pi / 2, math.pi / 2)
 ANGLE_PITCH_SPEC = QuantizationSpec("angle", -math.pi, math.pi)
-SCAN2CAP_POSITION_COARSE_NUM_BINS = math.ceil(
-    POSITION_SPEC.num_bins / SCAN2CAP_POSITION_FINE_BINS
-)
+SCAN2CAP_POSITION_COARSE_NUM_BINS = POSITION_OUTPUT_SPEC.num_bins
 
 BBOX_QUANTIZATION_SPECS = [
-    POSITION_SPEC,
-    POSITION_SPEC,
-    POSITION_SPEC,
-    SIZE_SPEC,
-    SIZE_SPEC,
-    SIZE_SPEC,
+    POSITION_OUTPUT_SPEC,
+    POSITION_OUTPUT_SPEC,
+    POSITION_OUTPUT_SPEC,
+    SIZE_OUTPUT_SPEC,
+    SIZE_OUTPUT_SPEC,
+    SIZE_OUTPUT_SPEC,
     ANGLE_YAW_SPEC,
     ANGLE_ROLL_SPEC,
     ANGLE_PITCH_SPEC,
 ]
+BBOX_OUTPUT_TOKEN_FAMILIES = frozenset(
+    {
+        POSITION_OUTPUT_SPEC.family,
+        SIZE_OUTPUT_SPEC.family,
+        ANGLE_YAW_SPEC.family,
+        POSITION_SPEC.family,
+        SIZE_SPEC.family,
+    }
+)
+BBOX_RESIDUAL_TOKEN_FAMILIES = frozenset(
+    spec.family for spec in BBOX_QUANTIZATION_SPECS
+)
 
 BBOX_PLACEHOLDER_TOKENS = [
     POSITION_PROMPT_TOKEN,
@@ -78,7 +113,9 @@ for spec in BBOX_QUANTIZATION_SPECS:
         spec.num_bins,
     )
 
-SPECIAL_TOKEN_PATTERN = re.compile(r"\|(position|size|angle)(?:_(\d+))?\|")
+SPECIAL_TOKEN_PATTERN = re.compile(
+    r"\|(position_coarse|size_coarse|position_fine|position|size|angle)(?:_(\d+))?\|"
+)
 _FENCED_JSON_PATTERN = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 _NUMERIC_TRIPLE_PATTERN = re.compile(
     r"\[\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\]"
@@ -87,7 +124,7 @@ _POSITION_TOKEN_TRIPLE_PATTERN = re.compile(
     r'\[\s*"(\|position_\d+\|)"\s*,\s*"(\|position_\d+\|)"\s*,\s*"(\|position_\d+\|)"\s*\]'
 )
 _TOKEN_LITERAL_PATTERN = re.compile(
-    r'(?<!["\'])\|(position|size|angle)(?:_\d+)?\|(?!["\'])'
+    r'(?<!["\'])\|(position_coarse|size_coarse|position_fine|position|size|angle)(?:_\d+)?\|(?!["\'])'
 )
 
 
@@ -126,6 +163,15 @@ def parse_bbox_coordinate_token(token: str) -> tuple[str, int]:
     return family, int(token_index)
 
 
+def contains_bbox_output_tokens(text: str) -> bool:
+    for match in SPECIAL_TOKEN_PATTERN.finditer(text):
+        if match.group(2) is None:
+            continue
+        if match.group(1) in BBOX_OUTPUT_TOKEN_FAMILIES:
+            return True
+    return False
+
+
 def get_bbox_coordinate_token_metadata(tokenizer) -> List[dict]:
     metadata = []
     for token, token_id in zip(
@@ -150,6 +196,11 @@ def get_bbox_coordinate_token_metadata(tokenizer) -> List[dict]:
 def build_bbox_coordinate_config(tokenizer, neighbor_radius: int = 2) -> dict:
     metadata = get_bbox_coordinate_token_metadata(tokenizer)
     coordinate_token_ids = [item["token_id"] for item in metadata]
+    residual_token_ids = [
+        item["token_id"]
+        for item in metadata
+        if item["family"] in BBOX_RESIDUAL_TOKEN_FAMILIES
+    ]
     token_family_map = {str(item["token_id"]): item["family"] for item in metadata}
     token_bin_index_map = {str(item["token_id"]): item["bin_index"] for item in metadata}
 
@@ -172,6 +223,7 @@ def build_bbox_coordinate_config(tokenizer, neighbor_radius: int = 2) -> dict:
 
     return {
         "coordinate_token_ids": coordinate_token_ids,
+        "residual_token_ids": residual_token_ids,
         "coordinate_neighbor_map": neighbor_map,
         "coordinate_family_map": token_family_map,
         "coordinate_bin_index_map": token_bin_index_map,
@@ -185,6 +237,15 @@ def get_bbox_coordinate_token_ids(tokenizer) -> List[int]:
         int(token_id)
         for token_id in token_ids
         if token_id is not None and token_id >= 0 and token_id != unk_token_id
+    ]
+
+
+def get_bbox_residual_token_ids(tokenizer) -> List[int]:
+    metadata = get_bbox_coordinate_token_metadata(tokenizer)
+    return [
+        int(item["token_id"])
+        for item in metadata
+        if item["family"] in BBOX_RESIDUAL_TOKEN_FAMILIES
     ]
 
 
@@ -226,6 +287,7 @@ def resize_model_embeddings_for_bbox_tokens(
     model.config.vocab_size = len(tokenizer)
     setattr(model.config, "use_bbox_special_tokens", True)
     setattr(model.config, "bbox_coordinate_token_ids", config_values["coordinate_token_ids"])
+    setattr(model.config, "bbox_residual_token_ids", config_values["residual_token_ids"])
     setattr(model.config, "bbox_coordinate_neighbor_token_ids", config_values["coordinate_neighbor_map"])
     setattr(model.config, "bbox_coordinate_family_map", config_values["coordinate_family_map"])
     setattr(model.config, "bbox_coordinate_bin_index_map", config_values["coordinate_bin_index_map"])
@@ -247,15 +309,19 @@ add_bbox_special_tokens = add_bbox_tokens
 resize_model_embeddings_for_special_tokens = resize_model_embeddings_for_bbox_tokens
 
 
+def spec_supports_residual(spec: QuantizationSpec) -> bool:
+    return spec.family in BBOX_RESIDUAL_TOKEN_FAMILIES
+
+
 def quantize_value(value: float, spec: QuantizationSpec) -> int:
     clamped_value = min(max(float(value), spec.min_value), spec.max_value)
-    index = int(round((clamped_value - spec.min_value) / spec.step))
+    index = int(round((clamped_value - spec.min_value) / spec.token_step))
     return min(max(index, 0), spec.max_index)
 
 
 def dequantize_index(index: int, spec: QuantizationSpec) -> float:
     clamped_index = min(max(int(index), 0), spec.max_index)
-    value = spec.min_value + clamped_index * spec.step
+    value = spec.min_value + clamped_index * spec.token_step
     return min(max(value, spec.min_value), spec.max_value)
 
 
@@ -267,7 +333,9 @@ def quantize_value_with_residual(value: float, spec: QuantizationSpec) -> tuple[
     token_index = quantize_value(value, spec)
     token = f"|{spec.family}_{token_index}|"
     token_center = dequantize_index(token_index, spec)
-    residual = (min(max(float(value), spec.min_value), spec.max_value) - token_center) / spec.step
+    residual = (
+        min(max(float(value), spec.min_value), spec.max_value) - token_center
+    ) / spec.token_step
     residual = min(max(residual, -0.5), 0.5)
     return token, float(residual)
 
@@ -275,7 +343,7 @@ def quantize_value_with_residual(value: float, spec: QuantizationSpec) -> tuple[
 def quantize_position_triplet(position: Sequence[float]) -> List[str]:
     if len(position) != 3:
         raise ValueError(f"Expected 3 position values, got {len(position)}")
-    return [quantize_value_to_token(value, POSITION_SPEC) for value in position]
+    return [quantize_value_to_token(value, POSITION_OUTPUT_SPEC) for value in position]
 
 
 def quantize_position_value_to_coarse_fine_tokens(value: float) -> List[str]:
@@ -318,8 +386,19 @@ def quantize_bbox_values_with_residuals(bbox_3d: Sequence[float]) -> tuple[List[
     for value, spec in zip(bbox_3d, BBOX_QUANTIZATION_SPECS):
         token, residual = quantize_value_with_residual(value, spec)
         tokens.append(token)
-        residuals.append(residual)
+        if spec_supports_residual(spec):
+            residuals.append(residual)
     return tokens, residuals
+
+
+def _get_decode_spec_for_family(family: str, spec: QuantizationSpec) -> QuantizationSpec:
+    if family == spec.family:
+        return spec
+    if spec.family == POSITION_OUTPUT_SPEC.family and family == POSITION_SPEC.family:
+        return POSITION_SPEC
+    if spec.family == SIZE_OUTPUT_SPEC.family and family == SIZE_SPEC.family:
+        return SIZE_SPEC
+    raise ValueError(f"Token family mismatch: {family} vs {spec.family}")
 
 
 def decode_special_token_value(value: Any, spec: QuantizationSpec) -> float:
@@ -331,9 +410,8 @@ def decode_special_token_value(value: Any, spec: QuantizationSpec) -> float:
         token_match = SPECIAL_TOKEN_PATTERN.fullmatch(stripped_value)
         if token_match is not None and token_match.group(2) is not None:
             family, token_index = token_match.groups()
-            if family != spec.family:
-                raise ValueError(f"Token family mismatch: {family} vs {spec.family}")
-            return dequantize_index(int(token_index), spec)
+            decode_spec = _get_decode_spec_for_family(family, spec)
+            return dequantize_index(int(token_index), decode_spec)
         try:
             return float(stripped_value)
         except ValueError as exc:
@@ -355,7 +433,8 @@ def get_bbox_token_instruction() -> str:
     placeholder_json = json.dumps(BBOX_PLACEHOLDER_TOKENS)
     return (
         'Represent "bbox_3d" as 9 quantized special tokens in the format '
-        f'{placeholder_json}. Use one special token per coordinate, such as "|position_512|".'
+        f'{placeholder_json}. Use one special token per coordinate, such as '
+        '"|position_coarse_128|", "|size_coarse_40|", or "|angle_120|".'
     )
 
 
@@ -370,7 +449,7 @@ THREEDOD_BBOX_LEGACY_LINE = (
 THREEDOD_BBOX_TOKEN_INSTRUCTION = (
     'The 3D bounding box format should be '
     f'{json.dumps(BBOX_PLACEHOLDER_TOKENS)}. '
-    'Use quantized special tokens such as "|size_120|".'
+    'Use quantized special tokens such as "|size_coarse_40|" and "|angle_120|".'
 )
 
 
@@ -477,7 +556,12 @@ def quantize_bbox_payload(payload: Any) -> Any:
         new_payload = {}
         for key, value in payload.items():
             if key == "bbox_3d" and isinstance(value, (list, tuple)) and len(value) == 9:
-                new_payload[key] = quantize_bbox_values(value)
+                try:
+                    decoded_bbox = decode_bbox_values(value)
+                except (TypeError, ValueError):
+                    new_payload[key] = value
+                    continue
+                new_payload[key] = quantize_bbox_values(decoded_bbox)
             else:
                 new_payload[key] = quantize_bbox_payload(value)
         return new_payload
@@ -499,7 +583,12 @@ def quantize_bbox_payload_with_residuals(payload: Any) -> tuple[Any, List[float]
             new_payload = {}
             for key, nested_value in value.items():
                 if key == "bbox_3d" and isinstance(nested_value, (list, tuple)) and len(nested_value) == 9:
-                    quantized_values, residuals = quantize_bbox_values_with_residuals(nested_value)
+                    try:
+                        decoded_bbox = decode_bbox_values(nested_value)
+                    except (TypeError, ValueError):
+                        new_payload[key] = nested_value
+                        continue
+                    quantized_values, residuals = quantize_bbox_values_with_residuals(decoded_bbox)
                     residual_targets.extend(residuals)
                     new_payload[key] = quantized_values
                 else:
@@ -535,15 +624,14 @@ def rewrite_bbox_response_with_special_tokens(text: str) -> str:
 
 
 def rewrite_bbox_response_with_auxiliary_targets(text: str) -> tuple[str, List[float]]:
-    if "|position_" in text or "|size_" in text or "|angle_" in text:
-        return text, []
-
     try:
         payload = parse_json_like_with_special_tokens(text)
     except Exception:
         return text, []
 
     quantized_payload, residual_targets = quantize_bbox_payload_with_residuals(payload)
+    if not residual_targets and not contains_bbox_output_tokens(text):
+        return text, []
     return format_bbox_payload(
         quantized_payload,
         fenced=text.strip().startswith("```"),
@@ -568,13 +656,12 @@ def refine_bbox_values_with_residuals(
         if token_match is None or token_match.group(2) is None:
             refined_values.append(value)
             continue
-        if residual_index >= len(residual_values):
-            refined_values.append(value)
-            continue
-        residual = residual_values[residual_index]
-        residual_index += 1
         bin_center = decode_special_token_value(value, spec)
-        refined_value = bin_center + float(residual) * spec.step
+        refined_value = bin_center
+        if spec_supports_residual(spec) and residual_index < len(residual_values):
+            residual = residual_values[residual_index]
+            residual_index += 1
+            refined_value = bin_center + float(residual) * spec.token_step
         refined_value = min(max(refined_value, spec.min_value), spec.max_value)
         refined_values.append(round(refined_value, decimal_places))
     return refined_values, residual_index

@@ -49,7 +49,12 @@ from transformers.utils import (
     logging,
     replace_return_docstrings,
 )
-from qwen_vl.bbox_special_tokens import refine_bbox_response_with_residuals
+from qwen_vl.bbox_special_tokens import (
+    POSITION_COARSE_PROMPT_FAMILY,
+    SIZE_COARSE_FAMILY,
+    contains_bbox_output_tokens,
+    refine_bbox_response_with_residuals,
+)
 from .configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLVisionConfig
 from .vggt.models.vggt import VGGT
 from .geometry_encoders import create_geometry_encoder, GeometryEncoderConfig
@@ -75,6 +80,12 @@ else:
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "Qwen2_5_VLConfig"
+ANGLE_TOKEN_FAMILY = "angle"
+BBOX_RESIDUAL_HEAD_FAMILIES = (
+    POSITION_COARSE_PROMPT_FAMILY,
+    SIZE_COARSE_FAMILY,
+    ANGLE_TOKEN_FAMILY,
+)
 
 
 class Qwen2_5_VLMLP(nn.Module):
@@ -1593,7 +1604,12 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.bbox_residual_head = None
         if getattr(config, "use_bbox_residual_head", False):
-            self.bbox_residual_head = nn.Linear(config.hidden_size, 1)
+            self.bbox_residual_head = nn.ModuleDict(
+                {
+                    family: nn.Linear(config.hidden_size, 1)
+                    for family in BBOX_RESIDUAL_HEAD_FAMILIES
+                }
+            )
         self.rope_deltas = None  # cache rope_deltas here
 
         # Initialize weights and apply final processing
@@ -1685,13 +1701,68 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
     def get_decoder(self):
         return self.model
 
-    def _predict_bbox_token_residuals(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+    def _get_bbox_residual_head_range(self, family: str) -> float:
+        config_name = {
+            POSITION_COARSE_PROMPT_FAMILY: "bbox_position_residual_head_range",
+            SIZE_COARSE_FAMILY: "bbox_size_residual_head_range",
+            ANGLE_TOKEN_FAMILY: "bbox_angle_residual_head_range",
+        }.get(family)
+        if config_name is None:
+            return 0.5
+        return max(0.0, float(getattr(self.config, config_name, 0.5)))
+
+    def _get_bbox_residual_family_token_ids(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Dict[str, torch.Tensor]:
+        family_map = getattr(self.config, "bbox_coordinate_family_map", None) or {}
+        family_to_token_ids = {family: [] for family in BBOX_RESIDUAL_HEAD_FAMILIES}
+        for token_id_str, family in family_map.items():
+            if family in family_to_token_ids:
+                family_to_token_ids[family].append(int(token_id_str))
+        return {
+            family: torch.tensor(token_ids, device=device, dtype=dtype)
+            for family, token_ids in family_to_token_ids.items()
+            if token_ids
+        }
+
+    def _predict_bbox_token_residuals(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: Optional[torch.LongTensor] = None,
+    ) -> Optional[torch.Tensor]:
         if self.bbox_residual_head is None:
             return None
         if hidden_states.shape[1] == 0:
             return hidden_states.new_zeros(hidden_states.shape[:2])
-        residuals = self.bbox_residual_head(hidden_states[..., :-1, :]).squeeze(-1)
-        residuals = 0.5 * torch.tanh(residuals)
+        if input_ids is None or hidden_states.shape[1] <= 1:
+            return hidden_states.new_zeros(hidden_states.shape[:2])
+
+        next_token_ids = input_ids[..., 1:]
+        family_token_ids = self._get_bbox_residual_family_token_ids(
+            device=next_token_ids.device,
+            dtype=next_token_ids.dtype,
+        )
+        hidden_states_to_predict = hidden_states[..., :-1, :]
+        residuals = hidden_states_to_predict.new_zeros(next_token_ids.shape)
+
+        for family, head in self.bbox_residual_head.items():
+            token_ids = family_token_ids.get(family)
+            if token_ids is None or token_ids.numel() == 0:
+                continue
+            family_mask = torch.isin(next_token_ids, token_ids)
+            if not family_mask.any():
+                continue
+            family_hidden_states = hidden_states_to_predict[family_mask]
+            family_residuals = head(family_hidden_states).squeeze(-1)
+            family_residual_range = self._get_bbox_residual_head_range(family)
+            if family_residual_range > 0:
+                family_residuals = family_residual_range * torch.tanh(family_residuals)
+            else:
+                family_residuals = family_residuals.new_zeros(family_residuals.shape)
+            residuals[family_mask] = family_residuals.to(residuals.dtype)
+
         return F.pad(residuals, (1, 0), value=0.0)
 
     def _compute_bbox_coordinate_loss(
@@ -1753,8 +1824,8 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             clean_up_tokenization_spaces=False,
         )
 
-        coordinate_token_ids = getattr(self.config, "bbox_coordinate_token_ids", None) or []
-        if self.bbox_residual_head is None or not coordinate_token_ids:
+        residual_token_ids = getattr(self.config, "bbox_residual_token_ids", None) or []
+        if self.bbox_residual_head is None or not residual_token_ids:
             return decoded_texts
 
         if pad_token_id is not None:
@@ -1779,10 +1850,10 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         if bbox_token_residuals is None:
             return decoded_texts
 
-        coordinate_token_id_set = {int(token_id) for token_id in coordinate_token_ids}
+        residual_token_id_set = {int(token_id) for token_id in residual_token_ids}
         refined_texts = []
         for batch_idx, decoded_text in enumerate(decoded_texts):
-            if not any(token in decoded_text for token in ("|position_", "|size_", "|angle_")):
+            if not contains_bbox_output_tokens(decoded_text):
                 refined_texts.append(decoded_text)
                 continue
 
@@ -1790,7 +1861,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             for position in range(int(prompt_lengths[batch_idx]), sequences.shape[1]):
                 if not attention_mask[batch_idx, position]:
                     continue
-                if int(sequences[batch_idx, position].item()) in coordinate_token_id_set:
+                if int(sequences[batch_idx, position].item()) in residual_token_id_set:
                     residual_values.append(float(bbox_token_residuals[batch_idx, position].item()))
             refined_texts.append(
                 refine_bbox_response_with_residuals(
@@ -2144,7 +2215,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
 
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
-        bbox_token_residuals = self._predict_bbox_token_residuals(hidden_states)
+        bbox_token_residuals = self._predict_bbox_token_residuals(hidden_states, input_ids=input_ids)
         loss = None
         if labels is not None:
             # Upcast to float if we need to compute the loss to avoid potential precision issues
