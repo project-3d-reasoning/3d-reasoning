@@ -1610,6 +1610,9 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                     for family in BBOX_RESIDUAL_HEAD_FAMILIES
                 }
             )
+        self._bbox_coordinate_token_lookup_cache = {}
+        self._bbox_coordinate_neighbor_table_cache = {}
+        self._bbox_residual_family_lookup_cache = {}
         self.rope_deltas = None  # cache rope_deltas here
 
         # Initialize weights and apply final processing
@@ -1727,6 +1730,81 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             if token_ids
         }
 
+    @staticmethod
+    def _get_device_cache_key(device: torch.device) -> tuple[str, Optional[int]]:
+        return device.type, device.index
+
+    def _get_bbox_coordinate_token_lookup(
+        self,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        token_ids = getattr(self.config, "bbox_coordinate_token_ids", None) or []
+        if not token_ids:
+            return None
+
+        cache_key = self._get_device_cache_key(device)
+        lookup = self._bbox_coordinate_token_lookup_cache.get(cache_key)
+        vocab_size = int(getattr(self.config, "vocab_size", self.vocab_size))
+        if lookup is None or lookup.shape[0] != vocab_size:
+            lookup = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+            lookup[torch.tensor(token_ids, device=device, dtype=torch.long)] = True
+            self._bbox_coordinate_token_lookup_cache[cache_key] = lookup
+        return lookup
+
+    def _get_bbox_coordinate_neighbor_table(
+        self,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        neighbor_map = getattr(self.config, "bbox_coordinate_neighbor_token_ids", None) or {}
+        if not neighbor_map:
+            return None
+
+        cache_key = self._get_device_cache_key(device)
+        table = self._bbox_coordinate_neighbor_table_cache.get(cache_key)
+        vocab_size = int(getattr(self.config, "vocab_size", self.vocab_size))
+        max_neighbors = max((len(neighbors) for neighbors in neighbor_map.values()), default=0)
+        if max_neighbors <= 0:
+            return None
+        expected_shape = (vocab_size, max_neighbors)
+        if table is None or tuple(table.shape) != expected_shape:
+            table = torch.full(expected_shape, -1, dtype=torch.long, device=device)
+            for token_id_str, neighbors in neighbor_map.items():
+                if not neighbors:
+                    continue
+                token_id = int(token_id_str)
+                table[token_id, : len(neighbors)] = torch.tensor(
+                    neighbors,
+                    device=device,
+                    dtype=torch.long,
+                )
+            self._bbox_coordinate_neighbor_table_cache[cache_key] = table
+        return table
+
+    def _get_bbox_residual_family_lookup(
+        self,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        family_map = getattr(self.config, "bbox_coordinate_family_map", None) or {}
+        if not family_map:
+            return None
+
+        cache_key = self._get_device_cache_key(device)
+        lookup = self._bbox_residual_family_lookup_cache.get(cache_key)
+        vocab_size = int(getattr(self.config, "vocab_size", self.vocab_size))
+        if lookup is None or lookup.shape[0] != vocab_size:
+            lookup = torch.zeros(vocab_size, dtype=torch.long, device=device)
+            family_to_index = {
+                family: index
+                for index, family in enumerate(BBOX_RESIDUAL_HEAD_FAMILIES, start=1)
+            }
+            for token_id_str, family in family_map.items():
+                family_index = family_to_index.get(family)
+                if family_index is None:
+                    continue
+                lookup[int(token_id_str)] = family_index
+            self._bbox_residual_family_lookup_cache[cache_key] = lookup
+        return lookup
+
     def _predict_bbox_token_residuals(
         self,
         hidden_states: torch.Tensor,
@@ -1740,18 +1818,15 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             return hidden_states.new_zeros(hidden_states.shape[:2])
 
         next_token_ids = input_ids[..., 1:]
-        family_token_ids = self._get_bbox_residual_family_token_ids(
-            device=next_token_ids.device,
-            dtype=next_token_ids.dtype,
-        )
         hidden_states_to_predict = hidden_states[..., :-1, :]
         residuals = hidden_states_to_predict.new_zeros(next_token_ids.shape)
+        family_lookup = self._get_bbox_residual_family_lookup(next_token_ids.device)
+        if family_lookup is None:
+            return F.pad(residuals, (1, 0), value=0.0)
+        family_indices = family_lookup[next_token_ids]
 
-        for family, head in self.bbox_residual_head.items():
-            token_ids = family_token_ids.get(family)
-            if token_ids is None or token_ids.numel() == 0:
-                continue
-            family_mask = torch.isin(next_token_ids, token_ids)
+        for family_index, (family, head) in enumerate(self.bbox_residual_head.items(), start=1):
+            family_mask = family_indices.eq(family_index)
             if not family_mask.any():
                 continue
             family_hidden_states = hidden_states_to_predict[family_mask]
@@ -1780,25 +1855,24 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 reduction="mean",
             )
 
-        neighbor_token_ids = getattr(self.config, "bbox_coordinate_neighbor_token_ids", None) or {}
         log_probs = F.log_softmax(coordinate_logits, dim=-1)
-        loss_sum = coordinate_logits.new_tensor(0.0)
-        loss_count = coordinate_logits.new_tensor(0.0)
+        target_nll = -log_probs.gather(1, coordinate_labels.unsqueeze(1)).squeeze(1)
+        neighbor_table = self._get_bbox_coordinate_neighbor_table(coordinate_logits.device)
+        if neighbor_table is None:
+            return target_nll.mean()
 
-        for token_id in torch.unique(coordinate_labels).tolist():
-            token_mask = coordinate_labels == token_id
-            token_log_probs = log_probs[token_mask]
-            token_nll = -token_log_probs[:, token_id]
-            neighbors = neighbor_token_ids.get(str(int(token_id)), [])
-            if neighbors:
-                neighbor_nll = -token_log_probs[:, neighbors].mean(dim=-1)
-                token_loss = (1.0 - label_smoothing) * token_nll + label_smoothing * neighbor_nll
-            else:
-                token_loss = token_nll
-            loss_sum = loss_sum + token_loss.sum()
-            loss_count = loss_count + token_mask.sum().to(coordinate_logits.dtype)
+        neighbors = neighbor_table.index_select(0, coordinate_labels)
+        neighbor_mask = neighbors.ge(0)
+        if not neighbor_mask.any():
+            return target_nll.mean()
 
-        return loss_sum / loss_count.clamp_min(1.0)
+        safe_neighbors = neighbors.clamp_min(0)
+        neighbor_log_probs = log_probs.gather(1, safe_neighbors)
+        neighbor_log_probs = neighbor_log_probs.masked_fill(~neighbor_mask, 0.0)
+        neighbor_counts = neighbor_mask.sum(dim=1)
+        neighbor_nll = -(neighbor_log_probs.sum(dim=1) / neighbor_counts.clamp_min(1).to(log_probs.dtype))
+        smoothed_loss = (1.0 - label_smoothing) * target_nll + label_smoothing * neighbor_nll
+        return torch.where(neighbor_counts.gt(0), smoothed_loss, target_nll).mean()
 
     @torch.no_grad()
     def refine_bbox_special_token_outputs(
@@ -2230,18 +2304,14 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             shift_labels = shift_labels.to(shift_logits.device)
             valid_mask = shift_labels.ne(-100)
 
-            bbox_coordinate_token_ids = getattr(self.config, "bbox_coordinate_token_ids", None) or []
             bbox_coordinate_label_smoothing = float(
                 getattr(self.config, "bbox_coordinate_label_smoothing", 0.1)
             )
 
-            if bbox_coordinate_token_ids:
-                coordinate_token_ids = torch.tensor(
-                    bbox_coordinate_token_ids,
-                    device=shift_labels.device,
-                    dtype=shift_labels.dtype,
-                )
-                coordinate_mask = torch.isin(shift_labels, coordinate_token_ids) & valid_mask
+            coordinate_lookup = self._get_bbox_coordinate_token_lookup(shift_labels.device)
+            if coordinate_lookup is not None:
+                safe_shift_labels = shift_labels.masked_fill(~valid_mask, 0)
+                coordinate_mask = coordinate_lookup[safe_shift_labels] & valid_mask
             else:
                 coordinate_mask = torch.zeros_like(valid_mask, dtype=torch.bool)
             non_coordinate_mask = valid_mask & ~coordinate_mask
@@ -2269,10 +2339,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 loss_sum = loss_sum + coordinate_loss * coordinate_count
                 loss_count = loss_count + coordinate_count
 
-            if loss_count.item() > 0:
-                loss = loss_sum / loss_count
-            else:
-                loss = shift_logits.new_tensor(0.0)
+            loss = loss_sum / loss_count.clamp_min(1.0)
 
             bbox_residual_loss_weight = float(
                 getattr(

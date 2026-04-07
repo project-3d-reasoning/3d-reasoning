@@ -199,7 +199,7 @@ def train(attn_implementation="flash_attention_2"):
         cache_dir=training_args.cache_dir,
         model_max_length=training_args.model_max_length,
         padding_side="right",
-        use_fast=False,
+        use_fast=model_args.tokenizer_use_fast,
     )
     if model_args.use_bbox_special_tokens:
         num_new_tokens = add_bbox_tokens(tokenizer)

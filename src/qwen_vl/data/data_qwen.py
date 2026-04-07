@@ -30,6 +30,7 @@ from qwen_vl.bbox_special_tokens import (
     rewrite_bbox_response_with_auxiliary_targets,
     rewrite_scan2cap_prompt_with_position_tokens,
 )
+from qwen_vl.tokenizer_utils import apply_chat_template_with_override
 from .rope2d import get_rope_index_25, get_rope_index_2
 from .utils import prepare_image_inputs
 
@@ -72,10 +73,6 @@ def preprocess_qwen_2_visual(
     if visual_type not in ["image", "video"]:
         raise ValueError("visual_type must be either 'image' or 'video'")
 
-    tokenizer = copy.deepcopy(tokenizer)
-    chat_template = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
-    tokenizer.chat_template = chat_template
-
     visual_replicate_index = 0
     input_ids, targets = [], []
     all_bbox_residual_targets, all_bbox_residual_masks = [], []
@@ -93,8 +90,9 @@ def preprocess_qwen_2_visual(
         sample_residual_targets = list(bbox_response_residual_targets[i]) if bbox_response_residual_targets else []
         sample_residual_index = 0
 
-        input_id += tokenizer.apply_chat_template(
-            [{"role": "system", "content": system_message}]
+        input_id += apply_chat_template_with_override(
+            tokenizer,
+            [{"role": "system", "content": system_message}],
         )
         target += [IGNORE_INDEX] * len(input_id)
         bbox_residual_target += [0.0] * len(input_id)
@@ -128,7 +126,7 @@ def preprocess_qwen_2_visual(
                     content = "".join(new_parts)
 
             conv = [{"role": role, "content": content}]
-            encode_id = tokenizer.apply_chat_template(conv)
+            encode_id = apply_chat_template_with_override(tokenizer, conv)
             input_id += encode_id
             token_residual_target = [0.0] * len(encode_id)
             token_residual_mask = [False] * len(encode_id)
@@ -300,10 +298,11 @@ class LazySupervisedDataset(Dataset):
             return np.array([1] * len(self.list_data_dict))
 
     def process_image_unified(self, image_file):
-        processor = copy.deepcopy(self.data_args.image_processor)
         image = Image.open(image_file).convert("RGB")
-
-        visual_processed = processor.preprocess(image, return_tensors="pt")
+        visual_processed = self.data_args.image_processor.preprocess(
+            image,
+            return_tensors="pt",
+        )
         image_tensor = visual_processed["pixel_values"]
         if isinstance(image_tensor, List):
             image_tensor = image_tensor[0]
@@ -346,13 +345,17 @@ class LazySupervisedDataset(Dataset):
         frame_idx = np.unique(frame_idx)
         video = vr.get_batch(frame_idx).asnumpy()
         fps = len(frame_idx) / video_length
-        processor = copy.deepcopy(self.data_args.image_processor)
-        processor.max_pixels = self.data_args.video_max_frame_pixels
-        processor.min_pixels = self.data_args.video_min_frame_pixels
-        processor.size["longest_edge"] = processor.max_pixels
-        processor.size["shortest_edge"] = processor.min_pixels
-        video_processed = processor.preprocess(
-            images=None, videos=video, return_tensors="pt"
+        video_size = {
+            "longest_edge": self.data_args.video_max_frame_pixels,
+            "shortest_edge": self.data_args.video_min_frame_pixels,
+        }
+        video_processed = self.data_args.image_processor.preprocess(
+            images=None,
+            videos=video,
+            return_tensors="pt",
+            max_pixels=self.data_args.video_max_frame_pixels,
+            min_pixels=self.data_args.video_min_frame_pixels,
+            size=video_size,
         )
         video_tensor = video_processed["pixel_values_videos"]
         grid_thw = video_processed["video_grid_thw"][0]

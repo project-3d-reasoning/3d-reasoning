@@ -16,6 +16,7 @@ from qwen_vl.bbox_special_tokens import (
     restore_threedod_bbox_prompt,
 )
 from qwen_vl.data.utils import prepare_generation_images
+from qwen_vl.tokenizer_utils import apply_chat_template_with_override
 
 
 SYSTEM_MESSAGE = "You are a helpful assistant."
@@ -192,13 +193,13 @@ class BBoxFormatProbeCallback(TrainerCallback):
         model_image_token = "<|vision_start|><|image_pad|><|vision_end|>"
         user_content = prompt.replace(image_token, model_image_token)
 
-        tokenizer = copy.deepcopy(self.tokenizer)
-        tokenizer.chat_template = CHAT_TEMPLATE
-        text = tokenizer.apply_chat_template(
+        text = apply_chat_template_with_override(
+            self.tokenizer,
             [
                 {"role": "system", "content": SYSTEM_MESSAGE},
                 {"role": "user", "content": user_content},
             ],
+            chat_template=CHAT_TEMPLATE,
             tokenize=False,
             add_generation_prompt=True,
         )

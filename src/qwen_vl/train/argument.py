@@ -18,6 +18,7 @@ class ModelArguments:
     bbox_position_residual_head_range: float = field(default=0.5)
     bbox_size_residual_head_range: float = field(default=0.5)
     bbox_angle_residual_head_range: float = field(default=0.5)
+    tokenizer_use_fast: bool = field(default=True)
 
     # Geometry encoder configuration
     use_geometry_encoder: bool = field(default=False)  # Whether to use 3D geometry encoder
