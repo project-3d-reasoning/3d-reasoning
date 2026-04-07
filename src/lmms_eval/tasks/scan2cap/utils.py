@@ -4,12 +4,10 @@ The evaluation script refers to the implementation of LEO
 https://github.com/embodied-generalist/embodied-generalist/blob/main/evaluator/cap_eval.py
 """
 
-import re
 import os
-import pandas as pd
+from functools import lru_cache
 from pathlib import Path
 import yaml
-import pickle
 from PIL import Image
 from terminaltables import AsciiTable
 from loguru import logger as eval_logger
@@ -26,15 +24,16 @@ media_dir = yaml.safe_load("".join(safe_data))["metadata"]["media_dir"]
 #     data = pickle.load(f)["data_list"]
 #     id2scene = {sample["sample_id"]: sample for sample in data}
 
+
+@lru_cache(maxsize=256)
+def _load_rgb_image(image_file):
+    image_path = os.path.join(media_dir, image_file)
+    with Image.open(image_path) as image:
+        return image.convert("RGB")
+
+
 def scan2cap_doc_to_visual(doc):
-    image_files = doc["images"]
-    images = [
-        Image.open(
-            os.path.join(media_dir, image_file)
-        ).convert("RGB")
-        for image_file in image_files
-    ]
-    return [images]
+    return [[_load_rgb_image(image_file) for image_file in doc["images"]]]
 
 
 def scan2cap_doc_to_text(doc, lmms_eval_specific_kwargs=None):

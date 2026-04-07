@@ -1,8 +1,6 @@
-import base64
-from io import BytesIO
+import os
 from typing import List, Optional, Tuple, Union
 
-import copy
 import decord
 import numpy as np
 import torch
@@ -24,7 +22,7 @@ from lmms_eval.api.registry import register_model
 from lmms_eval.models.model_utils.load_video import read_video_pyav_base64
 
 from qwen_vl.model.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGenerationWithVGGT
-from qwen_vl.data.utils import load_and_preprocess_images
+from qwen_vl.data.utils import load_and_preprocess_images, load_first_frame_coord_inputs
 
 try:
     # from qwen_vl_utils import process_vision_info
@@ -110,6 +108,7 @@ class VGLLM(lmms):
         self._config = self.model.config
         self.batch_size_per_gpu = int(batch_size)
         self.use_cache = use_cache
+        self._logged_coord_pe_eval = False
 
         if accelerator.num_processes > 1:
             assert accelerator.distributed_type in [
@@ -181,8 +180,70 @@ class VGLLM(lmms):
                 new_list.append(j)
         return new_list
 
+    def _resolve_doc_image_paths(self, task_name: str, doc) -> Optional[List[str]]:
+        if "images" not in doc or not isinstance(doc["images"], (list, tuple)):
+            return None
+
+        if task_name in {"scanrefer", "scanrefer_first_frame"}:
+            from lmms_eval.tasks.scanrefer import utils as task_utils
+        elif task_name == "scan2cap":
+            from lmms_eval.tasks.scan2cap import utils as task_utils
+        elif task_name in {"scannet_4frames", "scannet_6frames"}:
+            from lmms_eval.tasks.threedod import utils as task_utils
+        else:
+            return None
+
+        return [os.path.join(task_utils.media_dir, image_file) for image_file in doc["images"]]
+
+    def _load_eval_coord_pe(self, task_name: str, doc):
+        image_paths = self._resolve_doc_image_paths(task_name, doc)
+        if image_paths is None:
+            return None, None
+        return load_first_frame_coord_inputs(image_paths)
+
+    def _build_empty_coord_pe(self, processed_images: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        _, _, height, width = processed_images.shape
+        points = torch.zeros(
+            processed_images.shape[0],
+            height,
+            width,
+            3,
+            dtype=processed_images.dtype,
+        )
+        masks = torch.zeros(
+            processed_images.shape[0],
+            height,
+            width,
+            dtype=torch.bool,
+        )
+        return points, masks
+
+    def _prepare_coord_pe_batch(self, processed_images: torch.Tensor, coord_points, coord_masks) -> Tuple[torch.Tensor, torch.Tensor]:
+        if coord_points is None or coord_masks is None:
+            return self._build_empty_coord_pe(processed_images)
+
+        if len(coord_points) != processed_images.shape[0] or len(coord_masks) != processed_images.shape[0]:
+            eval_logger.warning("coord_pe image count does not match visual count during evaluation; falling back to empty coord_pe.")
+            return self._build_empty_coord_pe(processed_images)
+
+        target_h = processed_images.shape[-2]
+        target_w = processed_images.shape[-1]
+        for points, masks in zip(coord_points, coord_masks):
+            if points.shape[:2] != (target_h, target_w) or masks.shape[:2] != (target_h, target_w):
+                eval_logger.warning("coord_pe spatial shape does not match processed images during evaluation; falling back to empty coord_pe.")
+                return self._build_empty_coord_pe(processed_images)
+
+        return torch.stack(coord_points), torch.stack(coord_masks)
+
     def generate_until(self, requests: List[Instance]) -> List[str]:
         res = []
+        device = "cuda" if self.device_map == "auto" else self.device
+        use_geometry_encoder = getattr(self.model.config, "use_geometry_encoder", False) or getattr(self.model.config, "use_vggt_feature", False)
+        use_coord_pe = getattr(self.model.config, "use_coord_pe", False)
+        patch_multiple = self.processor.image_processor.patch_size * self.processor.image_processor.merge_size
+
+        def _ensure_rgb(image: Image.Image) -> Image.Image:
+            return image if image.mode == "RGB" else image.convert("RGB")
 
         def _collate(x):
             # the negative sign on len(toks) sorts descending - this has a few advantages:
@@ -204,10 +265,12 @@ class VGLLM(lmms):
             contexts, all_gen_kwargs, doc_to_visual, doc_id, task, split = zip(*chunk)
             task = task[0]
             split = split[0]
-            visuals = [doc_to_visual[0](self.task_dict[task][split][ids]) for ids in doc_id]
+            docs = [self.task_dict[task][split][ids] for ids in doc_id]
+            visuals = [doc_to_visual[0](doc) for doc in docs]
+            coord_pe_batches = [self._load_eval_coord_pe(task, doc) for doc in docs] if use_coord_pe else [(None, None)] * len(docs)
             visuals = self.flatten(visuals)
 
-            gen_kwargs = all_gen_kwargs[0]
+            gen_kwargs = dict(all_gen_kwargs[0])
 
             # Set default values for until and max_new_tokens
             until = [self.tokenizer.decode(self.eot_token_id)]
@@ -221,7 +284,6 @@ class VGLLM(lmms):
                     raise ValueError(f"Expected `gen_kwargs['until']` to be of type Union[str,list] but got {type(until)}")
 
             messages = []
-            processed_visuals = []
             for i, context in enumerate(contexts):
 
                 message = [{"role": "system", "content": "You are a helpful assistant."}]
@@ -245,24 +307,14 @@ class VGLLM(lmms):
                         message.append({"role": "user", "content": visual_content + [{"type": "text", "text": context}]})
 
                     elif isinstance(visual, Image.Image):  # Single image
-                        base64_image = visual.convert("RGB")
-                        buffer = BytesIO()
-                        base64_image.save(buffer, format="JPEG")
-                        base64_bytes = base64.b64encode(buffer.getvalue())
-                        base64_string = base64_bytes.decode("utf-8")
-                        message.append({"role": "user", "content": [{"type": "image", "image": f"data:image/jpeg;base64,{base64_string}"}, {"type": "text", "text": context}]})
+                        message.append({"role": "user", "content": [{"type": "image", "image": _ensure_rgb(visual)}, {"type": "text", "text": context}]})
                     elif isinstance(visual, (list, tuple)) and all(isinstance(v, Image.Image) for v in visual):  # Multiple images
                         image_content = []
                         image_count = 0
                         for v in visual:
-                            base64_image = v.convert("RGB")
-                            buffer = BytesIO()
-                            base64_image.save(buffer, format="JPEG")
-                            base64_bytes = base64.b64encode(buffer.getvalue())
-                            base64_string = base64_bytes.decode("utf-8")
                             if self.add_frame_index:
                                 image_content.append({"type": "text", "text": "Frame-{}: ".format(image_count)})    
-                            image_content.append({"type": "image", "image": f"data:image/jpeg;base64,{base64_string}"})
+                            image_content.append({"type": "image", "image": _ensure_rgb(v)})
                             image_count += 1
                         message.append({"role": "user", "content": image_content + [{"type": "text", "text": context}]})
                     else:
@@ -276,42 +328,50 @@ class VGLLM(lmms):
             # image_inputs, video_inputs = process_vision_info(messages)
 
             geometry_encoder_inputs = []
+            coord_pe_points = []
+            coord_pe_masks = []
             image_inputs = []
-            patch_size = self.processor.image_processor.patch_size
-            merge_size = self.processor.image_processor.merge_size
-            for message in messages:
+            for sample_idx, message in enumerate(messages):
                 vision_info = extract_vision_info(message)
-                cur_geometry_encoder_inputs = []
+                sample_images = []
                 for ele in vision_info:
                     if "image" in ele:
                         image = ele["image"]
                         if isinstance(image, Image.Image):
-                            pass
+                            sample_images.append(image)
                         elif isinstance(image, str) and "base64," in image:
-                            _, base64_data = image.split("base64,", 1)
-                            data = base64.b64decode(base64_data)
-                            # fix memory leak issue while using BytesIO
-                            with BytesIO(data) as bio:
-                                image = copy.deepcopy(Image.open(bio))
+                            raise NotImplementedError("Base64-encoded images are no longer supported in VGLLM generate_until")
+                        elif isinstance(image, str) and os.path.exists(image):
+                            with Image.open(image) as pil_image:
+                                sample_images.append(_ensure_rgb(pil_image))
                         else:
                             raise NotImplementedError("Unsupported image type")
-
+                    elif "video" in ele:
+                        raise NotImplementedError("Video inputs are not supported with geometry encoder preprocessing")
                     else:
                         raise NotImplementedError("Unsupported vision info type")
 
-                    assert isinstance(image, Image.Image), f"Unsupported image type: {type(image)}"
-                    image = load_and_preprocess_images([image])[0]
-                    cur_geometry_encoder_inputs.append(copy.deepcopy(image))
-                    _, height, width = image.shape
-                    # merge_size = 2
-                    if (width // patch_size) % merge_size > 0:
-                        width = width - (width // patch_size) % merge_size * patch_size
-                    if (height // patch_size) % merge_size > 0:
-                        height = height - (height // patch_size) % merge_size * patch_size
-                    image = image[:, :height, :width]
-                    image_inputs.append(image)
+                if not sample_images:
+                    continue
 
-                geometry_encoder_inputs.append(torch.stack(cur_geometry_encoder_inputs))
+                processed_images = load_and_preprocess_images(sample_images)
+                geometry_encoder_inputs.append(processed_images)
+                if use_coord_pe:
+                    sample_coord_points, sample_coord_masks = coord_pe_batches[sample_idx]
+                    sample_coord_points, sample_coord_masks = self._prepare_coord_pe_batch(
+                        processed_images,
+                        sample_coord_points,
+                        sample_coord_masks,
+                    )
+                    coord_pe_points.append(sample_coord_points)
+                    coord_pe_masks.append(sample_coord_masks)
+                for image in processed_images:
+                    _, height, width = image.shape
+                    if width % patch_multiple > 0:
+                        width -= width % patch_multiple
+                    if height % patch_multiple > 0:
+                        height -= height % patch_multiple
+                    image_inputs.append(image[:, :height, :width])
             inputs = self.processor(
                 text=text,
                 images=image_inputs,
@@ -320,9 +380,22 @@ class VGLLM(lmms):
                 return_tensors="pt",
                 do_rescale=False
             )
-            device = "cuda" if self.device_map == "auto" else self.device
-            if getattr(self.model.config, "use_geometry_encoder", False) or getattr(self.model.config, "use_vggt_feature", False):
+            if use_geometry_encoder:
                 inputs["geometry_encoder_inputs"] = [feat.to(device) for feat in geometry_encoder_inputs]
+                if use_coord_pe:
+                    inputs["coord_pe_points"] = [feat.to(device) for feat in coord_pe_points]
+                    inputs["coord_pe_masks"] = [feat.to(device) for feat in coord_pe_masks]
+                    if coord_pe_points and not self._logged_coord_pe_eval:
+                        first_points = coord_pe_points[0]
+                        first_masks = coord_pe_masks[0]
+                        eval_logger.info(
+                            "Passing coord_pe into model during evaluation: "
+                            f"batch={len(coord_pe_points)}, "
+                            f"first_points_shape={tuple(first_points.shape)}, "
+                            f"first_masks_shape={tuple(first_masks.shape)}, "
+                            f"first_valid_pixels={int(first_masks.sum().item())}"
+                        )
+                        self._logged_coord_pe_eval = True
             inputs = inputs.to(device)
 
             if "max_new_tokens" not in gen_kwargs:
@@ -336,17 +409,18 @@ class VGLLM(lmms):
 
             pad_token_id = self.tokenizer.pad_token_id
 
-            cont = self.model.generate(
-                **inputs,
-                eos_token_id=self.tokenizer.eos_token_id,
-                pad_token_id=pad_token_id,
-                do_sample=True if gen_kwargs["temperature"] > 0 else False,
-                temperature=gen_kwargs["temperature"],
-                top_p=gen_kwargs["top_p"],
-                num_beams=gen_kwargs["num_beams"],
-                max_new_tokens=gen_kwargs["max_new_tokens"],
-                use_cache=self.use_cache,
-            )
+            with torch.inference_mode():
+                cont = self.model.generate(
+                    **inputs,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    pad_token_id=pad_token_id,
+                    do_sample=True if gen_kwargs["temperature"] > 0 else False,
+                    temperature=gen_kwargs["temperature"],
+                    top_p=gen_kwargs["top_p"],
+                    num_beams=gen_kwargs["num_beams"],
+                    max_new_tokens=gen_kwargs["max_new_tokens"],
+                    use_cache=self.use_cache,
+                )
 
             generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, cont)]
             answers = self.processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)
