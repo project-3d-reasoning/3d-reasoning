@@ -1840,6 +1840,31 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
 
         return F.pad(residuals, (1, 0), value=0.0)
 
+    def _bbox_residual_head_zero_guard(self, reference_tensor: torch.Tensor) -> torch.Tensor:
+        zero_guard = reference_tensor.new_tensor(0.0)
+        if self.bbox_residual_head is None:
+            return zero_guard
+
+        for head in self.bbox_residual_head.values():
+            zero_guard = zero_guard + head.weight.sum() * 0.0
+            if head.bias is not None:
+                zero_guard = zero_guard + head.bias.sum() * 0.0
+        return zero_guard
+
+    def _geometry_module_zero_guard(self, reference_tensor: torch.Tensor) -> torch.Tensor:
+        zero_guard = reference_tensor.new_tensor(0.0)
+        if not getattr(self.config, "use_geometry_encoder", False):
+            return zero_guard
+
+        for module_name in ("geometry_merger", "feature_fusion"):
+            module = getattr(self, module_name, None)
+            if module is None:
+                continue
+            for parameter in module.parameters():
+                if parameter.requires_grad:
+                    zero_guard = zero_guard + parameter.sum() * 0.0
+        return zero_guard
+
     def _compute_bbox_coordinate_loss(
         self,
         coordinate_logits: torch.Tensor,
@@ -2340,6 +2365,10 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 loss_count = loss_count + coordinate_count
 
             loss = loss_sum / loss_count.clamp_min(1.0)
+
+            zero_guard_loss = self._bbox_residual_head_zero_guard(loss)
+            zero_guard_loss = zero_guard_loss + self._geometry_module_zero_guard(loss)
+            loss = loss + zero_guard_loss
 
             bbox_residual_loss_weight = float(
                 getattr(
