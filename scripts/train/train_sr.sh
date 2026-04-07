@@ -22,6 +22,7 @@ mkdir -p $OUTPUT_DIR
 # Model Configuration
 # ======================
 DATASETS="spar_234k,llava_hound_64k"                  # [DataArguments] Dataset with sampling rate
+USE_COORD_PE=${USE_COORD_PE:-True}                    # [ModelArguments] Defaults to True; set to False to disable coordinate positional encoding
 
 # ======================
 # Training Hyperparameters
@@ -74,4 +75,5 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --geometry_encoder_type $GEOMETRY_ENCODER_TYPE \
             --geometry_encoder_path $GEOMETRY_ENCODER_PATH \
             --feature_fusion_method "add" \
+            --use_coord_pe $USE_COORD_PE \
             > ${OUTPUT_DIR}/train.log 2>&1

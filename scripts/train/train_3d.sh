@@ -14,7 +14,7 @@ NPROC_PER_NODE=$(nvidia-smi --list-gpus | wc -l)  # Automatically detects availa
 MODEL_PATH="/data7t-root/huggingface/hub/models--Qwen--Qwen2.5-VL-7B-Instruct/snapshots/cc594898137f460bfe9f0759e9844b3ce807cfb5"  # [ModelArguments] Pretrained model path
 GEOMETRY_ENCODER_TYPE="vggt"
 GEOMETRY_ENCODER_PATH="facebook/VGGT-1B"
-OUTPUT_DIR="PATH_TO_OUTPUT_DIR"                   # Directory for saving checkpoints
+OUTPUT_DIR="7b-pe"                   # Directory for saving checkpoints
 CACHE_DIR="./cache"                        # [TrainingArguments] Cache directory for models
 mkdir -p $OUTPUT_DIR
 
@@ -22,12 +22,13 @@ mkdir -p $OUTPUT_DIR
 # Model Configuration
 # ======================
 DATASETS="scan2cap,scanrefer,scannet_det"                  # [DataArguments] Dataset with sampling rate
+USE_COORD_PE=${USE_COORD_PE:-True}                        # [ModelArguments] Defaults to True; set to False to disable coordinate positional encoding
 
 # ======================
 # Training Hyperparameters
 # ======================
 export NCCL_NVLS_ENABLE=0
-LR=1e-5
+LR=2e-5
 total_batch_size=64
 GRADIENT_ACCUMULATION_STEPS=$(($total_batch_size / $NPROC_PER_NODE))
 
@@ -63,7 +64,7 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --lr_scheduler_type "cosine" \
             --weight_decay 0.01 \
             --logging_steps 10 \
-            --save_steps 1000 \
+            --save_steps 500 \
             --save_total_limit 1 \
             --deepspeed "scripts/zero2_opt.json" \
             --gradient_checkpointing \
@@ -75,4 +76,5 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --geometry_encoder_type $GEOMETRY_ENCODER_TYPE \
             --geometry_encoder_path $GEOMETRY_ENCODER_PATH \
             --feature_fusion_method "add" \
+            --use_coord_pe $USE_COORD_PE \
             > ${OUTPUT_DIR}/train.log 2>&1
