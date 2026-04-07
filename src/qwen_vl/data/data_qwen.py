@@ -249,6 +249,24 @@ class LazySupervisedDataset(Dataset):
     def __len__(self):
         return len(self.list_data_dict)
 
+    def _clone_sample_for_getitem(self, sample: Dict) -> Dict:
+        cloned = dict(sample)
+
+        conversations = sample.get("conversations")
+        if conversations is not None:
+            cloned["conversations"] = [dict(conv) for conv in conversations]
+
+        for key in ("image", "images", "video"):
+            value = sample.get(key)
+            if isinstance(value, list):
+                cloned[key] = list(value)
+
+        metadata = sample.get("metadata")
+        if isinstance(metadata, dict):
+            cloned["metadata"] = dict(metadata)
+
+        return cloned
+
     @property
     def lengths(self):
         length_list = []
@@ -439,7 +457,7 @@ class LazySupervisedDataset(Dataset):
         return images
 
     def _get_item(self, i) -> Dict[str, torch.Tensor]:
-        sources = copy.deepcopy(self.list_data_dict[i])
+        sources = self._clone_sample_for_getitem(self.list_data_dict[i])
         if self.use_bbox_special_tokens:
             sources = self._rewrite_special_token_datasets(sources)
         if isinstance(i, int):
@@ -495,12 +513,11 @@ class LazySupervisedDataset(Dataset):
             else:
                 raise NotImplementedError
 
-            grid_thw_merged = copy.deepcopy(grid_thw)
             grid_thw_merged = [
                 merged_thw.prod() // self.data_args.image_processor.merge_size**2
-                for merged_thw in grid_thw_merged
+                for merged_thw in grid_thw
             ]
-            sources = copy.deepcopy([e["conversations"] for e in sources])
+            sources = [[dict(conv) for conv in e["conversations"]] for e in sources]
             data_dict = preprocess_qwen_2_visual(
                 sources,
                 self.tokenizer,
@@ -534,15 +551,16 @@ class LazySupervisedDataset(Dataset):
                 video_file = os.path.join(video_folder, video_file)
                 video, grid_thw, second_per_grid_ts = self.process_video(video_file)
                 video = [video]
-            grid_thw_merged = copy.deepcopy(grid_thw)
             if not isinstance(grid_thw, Sequence):
-                grid_thw_merged = [grid_thw_merged]
+                grid_thw_merged = [grid_thw]
                 grid_thw = [grid_thw]
+            else:
+                grid_thw_merged = list(grid_thw)
             grid_thw_merged = [
                 merged_thw.prod() // self.data_args.image_processor.merge_size**2
                 for merged_thw in grid_thw_merged
             ]
-            sources = copy.deepcopy([e["conversations"] for e in sources])
+            sources = [[dict(conv) for conv in e["conversations"]] for e in sources]
             data_dict = preprocess_qwen_2_visual(
                 sources,
                 self.tokenizer,
@@ -560,7 +578,7 @@ class LazySupervisedDataset(Dataset):
             )
         else:
             grid_thw_merged = None
-            sources = copy.deepcopy([e["conversations"] for e in sources])
+            sources = [[dict(conv) for conv in e["conversations"]] for e in sources]
             data_dict = preprocess_qwen_2_visual(
                 sources,
                 self.tokenizer,

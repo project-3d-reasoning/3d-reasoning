@@ -23,6 +23,7 @@ mkdir -p $OUTPUT_DIR
 # ======================
 DATASETS="scan2cap,scanrefer,scannet_det"                  # [DataArguments] Dataset with sampling rate
 USE_BBOX_SPECIAL_TOKENS=True
+TOKENIZER_USE_FAST=True
 MODEL_MAX_LENGTH=12800
 NUM_TRAIN_EPOCHS=1
 
@@ -65,6 +66,7 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --vision_tower_lr 1e-6 \
             --optim adamw_torch \
             --model_max_length $MODEL_MAX_LENGTH \
+            --tokenizer_use_fast $TOKENIZER_USE_FAST \
             --data_flatten False \
             --max_pixels $((576*28*28)) \
             --min_pixels $((16*28*28)) \
