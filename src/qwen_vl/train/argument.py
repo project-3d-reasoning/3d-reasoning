@@ -15,6 +15,9 @@ class ModelArguments:
     use_bbox_residual_head: bool = field(default=False)
     bbox_residual_loss_weight: float = field(default=0.25)
     bbox_residual_loss_weight_warmup_ratio: float = field(default=0.0)
+    bbox_residual_loss_ratio_target: float = field(default=-1.0)
+    bbox_residual_loss_ratio_start: float = field(default=0.5)
+    bbox_residual_loss_weight_max: float = field(default=10.0)
     bbox_position_residual_head_range: float = field(default=0.5)
     bbox_size_residual_head_range: float = field(default=0.5)
     bbox_angle_residual_head_range: float = field(default=0.5)
@@ -56,6 +59,7 @@ class TrainingArguments(transformers.TrainingArguments):
     )
     mm_projector_lr: Optional[float] = None
     vision_tower_lr: Optional[float] = None
+    bbox_residual_head_lr: Optional[float] = None
     group_by_modality_length: bool = field(default=False)
     bbox_probe_interval: int = field(default=0)
     bbox_probe_num_samples: int = field(default=2)

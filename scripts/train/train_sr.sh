@@ -33,6 +33,9 @@ BBOX_COORDINATE_SMOOTHING_NEIGHBOR_RADIUS=2
 USE_BBOX_RESIDUAL_HEAD=False
 BBOX_RESIDUAL_LOSS_WEIGHT=0.25
 BBOX_RESIDUAL_LOSS_WEIGHT_WARMUP_RATIO=0.0
+BBOX_RESIDUAL_LOSS_RATIO_TARGET=-1
+BBOX_RESIDUAL_LOSS_RATIO_START=0.5
+BBOX_RESIDUAL_LOSS_WEIGHT_MAX=10.0
 
 # Probe is diagnostic only; keep this high enough when enabling bbox tasks
 BBOX_PROBE_INTERVAL=0
@@ -43,6 +46,7 @@ BBOX_PROBE_MAX_NEW_TOKENS=256
 # Training Hyperparameters
 # ======================
 LR=1e-5
+BBOX_RESIDUAL_HEAD_LR=1e-5
 total_batch_size=64
 GRADIENT_ACCUMULATION_STEPS=$(($total_batch_size / $NPROC_PER_NODE))
 
@@ -61,6 +65,7 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --per_device_train_batch_size 1 \
             --gradient_accumulation_steps $GRADIENT_ACCUMULATION_STEPS \
             --learning_rate $LR \
+            --bbox_residual_head_lr $BBOX_RESIDUAL_HEAD_LR \
             --mm_projector_lr 1e-5 \
             --vision_tower_lr 1e-6 \
             --optim adamw_torch \
@@ -93,6 +98,9 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --use_bbox_residual_head $USE_BBOX_RESIDUAL_HEAD \
             --bbox_residual_loss_weight $BBOX_RESIDUAL_LOSS_WEIGHT \
             --bbox_residual_loss_weight_warmup_ratio $BBOX_RESIDUAL_LOSS_WEIGHT_WARMUP_RATIO \
+            --bbox_residual_loss_ratio_target $BBOX_RESIDUAL_LOSS_RATIO_TARGET \
+            --bbox_residual_loss_ratio_start $BBOX_RESIDUAL_LOSS_RATIO_START \
+            --bbox_residual_loss_weight_max $BBOX_RESIDUAL_LOSS_WEIGHT_MAX \
             --bbox_probe_interval $BBOX_PROBE_INTERVAL \
             --bbox_probe_num_samples $BBOX_PROBE_NUM_SAMPLES \
             --bbox_probe_max_new_tokens $BBOX_PROBE_MAX_NEW_TOKENS \

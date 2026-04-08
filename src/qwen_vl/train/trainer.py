@@ -94,6 +94,62 @@ class _BBoxResidualLogTracker:
         }
 
 
+class _ConstantLRSchedulerWrapper:
+    def __init__(self, scheduler, optimizer, constant_group_indices):
+        self.scheduler = scheduler
+        self.optimizer = optimizer
+        self.constant_group_indices = tuple(int(idx) for idx in constant_group_indices)
+        self.constant_lrs = {
+            idx: float(self.optimizer.param_groups[idx]["lr"])
+            for idx in self.constant_group_indices
+        }
+        self._restore_constant_lrs()
+
+    def _restore_constant_lrs(self):
+        for idx, lr in self.constant_lrs.items():
+            if idx < len(self.optimizer.param_groups):
+                self.optimizer.param_groups[idx]["lr"] = lr
+
+    def step(self, *args, **kwargs):
+        out = self.scheduler.step(*args, **kwargs)
+        self._restore_constant_lrs()
+        return out
+
+    def state_dict(self):
+        return {
+            "scheduler": self.scheduler.state_dict(),
+            "constant_group_indices": list(self.constant_group_indices),
+            "constant_lrs": self.constant_lrs,
+        }
+
+    def load_state_dict(self, state_dict):
+        if "scheduler" in state_dict:
+            self.scheduler.load_state_dict(state_dict["scheduler"])
+            self.constant_group_indices = tuple(
+                int(idx) for idx in state_dict.get("constant_group_indices", self.constant_group_indices)
+            )
+            self.constant_lrs = {
+                int(idx): float(lr)
+                for idx, lr in state_dict.get("constant_lrs", self.constant_lrs).items()
+            }
+        else:
+            self.scheduler.load_state_dict(state_dict)
+        self._restore_constant_lrs()
+
+    def get_last_lr(self):
+        if hasattr(self.scheduler, "get_last_lr"):
+            lrs = list(self.scheduler.get_last_lr())
+        else:
+            lrs = [group["lr"] for group in self.optimizer.param_groups]
+        for idx, lr in self.constant_lrs.items():
+            if idx < len(lrs):
+                lrs[idx] = lr
+        return lrs
+
+    def __getattr__(self, name):
+        return getattr(self.scheduler, name)
+
+
 class VGTrainer(Trainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -142,6 +198,31 @@ class VGTrainer(Trainer):
             return super().log(logs, start_time=start_time)
         except TypeError:
             return super().log(logs)
+
+    def create_scheduler(self, num_training_steps: int, optimizer=None):
+        try:
+            scheduler = super().create_scheduler(
+                num_training_steps=num_training_steps,
+                optimizer=optimizer,
+            )
+        except TypeError:
+            scheduler = super().create_scheduler(num_training_steps, optimizer)
+
+        constant_group_indices = getattr(self, "_constant_lr_param_group_indices", [])
+        target_optimizer = optimizer if optimizer is not None else self.optimizer
+        if (
+            scheduler is not None
+            and target_optimizer is not None
+            and constant_group_indices
+            and not isinstance(scheduler, _ConstantLRSchedulerWrapper)
+        ):
+            scheduler = _ConstantLRSchedulerWrapper(
+                scheduler=scheduler,
+                optimizer=target_optimizer,
+                constant_group_indices=constant_group_indices,
+            )
+            self.lr_scheduler = scheduler
+        return scheduler
 
 
 def _flash_attention_forward(
@@ -329,179 +410,93 @@ def print_trainable_parameters(self) -> None:
 
 
 def create_optimizer(self):
-
     opt_model = self.model
 
     if self.optimizer is None:
-        decay_parameters = get_parameter_names(opt_model, ALL_LAYERNORM_LAYERS)
-        decay_parameters = [name for name in decay_parameters if "bias" not in name]
-        if self.args.mm_projector_lr is not None and self.args.mm_projector_lr != 0:
-            projector_parameters = [
-                name for name, _ in opt_model.named_parameters() if "merger" in name
-            ]
-            if self.args.vision_tower_lr is not None and self.args.vision_tower_lr != 0:
-                vision_tower_parameters = [
-                    name for name, _ in opt_model.named_parameters() if "visual" in name
+        decay_parameters = set(get_parameter_names(opt_model, ALL_LAYERNORM_LAYERS))
+        decay_parameters = {name for name in decay_parameters if "bias" not in name}
+        named_parameters = [
+            (name, parameter)
+            for name, parameter in opt_model.named_parameters()
+            if parameter.requires_grad
+        ]
+
+        use_projector_lr = (
+            self.args.mm_projector_lr is not None and self.args.mm_projector_lr != 0
+        )
+        use_vision_lr = (
+            self.args.vision_tower_lr is not None and self.args.vision_tower_lr != 0
+        )
+        use_residual_head_lr = (
+            getattr(self.args, "bbox_residual_head_lr", None) is not None
+            and float(self.args.bbox_residual_head_lr) > 0
+        )
+
+        projector_parameters = {
+            name for name, _ in named_parameters if "merger" in name
+        } if use_projector_lr else set()
+        vision_tower_parameters = {
+            name for name, _ in named_parameters if "visual" in name
+        } if use_vision_lr else set()
+        residual_head_parameters = {
+            name for name, _ in named_parameters if "bbox_residual_head" in name
+        } if use_residual_head_lr else set()
+
+        def resolve_group_tag(name: str) -> str:
+            if name in residual_head_parameters:
+                return "bbox_residual_head"
+            if name in projector_parameters:
+                return "projector"
+            if name in vision_tower_parameters:
+                return "vision"
+            return "default"
+
+        optimizer_grouped_parameters = []
+        constant_group_indices = []
+
+        group_specs = [
+            ("default", None, False),
+            ("vision", self.args.vision_tower_lr if use_vision_lr else None, False),
+            ("projector", self.args.mm_projector_lr if use_projector_lr else None, False),
+            (
+                "bbox_residual_head",
+                float(self.args.bbox_residual_head_lr) if use_residual_head_lr else None,
+                use_residual_head_lr,
+            ),
+        ]
+
+        for group_tag, lr_override, keep_constant_lr in group_specs:
+            if group_tag == "vision" and not use_vision_lr:
+                continue
+            if group_tag == "projector" and not use_projector_lr:
+                continue
+            if group_tag == "bbox_residual_head" and not use_residual_head_lr:
+                continue
+
+            for use_decay in (True, False):
+                group_params = [
+                    parameter
+                    for name, parameter in named_parameters
+                    if resolve_group_tag(name) == group_tag and ((name in decay_parameters) == use_decay)
                 ]
-                optimizer_grouped_parameters = [
-                    {
-                        "params": [
-                            p
-                            for n, p in opt_model.named_parameters()
-                            if (
-                                n in decay_parameters
-                                and n not in projector_parameters
-                                and n not in vision_tower_parameters
-                                and p.requires_grad
-                            )
-                        ],
-                        "weight_decay": self.args.weight_decay,
-                    },
-                    {
-                        "params": [
-                            p
-                            for n, p in opt_model.named_parameters()
-                            if (
-                                n in decay_parameters
-                                and n not in projector_parameters
-                                and n in vision_tower_parameters
-                                and p.requires_grad
-                            )
-                        ],
-                        "weight_decay": self.args.weight_decay,
-                        "lr": self.args.vision_tower_lr,
-                    },
-                    {
-                        "params": [
-                            p
-                            for n, p in opt_model.named_parameters()
-                            if (
-                                n not in decay_parameters
-                                and n not in projector_parameters
-                                and n not in vision_tower_parameters
-                                and p.requires_grad
-                            )
-                        ],
-                        "weight_decay": 0.0,
-                    },
-                    {
-                        "params": [
-                            p
-                            for n, p in opt_model.named_parameters()
-                            if (
-                                n not in decay_parameters
-                                and n not in projector_parameters
-                                and n in vision_tower_parameters
-                                and p.requires_grad
-                            )
-                        ],
-                        "weight_decay": 0.0,
-                        "lr": self.args.vision_tower_lr,
-                    },
-                    {
-                        "params": [
-                            p
-                            for n, p in opt_model.named_parameters()
-                            if (
-                                n in decay_parameters
-                                and n in projector_parameters
-                                and p.requires_grad
-                            )
-                        ],
-                        "weight_decay": self.args.weight_decay,
-                        "lr": self.args.mm_projector_lr,
-                    },
-                    {
-                        "params": [
-                            p
-                            for n, p in opt_model.named_parameters()
-                            if (
-                                n not in decay_parameters
-                                and n in projector_parameters
-                                and p.requires_grad
-                            )
-                        ],
-                        "weight_decay": 0.0,
-                        "lr": self.args.mm_projector_lr,
-                    },
-                ]
-            else:
-                optimizer_grouped_parameters = [
-                    {
-                        "params": [
-                            p
-                            for n, p in opt_model.named_parameters()
-                            if (
-                                n in decay_parameters
-                                and n not in projector_parameters
-                                and p.requires_grad
-                            )
-                        ],
-                        "weight_decay": self.args.weight_decay,
-                    },
-                    {
-                        "params": [
-                            p
-                            for n, p in opt_model.named_parameters()
-                            if (
-                                n not in decay_parameters
-                                and n not in projector_parameters
-                                and p.requires_grad
-                            )
-                        ],
-                        "weight_decay": 0.0,
-                    },
-                    {
-                        "params": [
-                            p
-                            for n, p in opt_model.named_parameters()
-                            if (
-                                n in decay_parameters
-                                and n in projector_parameters
-                                and p.requires_grad
-                            )
-                        ],
-                        "weight_decay": self.args.weight_decay,
-                        "lr": self.args.mm_projector_lr,
-                    },
-                    {
-                        "params": [
-                            p
-                            for n, p in opt_model.named_parameters()
-                            if (
-                                n not in decay_parameters
-                                and n in projector_parameters
-                                and p.requires_grad
-                            )
-                        ],
-                        "weight_decay": 0.0,
-                        "lr": self.args.mm_projector_lr,
-                    },
-                ]
-        else:
-            optimizer_grouped_parameters = [
-                {
-                    "params": [
-                        p
-                        for n, p in opt_model.named_parameters()
-                        if (n in decay_parameters and p.requires_grad)
-                    ],
-                    "weight_decay": self.args.weight_decay,
-                },
-                {
-                    "params": [
-                        p
-                        for n, p in opt_model.named_parameters()
-                        if (n not in decay_parameters and p.requires_grad)
-                    ],
-                    "weight_decay": 0.0,
-                },
-            ]
+                if not group_params:
+                    continue
+
+                group = {
+                    "params": group_params,
+                    "weight_decay": self.args.weight_decay if use_decay else 0.0,
+                }
+                if lr_override is not None:
+                    group["lr"] = lr_override
+                optimizer_grouped_parameters.append(group)
+                if keep_constant_lr:
+                    constant_group_indices.append(len(optimizer_grouped_parameters) - 1)
 
         optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(
             self.args
         )
         self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+        self._constant_lr_param_group_indices = constant_group_indices
 
     return self.optimizer
 

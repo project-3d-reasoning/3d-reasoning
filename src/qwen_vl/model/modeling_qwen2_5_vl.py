@@ -2381,11 +2381,28 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                     getattr(self.config, "bbox_residual_loss_weight", 0.0),
                 )
             )
+            bbox_residual_loss_ratio_target = float(
+                getattr(self.config, "bbox_residual_loss_ratio_target", -1.0)
+            )
+            bbox_residual_loss_ratio_active = bool(
+                getattr(self.config, "bbox_residual_loss_ratio_active", False)
+            )
+            bbox_residual_loss_weight_max = float(
+                getattr(
+                    self.config,
+                    "bbox_residual_loss_weight_max",
+                    max(bbox_residual_loss_weight, 0.0),
+                )
+            )
+            use_dynamic_bbox_residual_weight = (
+                bbox_residual_loss_ratio_active
+                and 0.0 < bbox_residual_loss_ratio_target < 1.0
+            )
             if (
                 bbox_token_residuals is not None
                 and bbox_residual_targets is not None
                 and bbox_residual_mask is not None
-                and bbox_residual_loss_weight > 0
+                and (bbox_residual_loss_weight > 0 or use_dynamic_bbox_residual_weight)
             ):
                 bbox_residual_loss_raw = loss.detach().new_zeros(())
                 bbox_residual_loss_weighted = loss.detach().new_zeros(())
@@ -2403,7 +2420,22 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                         shift_bbox_targets[valid_bbox_residual_mask],
                         reduction="mean",
                     )
-                    weighted_bbox_residual_loss = bbox_residual_loss_weight * bbox_residual_loss
+                    effective_bbox_residual_weight = bbox_residual_loss.new_tensor(
+                        bbox_residual_loss_weight
+                    )
+                    if use_dynamic_bbox_residual_weight:
+                        safe_raw_loss = bbox_residual_loss.detach().clamp_min(1e-12)
+                        base_loss = loss.detach().clamp_min(0.0)
+                        effective_bbox_residual_weight = (
+                            bbox_residual_loss_ratio_target * base_loss
+                        ) / ((1.0 - bbox_residual_loss_ratio_target) * safe_raw_loss)
+                        effective_bbox_residual_weight = effective_bbox_residual_weight.clamp(
+                            min=0.0,
+                            max=max(bbox_residual_loss_weight_max, 0.0),
+                        ).to(bbox_residual_loss.dtype)
+                    weighted_bbox_residual_loss = (
+                        effective_bbox_residual_weight * bbox_residual_loss
+                    )
                     bbox_residual_loss_raw = bbox_residual_loss.detach()
                     bbox_residual_loss_weighted = weighted_bbox_residual_loss.detach()
                     loss = loss + weighted_bbox_residual_loss

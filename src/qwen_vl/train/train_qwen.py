@@ -142,6 +142,9 @@ def train(attn_implementation="flash_attention_2"):
             "use_bbox_residual_head",
             "bbox_residual_loss_weight",
             "bbox_residual_loss_weight_warmup_ratio",
+            "bbox_residual_loss_ratio_target",
+            "bbox_residual_loss_ratio_start",
+            "bbox_residual_loss_weight_max",
             "bbox_position_residual_head_range",
             "bbox_size_residual_head_range",
             "bbox_angle_residual_head_range",
@@ -224,11 +227,17 @@ def train(attn_implementation="flash_attention_2"):
     trainer = VGTrainer(
         model=model, processing_class=tokenizer, args=training_args, **data_module
     )
-    if model_args.use_bbox_residual_head and model_args.bbox_residual_loss_weight > 0:
+    if model_args.use_bbox_residual_head and (
+        model_args.bbox_residual_loss_weight > 0
+        or 0.0 < model_args.bbox_residual_loss_ratio_target < 1.0
+    ):
         trainer.add_callback(
             BBoxResidualWeightWarmupCallback(
                 target_weight=model_args.bbox_residual_loss_weight,
                 warmup_ratio=model_args.bbox_residual_loss_weight_warmup_ratio,
+                target_loss_ratio=model_args.bbox_residual_loss_ratio_target,
+                target_loss_ratio_start=model_args.bbox_residual_loss_ratio_start,
+                max_dynamic_weight=model_args.bbox_residual_loss_weight_max,
             )
         )
     if training_args.bbox_probe_interval > 0:
