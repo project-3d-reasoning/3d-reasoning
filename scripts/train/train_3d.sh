@@ -11,10 +11,10 @@ NPROC_PER_NODE=$(nvidia-smi --list-gpus | wc -l)  # Automatically detects availa
 # ======================
 # Path Configuration
 # ======================
-MODEL_PATH="/data7t-root/huggingface/hub/models--Qwen--Qwen2.5-VL-7B-Instruct/snapshots/cc594898137f460bfe9f0759e9844b3ce807cfb5"  # [ModelArguments] Pretrained model path
+MODEL_PATH="/inspire/hdd/project/qproject-fundationmodel/public/yxliu/test/Demongorgan/VG-LLM/models/Qwen2.5-VL-7B-Instruct"  # [ModelArguments] Pretrained model path
 GEOMETRY_ENCODER_TYPE="vggt"
-GEOMETRY_ENCODER_PATH="facebook/VGGT-1B"
-OUTPUT_DIR="7b-add-newtokens-residual"                   # Directory for saving checkpoints
+GEOMETRY_ENCODER_PATH="/inspire/hdd/project/qproject-fundationmodel/public/yxliu/test/Demongorgan/VG-LLM/models/VGGT-1B"
+OUTPUT_DIR="output/7b-add-newtokens-residual"                   # Directory for saving checkpoints
 CACHE_DIR="./cache"                        # [TrainingArguments] Cache directory for models
 mkdir -p $OUTPUT_DIR
 
@@ -28,7 +28,7 @@ MODEL_MAX_LENGTH=12800
 NUM_TRAIN_EPOCHS=1
 
 # BBox token / residual experiment knobs
-BBOX_COORDINATE_LABEL_SMOOTHING=0.1
+BBOX_COORDINATE_LABEL_SMOOTHING=0.06
 BBOX_COORDINATE_SMOOTHING_NEIGHBOR_RADIUS=2
 USE_BBOX_RESIDUAL_HEAD=True
 BBOX_RESIDUAL_LOSS_WEIGHT=10
