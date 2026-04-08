@@ -22,7 +22,7 @@ from lmms_eval.api.registry import register_model
 from lmms_eval.models.model_utils.load_video import read_video_pyav_base64
 
 from qwen_vl.model.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGenerationWithVGGT
-from qwen_vl.data.utils import load_and_preprocess_images, load_first_frame_coord_inputs
+from qwen_vl.data.utils import extract_scan2cap_prompt_center, load_and_preprocess_images, load_first_frame_coord_inputs
 
 try:
     # from qwen_vl_utils import process_vision_info
@@ -201,6 +201,14 @@ class VGLLM(lmms):
             return None, None
         return load_first_frame_coord_inputs(image_paths)
 
+    def _load_prompt_coord_center(self, task_name: str, doc) -> Optional[torch.Tensor]:
+        if task_name != "scan2cap":
+            return None
+        center = extract_scan2cap_prompt_center(doc)
+        if center is None:
+            return None
+        return torch.tensor(center, dtype=torch.float32)
+
     def _build_empty_coord_pe(self, processed_images: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         _, _, height, width = processed_images.shape
         points = torch.zeros(
@@ -240,6 +248,7 @@ class VGLLM(lmms):
         device = "cuda" if self.device_map == "auto" else self.device
         use_geometry_encoder = getattr(self.model.config, "use_geometry_encoder", False) or getattr(self.model.config, "use_vggt_feature", False)
         use_coord_pe = getattr(self.model.config, "use_coord_pe", False)
+        use_prompt_coord = hasattr(self.model, "_insert_prompt_coord_embeddings")
         patch_multiple = self.processor.image_processor.patch_size * self.processor.image_processor.merge_size
 
         def _ensure_rgb(image: Image.Image) -> Image.Image:
@@ -330,8 +339,18 @@ class VGLLM(lmms):
             geometry_encoder_inputs = []
             coord_pe_points = []
             coord_pe_masks = []
+            prompt_coord_centers = []
+            prompt_coord_masks = []
             image_inputs = []
             for sample_idx, message in enumerate(messages):
+                prompt_center = self._load_prompt_coord_center(task, docs[sample_idx])
+                if prompt_center is None:
+                    prompt_coord_centers.append(torch.zeros(3, dtype=torch.float32))
+                    prompt_coord_masks.append(False)
+                else:
+                    prompt_coord_centers.append(prompt_center)
+                    prompt_coord_masks.append(True)
+
                 vision_info = extract_vision_info(message)
                 sample_images = []
                 for ele in vision_info:
@@ -396,6 +415,9 @@ class VGLLM(lmms):
                             f"first_valid_pixels={int(first_masks.sum().item())}"
                         )
                         self._logged_coord_pe_eval = True
+            if use_prompt_coord and any(prompt_coord_masks):
+                inputs["prompt_coord_centers"] = torch.stack(prompt_coord_centers, dim=0).to(device)
+                inputs["prompt_coord_masks"] = torch.tensor(prompt_coord_masks, dtype=torch.bool, device=device)
             inputs = inputs.to(device)
 
             if "max_new_tokens" not in gen_kwargs:

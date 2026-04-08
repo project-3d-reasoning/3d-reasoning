@@ -23,7 +23,7 @@ import transformers
 
 from . import data_list
 from .rope2d import get_rope_index_25, get_rope_index_2
-from .utils import load_first_frame_coord_inputs, prepare_image_inputs
+from .utils import extract_scan2cap_prompt_center, load_first_frame_coord_inputs, prepare_image_inputs
 
 IGNORE_INDEX = -100
 IMAGE_TOKEN_INDEX = 151655
@@ -379,6 +379,13 @@ class LazySupervisedDataset(Dataset):
             sources = [sources]
         assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
         video = None
+        prompt_coord_center = None
+
+        metadata = sources[0].get("metadata", {})
+        if metadata.get("dataset") == "scan2cap":
+            parsed_center = extract_scan2cap_prompt_center(sources[0])
+            if parsed_center is not None:
+                prompt_coord_center = torch.tensor(parsed_center, dtype=torch.float32)
         
         if "video" in sources[0]:
             sources[0]["images"] = self.read_video_images(sources[0])
@@ -511,6 +518,9 @@ class LazySupervisedDataset(Dataset):
         elif "video" in self.list_data_dict[i]:
             data_dict["pixel_values_videos"] = video
             data_dict["video_grid_thw"] = grid_thw
+
+        if prompt_coord_center is not None:
+            data_dict["prompt_coord_center"] = prompt_coord_center
         
         data_dict["tag"] = self.list_data_dict[i].get("tag", "2d")
         return data_dict
@@ -611,7 +621,7 @@ class DataCollatorForSupervisedDataset(object):
         batch["pixel_values_videos"] = concat_videos
         batch["video_grid_thw"] = video_grid_thw
         batch["position_ids"] = position_ids
-                
+
         # assume all data in a batch has geometry_encoder_inputs
         if "geometry_encoder_inputs" in instances[0]:
             geometry_encoder_inputs = [torch.stack(instance["geometry_encoder_inputs"]) for instance in instances]
@@ -619,6 +629,18 @@ class DataCollatorForSupervisedDataset(object):
             if "coord_pe_points" in instances[0]:
                 batch["coord_pe_points"] = [torch.stack(instance["coord_pe_points"]) for instance in instances]
                 batch["coord_pe_masks"] = [torch.stack(instance["coord_pe_masks"]) for instance in instances]
+            prompt_coord_centers = []
+            prompt_coord_masks = []
+            for instance in instances:
+                center = instance.get("prompt_coord_center")
+                if center is None:
+                    prompt_coord_centers.append(torch.zeros(3, dtype=torch.float32))
+                    prompt_coord_masks.append(False)
+                else:
+                    prompt_coord_centers.append(center.to(dtype=torch.float32))
+                    prompt_coord_masks.append(True)
+            batch["prompt_coord_centers"] = torch.stack(prompt_coord_centers, dim=0)
+            batch["prompt_coord_masks"] = torch.tensor(prompt_coord_masks, dtype=torch.bool)
             assert len(set([instance["tag"] for instance in instances])) == 1, "all data in a batch should have the same tag"
             batch["tag"] = instances[0]["tag"]
         return batch

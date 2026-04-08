@@ -9,6 +9,8 @@ from PIL import Image
 from torchvision import transforms as TF
 import numpy as np
 import copy
+import ast
+import re
 from pathlib import Path
 
 def load_and_preprocess_images(image_path_list, mode="crop", target_size=518):
@@ -208,6 +210,41 @@ def transform_points(points, transform):
     rotation = transform[:3, :3]
     translation = transform[:3, 3]
     return (points @ rotation.T + translation).astype(np.float32)
+
+
+_SCAN2CAP_CENTER_PATTERN = re.compile(r"located at\s*(\[[^\]]+\])", re.IGNORECASE)
+
+
+def extract_scan2cap_prompt_center(sample_or_text):
+    if isinstance(sample_or_text, dict):
+        prompt_center = sample_or_text.get("prompt_center")
+        if prompt_center is not None:
+            if len(prompt_center) != 3:
+                return None
+            return [float(value) for value in prompt_center]
+
+        conversations = sample_or_text.get("conversations", [])
+        if not conversations:
+            return None
+        text = conversations[0].get("value", "")
+    else:
+        text = sample_or_text
+
+    if not isinstance(text, str):
+        return None
+
+    match = _SCAN2CAP_CENTER_PATTERN.search(text)
+    if match is None:
+        return None
+
+    try:
+        center = ast.literal_eval(match.group(1))
+    except (SyntaxError, ValueError):
+        return None
+
+    if not isinstance(center, (list, tuple)) or len(center) != 3:
+        return None
+    return [float(value) for value in center]
 
 
 def load_first_frame_coord_inputs(image_path_list, target_size=518):

@@ -6,7 +6,21 @@
 # ======================
 MASTER_ADDR="127.0.0.1"                     # [Required] Master node IP for multi-GPU training
 MASTER_PORT=$(shuf -i 20000-29999 -n 1)     # Random port to avoid conflicts
-NPROC_PER_NODE=$(nvidia-smi --list-gpus | wc -l)  # Automatically detects available GPUs
+NPROC_PER_NODE=4                            # Set this manually to match the number of GPUs you want to use
+
+if [ "${NPROC_PER_NODE}" -le 0 ]; then
+    echo "Failed to determine a valid NPROC_PER_NODE. Set it to a positive integer."
+    exit 1
+fi
+
+if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    IFS=',' read -r -a CUDA_DEVICE_LIST <<< "$CUDA_VISIBLE_DEVICES"
+    VISIBLE_GPU_COUNT=${#CUDA_DEVICE_LIST[@]}
+    if [ "${NPROC_PER_NODE}" -gt "${VISIBLE_GPU_COUNT}" ]; then
+        echo "NPROC_PER_NODE=${NPROC_PER_NODE} exceeds visible GPUs (${VISIBLE_GPU_COUNT}) from CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+        exit 1
+    fi
+fi
 
 # ======================
 # Path Configuration

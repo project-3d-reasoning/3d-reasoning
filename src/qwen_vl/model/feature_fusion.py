@@ -161,28 +161,51 @@ class CoordinatePositionalEncoding(nn.Module):
         output_dim: int,
         patch_size: int = 14,
         spatial_merge_size: int = 2,
+        sub_patch_divisions_per_patch: int = 2,
         base: float = 10000.0,
         coord_scale: float = 10.0,
     ):
         super().__init__()
         if output_dim % 2 != 0:
             raise ValueError("output_dim must be even for sin/cos coordinate encoding")
+        if patch_size % sub_patch_divisions_per_patch != 0:
+            raise ValueError(
+                "patch_size must be divisible by sub_patch_divisions_per_patch for hierarchical coord pooling"
+            )
 
         self.output_dim = output_dim
         self.patch_size = patch_size
         self.spatial_merge_size = spatial_merge_size
         self.pixel_merge_size = patch_size * spatial_merge_size
+        self.sub_patch_divisions_per_patch = sub_patch_divisions_per_patch
+        self.sub_patch_size = patch_size // sub_patch_divisions_per_patch
+        self.subdivisions_per_axis = spatial_merge_size * sub_patch_divisions_per_patch
+        self.subgroup_count = self.subdivisions_per_axis ** 2
         self.base = base
         self.coord_scale = coord_scale
 
+        self.axis_pair_dims = self._build_axis_pair_dims(output_dim)
+        total_pairs = output_dim // 2
+        subgroup_base_pairs = total_pairs // self.subgroup_count
+        subgroup_remainder = total_pairs % self.subgroup_count
+        self.subgroup_axis_pair_dims = [
+            self._build_axis_pair_dims(
+                (subgroup_base_pairs + (1 if subgroup_idx < subgroup_remainder else 0)) * 2
+            )
+            for subgroup_idx in range(self.subgroup_count)
+        ]
+        self.axis_embed_dims = [pair_dim * 2 for pair_dim in self.axis_pair_dims]
+
+    def _build_axis_pair_dims(self, output_dim: int) -> list[int]:
+        if output_dim % 2 != 0:
+            raise ValueError("output_dim must be even for sin/cos coordinate encoding")
         total_pairs = output_dim // 2
         base_pairs = total_pairs // 3
         remainder = total_pairs % 3
-        self.axis_pair_dims = [
+        return [
             base_pairs + (1 if axis_idx < remainder else 0)
             for axis_idx in range(3)
         ]
-        self.axis_embed_dims = [pair_dim * 2 for pair_dim in self.axis_pair_dims]
 
     def _encode_axis(self, values: torch.Tensor, pair_dim: int) -> torch.Tensor:
         if pair_dim == 0:
@@ -192,6 +215,19 @@ class CoordinatePositionalEncoding(nn.Module):
         out = values.float().unsqueeze(-1) * omega
         emb = torch.cat([torch.sin(out), torch.cos(out)], dim=-1)
         return emb.to(values.dtype)
+
+    def encode_points(self, coord_points: torch.Tensor, axis_pair_dims: Optional[list[int]] = None) -> torch.Tensor:
+        if coord_points.shape[-1] != 3:
+            raise ValueError(f"coord_points must end with 3 values, got shape {tuple(coord_points.shape)}")
+
+        if axis_pair_dims is None:
+            axis_pair_dims = self.axis_pair_dims
+
+        scaled_points = coord_points / self.coord_scale
+        x_embed = self._encode_axis(scaled_points[..., 0], axis_pair_dims[0])
+        y_embed = self._encode_axis(scaled_points[..., 1], axis_pair_dims[1])
+        z_embed = self._encode_axis(scaled_points[..., 2], axis_pair_dims[2])
+        return torch.cat([x_embed, y_embed, z_embed], dim=-1)
 
     def forward(self, coord_points: torch.Tensor, coord_mask: torch.Tensor) -> torch.Tensor:
         if coord_points.dim() == 3:
@@ -207,20 +243,57 @@ class CoordinatePositionalEncoding(nn.Module):
 
         coord_points = coord_points.permute(0, 3, 1, 2)
         coord_mask = coord_mask.unsqueeze(1)
-        kernel = self.pixel_merge_size
+        kernel = self.sub_patch_size
         area = kernel * kernel
 
         pooled_sum = F.avg_pool2d(coord_points * coord_mask, kernel_size=kernel, stride=kernel) * area
         pooled_count = F.avg_pool2d(coord_mask, kernel_size=kernel, stride=kernel) * area
         pooled_points = pooled_sum / pooled_count.clamp_min(1.0)
-        pooled_points = pooled_points.permute(0, 2, 3, 1) / self.coord_scale
-        patch_valid = (pooled_count.squeeze(1) > 0).unsqueeze(-1)
 
-        x_embed = self._encode_axis(pooled_points[..., 0], self.axis_pair_dims[0])
-        y_embed = self._encode_axis(pooled_points[..., 1], self.axis_pair_dims[1])
-        z_embed = self._encode_axis(pooled_points[..., 2], self.axis_pair_dims[2])
-        coord_embed = torch.cat([x_embed, y_embed, z_embed], dim=-1)
-        coord_embed = coord_embed * patch_valid.to(coord_embed.dtype)
+        batch_size = pooled_points.shape[0]
+        h_grid = valid_height // self.pixel_merge_size
+        w_grid = valid_width // self.pixel_merge_size
+        pooled_points = pooled_points.permute(0, 2, 3, 1).reshape(
+            batch_size,
+            h_grid,
+            self.subdivisions_per_axis,
+            w_grid,
+            self.subdivisions_per_axis,
+            3,
+        )
+        pooled_points = pooled_points.permute(0, 1, 3, 2, 4, 5).reshape(
+            batch_size,
+            h_grid,
+            w_grid,
+            self.subgroup_count,
+            3,
+        )
+
+        patch_valid = (pooled_count.squeeze(1) > 0).reshape(
+            batch_size,
+            h_grid,
+            self.subdivisions_per_axis,
+            w_grid,
+            self.subdivisions_per_axis,
+        )
+        patch_valid = patch_valid.permute(0, 1, 3, 2, 4).reshape(
+            batch_size,
+            h_grid,
+            w_grid,
+            self.subgroup_count,
+            1,
+        )
+
+        coord_embed_chunks = []
+        for subgroup_idx, axis_pair_dims in enumerate(self.subgroup_axis_pair_dims):
+            subgroup_embed = self.encode_points(
+                pooled_points[..., subgroup_idx, :],
+                axis_pair_dims=axis_pair_dims,
+            )
+            subgroup_embed = subgroup_embed * patch_valid[..., subgroup_idx, :].to(subgroup_embed.dtype)
+            coord_embed_chunks.append(subgroup_embed)
+
+        coord_embed = torch.cat(coord_embed_chunks, dim=-1)
         return coord_embed
 
 

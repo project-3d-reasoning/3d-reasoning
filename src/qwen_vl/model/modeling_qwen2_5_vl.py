@@ -1624,12 +1624,11 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             num_layers=getattr(config, "fusion_num_layers", 1)
         )
         self.feature_fusion = FeatureFusionModule(fusion_config)
-        if getattr(config, "use_coord_pe", False):
-            self.coordinate_positional_encoding = CoordinatePositionalEncoding(
-                output_dim=config.hidden_size,
-                patch_size=self.geometry_encoder.patch_size,
-                spatial_merge_size=config.vision_config.spatial_merge_size,
-            )
+        self.coordinate_positional_encoding = CoordinatePositionalEncoding(
+            output_dim=config.hidden_size,
+            patch_size=self.geometry_encoder.patch_size,
+            spatial_merge_size=config.vision_config.spatial_merge_size,
+        )
 
     def _process_geometry_features(self, image_embeds, geometry_encoder_inputs, coord_pe_points=None, coord_pe_masks=None):
         """Process geometry features using the geometry encoder."""
@@ -1666,6 +1665,137 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             image_embeds = image_embeds.view(-1, image_embeds.shape[-1])
         
         return image_embeds
+
+    def _insert_prompt_coord_embeddings(
+        self,
+        input_ids: torch.LongTensor,
+        inputs_embeds: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        position_ids: Optional[torch.LongTensor],
+        labels: Optional[torch.LongTensor],
+        prompt_coord_centers: Optional[torch.Tensor],
+        prompt_coord_masks: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.LongTensor], Optional[torch.LongTensor]]:
+        if input_ids is None:
+            return inputs_embeds, attention_mask, position_ids, labels
+        if prompt_coord_centers is None or prompt_coord_masks is None or not torch.any(prompt_coord_masks):
+            return inputs_embeds, attention_mask, position_ids, labels
+
+        batch_size, seq_len, hidden_size = inputs_embeds.shape
+        if attention_mask is None:
+            attention_mask = torch.ones(batch_size, seq_len, device=inputs_embeds.device, dtype=torch.long)
+
+        if prompt_coord_centers.shape[0] != batch_size or prompt_coord_masks.shape[0] != batch_size:
+            raise ValueError("prompt_coord_centers and prompt_coord_masks must match the batch size")
+
+        prompt_coord_embeds = self.coordinate_positional_encoding.encode_points(
+            prompt_coord_centers.to(device=inputs_embeds.device, dtype=torch.float32)
+        ).to(dtype=inputs_embeds.dtype)
+        prompt_coord_masks = prompt_coord_masks.to(device=inputs_embeds.device, dtype=torch.bool)
+
+        has_left_padding = bool(attention_mask[:, 0].eq(0).any().item())
+
+        valid_embeds_list = []
+        valid_masks_list = []
+        valid_labels_list = [] if labels is not None else None
+        valid_position_ids_list = [] if position_ids is not None else None
+        max_valid_length = 0
+
+        vision_end_token_id = getattr(self.config, "vision_end_token_id", None)
+        image_token_id = self.config.image_token_id
+
+        for batch_idx in range(batch_size):
+            valid_token_mask = attention_mask[batch_idx].to(dtype=torch.bool)
+            valid_input_ids = input_ids[batch_idx][valid_token_mask]
+            valid_embeds = inputs_embeds[batch_idx][valid_token_mask]
+            valid_labels = labels[batch_idx][valid_token_mask] if labels is not None else None
+            valid_position_ids = position_ids[:, batch_idx, valid_token_mask] if position_ids is not None else None
+
+            if prompt_coord_masks[batch_idx]:
+                insert_candidates = (
+                    torch.argwhere(valid_input_ids == vision_end_token_id).flatten()
+                    if vision_end_token_id is not None
+                    else torch.empty(0, device=valid_input_ids.device, dtype=torch.long)
+                )
+                if insert_candidates.numel() == 0:
+                    insert_candidates = torch.argwhere(valid_input_ids == image_token_id).flatten()
+
+                if insert_candidates.numel() > 0:
+                    insert_at = insert_candidates[-1].item() + 1
+                    coord_embed = prompt_coord_embeds[batch_idx : batch_idx + 1]
+                    valid_embeds = torch.cat(
+                        [valid_embeds[:insert_at], coord_embed, valid_embeds[insert_at:]],
+                        dim=0,
+                    )
+
+                    if valid_labels is not None:
+                        valid_labels = torch.cat(
+                            [
+                                valid_labels[:insert_at],
+                                valid_labels.new_full((1,), -100),
+                                valid_labels[insert_at:],
+                            ],
+                            dim=0,
+                        )
+
+                    if valid_position_ids is not None:
+                        if valid_position_ids.shape[1] == 0:
+                            coord_position_ids = valid_position_ids.new_zeros((3, 1))
+                        elif insert_at < valid_position_ids.shape[1]:
+                            coord_position_ids = valid_position_ids[:, insert_at : insert_at + 1].clone()
+                            valid_position_ids = torch.cat(
+                                [
+                                    valid_position_ids[:, :insert_at],
+                                    valid_position_ids[:, insert_at:] + 1,
+                                ],
+                                dim=1,
+                            )
+                        else:
+                            coord_position_ids = valid_position_ids[:, -1:] + 1
+                        valid_position_ids = torch.cat(
+                            [
+                                valid_position_ids[:, :insert_at],
+                                coord_position_ids,
+                                valid_position_ids[:, insert_at:],
+                            ],
+                            dim=1,
+                        )
+
+                    valid_token_mask = torch.ones(
+                        valid_embeds.shape[0],
+                        device=inputs_embeds.device,
+                        dtype=attention_mask.dtype,
+                    )
+
+            valid_embeds_list.append(valid_embeds)
+            valid_masks_list.append(valid_token_mask)
+            if valid_labels_list is not None:
+                valid_labels_list.append(valid_labels)
+            if valid_position_ids_list is not None:
+                valid_position_ids_list.append(valid_position_ids)
+            max_valid_length = max(max_valid_length, valid_embeds.shape[0])
+
+        padded_embeds = inputs_embeds.new_zeros((batch_size, max_valid_length, hidden_size))
+        padded_attention_mask = attention_mask.new_zeros((batch_size, max_valid_length))
+        padded_labels = None
+        padded_position_ids = None
+        if labels is not None:
+            padded_labels = labels.new_full((batch_size, max_valid_length), -100)
+        if position_ids is not None:
+            padded_position_ids = position_ids.new_ones((3, batch_size, max_valid_length))
+
+        for batch_idx in range(batch_size):
+            valid_length = valid_embeds_list[batch_idx].shape[0]
+            start = max_valid_length - valid_length if has_left_padding else 0
+            end = start + valid_length
+            padded_embeds[batch_idx, start:end] = valid_embeds_list[batch_idx]
+            padded_attention_mask[batch_idx, start:end] = valid_masks_list[batch_idx]
+            if padded_labels is not None:
+                padded_labels[batch_idx, start:end] = valid_labels_list[batch_idx]
+            if padded_position_ids is not None:
+                padded_position_ids[:, batch_idx, start:end] = valid_position_ids_list[batch_idx]
+
+        return padded_embeds, padded_attention_mask, padded_position_ids, padded_labels
 
 
     @classmethod
@@ -1896,6 +2026,8 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         geometry_encoder_inputs: Optional[List[torch.Tensor]] = None,
         coord_pe_points: Optional[List[torch.Tensor]] = None,
         coord_pe_masks: Optional[List[torch.Tensor]] = None,
+        prompt_coord_centers: Optional[torch.Tensor] = None,
+        prompt_coord_masks: Optional[torch.Tensor] = None,
         boxes: Optional[List[torch.Tensor]] = None,
         tag: str = None,
         **kwargs,
@@ -2027,6 +2159,16 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 position_ids = position_ids.add(delta)
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
+        inputs_embeds, attention_mask, position_ids, labels = self._insert_prompt_coord_embeddings(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            labels=labels,
+            prompt_coord_centers=prompt_coord_centers,
+            prompt_coord_masks=prompt_coord_masks,
+        )
+
         outputs = self.model(
             input_ids=None,
             position_ids=position_ids,
@@ -2087,6 +2229,8 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         geometry_encoder_inputs=None,
         coord_pe_points=None,
         coord_pe_masks=None,
+        prompt_coord_centers=None,
+        prompt_coord_masks=None,
         **kwargs,
     ):
         # Overwritten -- in specific circumstances we don't want to forward image inputs to the model
@@ -2106,6 +2250,8 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             geometry_encoder_inputs=geometry_encoder_inputs,
             coord_pe_points=coord_pe_points,
             coord_pe_masks=coord_pe_masks,
+            prompt_coord_centers=prompt_coord_centers,
+            prompt_coord_masks=prompt_coord_masks,
             use_cache=use_cache,
             **kwargs,
         )
@@ -2119,6 +2265,8 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             model_inputs["geometry_encoder_inputs"] = None
             model_inputs["coord_pe_points"] = None
             model_inputs["coord_pe_masks"] = None
+            model_inputs["prompt_coord_centers"] = None
+            model_inputs["prompt_coord_masks"] = None
 
         return model_inputs
 
@@ -2174,6 +2322,10 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 for sample in model_kwargs[key]:
                     expanded_values.extend([sample] * expand_size)
                 model_kwargs[key] = expanded_values
+
+        for key in ["prompt_coord_centers", "prompt_coord_masks"]:
+            if key in model_kwargs and model_kwargs[key] is not None:
+                model_kwargs[key] = model_kwargs[key].repeat_interleave(expand_size, dim=0)
 
         def _expand_dict_for_generation_visual(dict_to_expand):
             image_grid_thw = model_kwargs.get("image_grid_thw", None)

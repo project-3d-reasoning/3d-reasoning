@@ -2,7 +2,7 @@ set -e
 export LMMS_EVAL_LAUNCHER="accelerate"
 
 export NCCL_NVLS_ENABLE=0
-benchmark=${BENCHMARK:-scanrefer} # choices: [scan2cap, scanrefer, scanrefer_first_frame, scannet_4frames, scannet_6frames]
+benchmark=${BENCHMARK:-scannet_4frames} # choices: [scan2cap, scanrefer, scanrefer_first_frame, scannet_4frames, scannet_6frames]
 output_path=${OUTPUT_PATH:-logs/$(TZ="Asia/Shanghai" date "+%Y%m%d")}
 model_path=${MODEL_PATH:-/data7t-root/r1/dmgg/VG-LLM/7b-pe}
 batch_size=${BATCH_SIZE:-8}

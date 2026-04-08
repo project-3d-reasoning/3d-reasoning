@@ -234,6 +234,7 @@ def main(args):
                     },
                 ],
                 "images": [img['img_path'] for img in images],
+                "prompt_center": transformed_coord,
                 "input_box": input_box,
                 "gt_box": gt_box,
                 "iou": max_iou if split == "val" else 1,
