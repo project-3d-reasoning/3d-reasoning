@@ -1,3 +1,4 @@
+import math
 import os
 from typing import Dict, List, Optional, Sequence
 
@@ -23,6 +24,124 @@ from transformers.trainer import (
     is_sagemaker_mp_enabled,
 )
 from transformers.trainer_utils import seed_worker
+
+
+class _BBoxResidualLogTracker:
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.raw_sum = 0.0
+        self.weighted_sum = 0.0
+        self.total_sum = 0.0
+        self.count = 0.0
+
+    @staticmethod
+    def _to_float(value) -> Optional[float]:
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return None
+            value = value.detach().float().mean().item()
+        else:
+            value = float(value)
+
+        if not math.isfinite(value):
+            return None
+        return value
+
+    def update(self, raw_loss, weighted_loss, total_loss) -> None:
+        raw_value = self._to_float(raw_loss)
+        weighted_value = self._to_float(weighted_loss)
+        total_value = self._to_float(total_loss)
+        if raw_value is None or weighted_value is None or total_value is None:
+            return
+
+        self.raw_sum += raw_value
+        self.weighted_sum += weighted_value
+        self.total_sum += max(total_value, 1e-12)
+        self.count += 1.0
+
+    def flush(self, device: torch.device) -> Dict[str, float]:
+        if self.count <= 0:
+            return {}
+
+        device = torch.device(device)
+        sync_device = device
+        if (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_backend() == "nccl"
+            and sync_device.type != "cuda"
+        ):
+            sync_device = torch.device("cuda", torch.cuda.current_device())
+
+        stats = torch.tensor(
+            [self.raw_sum, self.weighted_sum, self.total_sum, self.count],
+            dtype=torch.float64,
+            device=sync_device,
+        )
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
+
+        raw_avg = (stats[0] / stats[3].clamp_min(1.0)).item()
+        weighted_over_total = (stats[1] / stats[2].clamp_min(1e-12)).item()
+        self.reset()
+        return {
+            "BBOX_RESIDUAL_LOSS_raw": raw_avg,
+            "BBOX_RESIDUAL_LOSS_weighted_over_total": weighted_over_total,
+        }
+
+
+class VGTrainer(Trainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._bbox_residual_log_tracker = _BBoxResidualLogTracker()
+
+    @staticmethod
+    def _get_output_metric(outputs, key: str):
+        if outputs is None:
+            return None
+        if isinstance(outputs, dict):
+            return outputs.get(key)
+        return getattr(outputs, key, None)
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        try:
+            loss, outputs = super().compute_loss(
+                model,
+                inputs,
+                return_outputs=True,
+                num_items_in_batch=num_items_in_batch,
+            )
+        except TypeError:
+            loss, outputs = super().compute_loss(
+                model,
+                inputs,
+                return_outputs=True,
+            )
+
+        if model.training:
+            self._bbox_residual_log_tracker.update(
+                self._get_output_metric(outputs, "bbox_residual_loss_raw"),
+                self._get_output_metric(outputs, "bbox_residual_loss_weighted"),
+                loss,
+            )
+
+        if return_outputs:
+            return loss, outputs
+        return loss
+
+    def log(self, logs: Dict[str, float], start_time: Optional[float] = None) -> None:
+        logs = dict(logs)
+        if "loss" in logs:
+            logs.update(self._bbox_residual_log_tracker.flush(self.args.device))
+
+        try:
+            return super().log(logs, start_time=start_time)
+        except TypeError:
+            return super().log(logs)
 
 
 def _flash_attention_forward(

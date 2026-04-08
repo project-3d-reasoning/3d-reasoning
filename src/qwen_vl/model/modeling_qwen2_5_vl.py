@@ -1508,6 +1508,8 @@ class Qwen2_5_VLCausalLMOutputWithPast(ModelOutput):
     attentions: Optional[Tuple[torch.FloatTensor]] = None
     rope_deltas: Optional[torch.LongTensor] = None
     bbox_token_residuals: Optional[torch.FloatTensor] = None
+    bbox_residual_loss_raw: Optional[torch.FloatTensor] = None
+    bbox_residual_loss_weighted: Optional[torch.FloatTensor] = None
 
 
 QWEN2_5_VL_INPUTS_DOCSTRING = r"""
@@ -2316,6 +2318,8 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         logits = self.lm_head(hidden_states)
         bbox_token_residuals = self._predict_bbox_token_residuals(hidden_states, input_ids=input_ids)
         loss = None
+        bbox_residual_loss_raw = None
+        bbox_residual_loss_weighted = None
         if labels is not None:
             # Upcast to float if we need to compute the loss to avoid potential precision issues
             logits = logits.float()
@@ -2383,6 +2387,8 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 and bbox_residual_mask is not None
                 and bbox_residual_loss_weight > 0
             ):
+                bbox_residual_loss_raw = loss.detach().new_zeros(())
+                bbox_residual_loss_weighted = loss.detach().new_zeros(())
                 shift_bbox_residuals = bbox_token_residuals[..., 1:].contiguous().view(-1)
                 shift_bbox_targets = (
                     bbox_residual_targets[..., 1:].contiguous().to(shift_logits.device).view(-1)
@@ -2397,7 +2403,10 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                         shift_bbox_targets[valid_bbox_residual_mask],
                         reduction="mean",
                     )
-                    loss = loss + bbox_residual_loss_weight * bbox_residual_loss
+                    weighted_bbox_residual_loss = bbox_residual_loss_weight * bbox_residual_loss
+                    bbox_residual_loss_raw = bbox_residual_loss.detach()
+                    bbox_residual_loss_weighted = weighted_bbox_residual_loss.detach()
+                    loss = loss + weighted_bbox_residual_loss
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -2411,6 +2420,8 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             attentions=outputs.attentions,
             rope_deltas=self.rope_deltas,
             bbox_token_residuals=bbox_token_residuals,
+            bbox_residual_loss_raw=bbox_residual_loss_raw,
+            bbox_residual_loss_weighted=bbox_residual_loss_weighted,
         )
 
     def prepare_inputs_for_generation(

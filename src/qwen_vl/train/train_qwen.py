@@ -32,7 +32,7 @@ import qwen_vl.train.trainer
 import qwen_vl.train.sampler
 from qwen_vl.train.bbox_probe import BBoxFormatProbeCallback
 from qwen_vl.train.bbox_residual_schedule import BBoxResidualWeightWarmupCallback
-from trainer import replace_qwen2_vl_attention_class
+from trainer import VGTrainer, replace_qwen2_vl_attention_class
 
 from transformers import (
     Qwen2VLForConditionalGeneration,
@@ -48,7 +48,7 @@ from qwen_vl.train.argument import (
     DataArguments,
     TrainingArguments,
 )
-from transformers import AutoTokenizer, AutoProcessor, Qwen2VLImageProcessor, Trainer, AutoConfig, set_seed, enable_full_determinism
+from transformers import AutoTokenizer, AutoProcessor, Qwen2VLImageProcessor, AutoConfig, set_seed, enable_full_determinism
 
 local_rank = None
 
@@ -221,7 +221,7 @@ def train(attn_implementation="flash_attention_2"):
         setattr(data_args, "use_geometry_encoder", model_args.use_geometry_encoder)
     setattr(data_args, "use_bbox_special_tokens", model_args.use_bbox_special_tokens)
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
-    trainer = Trainer(
+    trainer = VGTrainer(
         model=model, processing_class=tokenizer, args=training_args, **data_module
     )
     if model_args.use_bbox_residual_head and model_args.bbox_residual_loss_weight > 0:
