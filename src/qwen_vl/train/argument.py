@@ -18,6 +18,14 @@ class ModelArguments:
     feature_fusion_method: str = field(default="add")  # Method to fuse geometry and visual features ("add", "concat", "cross_attention", "gate")
     fusion_num_layers: int = field(default=1)  # Number of layers in the cross-attention module when feature_fusion_method is "cross_attention"
     geometry_merger_type: str = field(default="mlp")  # Type of geometry feature merger ("mlp", "avg")
+    use_unique_3d_prefix: bool = field(default=False)  # Whether to build the detached unique_3d prefix branch
+    unique_3d_num_queries: int = field(default=0)  # Number of learnable prefix queries extracted from unique_3d
+    unique_3d_prefix_num_heads: int = field(default=8)  # Number of heads in the unique_3d cross attention
+    unique_3d_prefix_dropout: float = field(default=0.1)  # Dropout in the unique_3d prefix encoder
+    unique_3d_hsic_weight: float = field(default=0.0)  # Weight of the RBF-HSIC decorrelation loss
+    unique_3d_hsic_sigma_2d: float = field(default=-1.0)  # RBF sigma for 2D features, <=0 enables median heuristic
+    unique_3d_hsic_sigma_3d: float = field(default=-1.0)  # RBF sigma for unique_3d features, <=0 enables median heuristic
+    unique_3d_hsic_max_samples: int = field(default=256)  # Max token samples per sample for HSIC estimation
 
 @dataclass
 class DataArguments:

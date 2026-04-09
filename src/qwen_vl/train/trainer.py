@@ -1,4 +1,5 @@
 import os
+from collections import defaultdict
 from typing import Dict, List, Optional, Sequence
 
 import datasets
@@ -23,6 +24,10 @@ from transformers.trainer import (
     is_sagemaker_mp_enabled,
 )
 from transformers.trainer_utils import seed_worker
+
+
+ORIGINAL_TRAINER_COMPUTE_LOSS = Trainer.compute_loss
+ORIGINAL_TRAINER_LOG = Trainer.log
 
 
 def _flash_attention_forward(
@@ -217,8 +222,13 @@ def create_optimizer(self):
         decay_parameters = get_parameter_names(opt_model, ALL_LAYERNORM_LAYERS)
         decay_parameters = [name for name in decay_parameters if "bias" not in name]
         if self.args.mm_projector_lr is not None and self.args.mm_projector_lr != 0:
+            projector_parameter_keywords = (
+                "merger",
+                "unique_3d_projector",
+                "unique_3d_prefix_encoder",
+            )
             projector_parameters = [
-                name for name, _ in opt_model.named_parameters() if "merger" in name
+                name for name, _ in opt_model.named_parameters() if any(keyword in name for keyword in projector_parameter_keywords)
             ]
             if self.args.vision_tower_lr is not None and self.args.vision_tower_lr != 0:
                 vision_tower_parameters = [
@@ -387,8 +397,74 @@ def create_optimizer(self):
     return self.optimizer
 
 
+def _store_loss_metric(self, split: str, name: str, value: Optional[torch.Tensor]) -> None:
+    if value is None:
+        return
+
+    if not hasattr(self, "_stored_loss_metrics"):
+        self._stored_loss_metrics = {
+            "train": defaultdict(list),
+            "eval": defaultdict(list),
+        }
+
+    if isinstance(value, torch.Tensor):
+        metric_value = value.detach().float().mean().item()
+    else:
+        metric_value = float(value)
+    self._stored_loss_metrics[split][name].append(metric_value)
+
+
+def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+    outputs = model(**inputs)
+    loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+
+    split = "train" if model.training else "eval"
+    loss_ce = getattr(outputs, "loss_ce", None)
+    loss_hsic_raw = getattr(outputs, "loss_hsic_raw", None)
+    loss_hsic_weighted = getattr(outputs, "loss_hsic_weighted", None)
+
+    _store_loss_metric(self, split, "Loss_ce", loss_ce)
+    _store_loss_metric(self, split, "Loss_hsic_raw", loss_hsic_raw)
+    _store_loss_metric(self, split, "Loss_hsic_weighted", loss_hsic_weighted)
+
+    if loss_ce is not None:
+        # Keep gradients from the optimization loss, but report CE as the trainer loss value.
+        loss = loss + (loss_ce.to(loss.device) - loss).detach()
+
+    if num_items_in_batch is not None and self.model_accepts_loss_kwargs:
+        loss = loss / self.args.gradient_accumulation_steps
+
+    return (loss, outputs) if return_outputs else loss
+
+
+def log(self, logs: Dict[str, float], *args, **kwargs) -> None:
+    split = "eval" if "eval_loss" in logs else "train"
+
+    if hasattr(self, "_stored_loss_metrics") and self._stored_loss_metrics[split]:
+        averaged_metrics = {
+            name: sum(values) / len(values)
+            for name, values in self._stored_loss_metrics[split].items()
+            if len(values) > 0
+        }
+        self._stored_loss_metrics[split].clear()
+
+        if split == "train":
+            logs.update(averaged_metrics)
+            if "Loss_ce" in averaged_metrics and "loss" in logs:
+                logs["loss"] = averaged_metrics["Loss_ce"]
+        else:
+            eval_metrics = {f"eval_{name}": value for name, value in averaged_metrics.items()}
+            logs.update(eval_metrics)
+            if "Loss_ce" in averaged_metrics and "eval_loss" in logs:
+                logs["eval_loss"] = averaged_metrics["Loss_ce"]
+
+    return ORIGINAL_TRAINER_LOG(self, logs, *args, **kwargs)
+
+
 # Apply monkey patches
 Trainer.create_optimizer = create_optimizer
+Trainer.compute_loss = compute_loss
+Trainer.log = log
 
 Qwen2VisionTransformerPretrainedModel.print_trainable_parameters = (
     print_trainable_parameters_visual

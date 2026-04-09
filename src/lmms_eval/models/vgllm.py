@@ -55,7 +55,25 @@ class VGLLM(lmms):
         **kwargs,
     ) -> None:
         super().__init__()
-        # Do not use kwargs for now
+
+        config_override_keys = {
+            "use_geometry_encoder",
+            "geometry_encoder_type",
+            "geometry_encoder_path",
+            "reference_frame",
+            "feature_fusion_method",
+            "fusion_num_layers",
+            "geometry_merger_type",
+            "use_unique_3d_prefix",
+            "unique_3d_num_queries",
+            "unique_3d_prefix_num_heads",
+            "unique_3d_prefix_dropout",
+            "unique_3d_hsic_weight",
+            "unique_3d_hsic_sigma_2d",
+            "unique_3d_hsic_sigma_3d",
+            "unique_3d_hsic_max_samples",
+        }
+        config_overrides = {k: kwargs.pop(k) for k in list(kwargs.keys()) if k in config_override_keys}
         assert kwargs == {}, f"Unexpected kwargs: {kwargs}"
 
         self.use_custom_video_loader = use_custom_video_loader
@@ -79,6 +97,8 @@ class VGLLM(lmms):
             self.device_map = f"cuda:{accelerator.local_process_index}"
 
         config = AutoConfig.from_pretrained(pretrained)
+        for key, value in config_overrides.items():
+            setattr(config, key, value)
 
         if getattr(config, "use_geometry_encoder", False) or getattr(config, "use_vggt_feature", False):
             load_class = Qwen2_5_VLForConditionalGenerationWithVGGT
@@ -86,16 +106,27 @@ class VGLLM(lmms):
         else:
             load_class = Qwen2_5_VLForConditionalGeneration
             eval_logger.info("Using Qwen2_5_VLForConditionalGeneration")
+
+        load_kwargs = {
+            "config": config,
+            "device_map": self.device_map,
+        }
+        if getattr(config, "use_geometry_encoder", False):
+            load_kwargs["geometry_encoder_path"] = getattr(config, "geometry_encoder_path", None)
+
         if use_flash_attention_2:
             self._model = load_class.from_pretrained(
                 pretrained,
-                config=config,
                 torch_dtype=torch.bfloat16,
-                device_map=self.device_map,
                 attn_implementation="flash_attention_2",
+                **load_kwargs,
             ).eval()
         else:
-            self._model = load_class.from_pretrained(pretrained, config=config, torch_dtype="auto", device_map=self.device_map).eval()
+            self._model = load_class.from_pretrained(
+                pretrained,
+                torch_dtype="auto",
+                **load_kwargs,
+            ).eval()
         self.max_pixels = max_pixels
         self.min_pixels = min_pixels
         self.max_num_frames = max_num_frames

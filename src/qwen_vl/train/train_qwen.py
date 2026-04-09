@@ -132,7 +132,15 @@ def train(attn_implementation="flash_attention_2"):
                 "reference_frame",
                 "feature_fusion_method", 
                 "fusion_num_layers",
-                "geometry_merger_type"
+                "geometry_merger_type",
+                "use_unique_3d_prefix",
+                "unique_3d_num_queries",
+                "unique_3d_prefix_num_heads",
+                "unique_3d_prefix_dropout",
+                "unique_3d_hsic_weight",
+                "unique_3d_hsic_sigma_2d",
+                "unique_3d_hsic_sigma_3d",
+                "unique_3d_hsic_max_samples",
             ]:
                 setattr(config, k, getattr(model_args, k))
 

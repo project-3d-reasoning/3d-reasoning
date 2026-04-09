@@ -1,9 +1,14 @@
 """Feature fusion modules for combining 2D and 3D features."""
 
+import math
+from dataclasses import dataclass
+from typing import Optional
+
 import torch
 import torch.nn as nn
-from typing import Optional
-from dataclasses import dataclass
+import torch.nn.functional as F
+
+from .vggt.layers.rope import RotaryPositionEmbedding2D
 
 
 @dataclass
@@ -237,6 +242,168 @@ class FeatureFusionModule(nn.Module):
             
         else:
             raise ValueError(f"Unknown fusion method: {self.fusion_method}")
+
+
+class LearnableQueryPrefixEncoder(nn.Module):
+    """Extract a fixed number of prefix tokens from a variable-length memory."""
+
+    def __init__(self, hidden_size: int, num_queries: int, num_heads: int = 8, dropout: float = 0.1):
+        super().__init__()
+        if hidden_size % num_heads != 0:
+            raise ValueError(f"hidden_size ({hidden_size}) must be divisible by num_heads ({num_heads})")
+
+        head_dim = hidden_size // num_heads
+        if head_dim % 4 != 0:
+            raise ValueError(
+                f"head_dim ({head_dim}) must be divisible by 4 to apply 2D RoPE cleanly in cross-attention."
+            )
+
+        self.hidden_size = hidden_size
+        self.num_queries = num_queries
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.attn_dropout = dropout
+        self.query_tokens = nn.Parameter(torch.randn(num_queries, hidden_size) / math.sqrt(hidden_size))
+        self.query_norm = nn.LayerNorm(hidden_size)
+        self.memory_norm = nn.LayerNorm(hidden_size)
+        self.output_norm = nn.LayerNorm(hidden_size)
+        self.q_proj = nn.Linear(hidden_size, hidden_size)
+        self.k_proj = nn.Linear(hidden_size, hidden_size)
+        self.v_proj = nn.Linear(hidden_size, hidden_size)
+        self.out_proj = nn.Linear(hidden_size, hidden_size)
+        self.rope = RotaryPositionEmbedding2D()
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size * 4, hidden_size),
+            nn.Dropout(dropout),
+        )
+
+    def _reshape_heads(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = x.shape
+        return x.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+    def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, _, seq_len, _ = x.shape
+        return x.transpose(1, 2).reshape(batch_size, seq_len, self.hidden_size)
+
+    def forward(self, memory: Optional[torch.Tensor], memory_positions: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if memory is not None and memory.dim() != 3:
+            raise ValueError(f"Expected memory to have shape [batch, seq, hidden], but got {tuple(memory.shape)}")
+        if memory_positions is not None:
+            if memory is None:
+                raise ValueError("memory_positions was provided without memory")
+            if memory_positions.shape[:2] != memory.shape[:2] or memory_positions.shape[-1] != 2:
+                raise ValueError(
+                    f"Expected memory_positions to have shape [batch, seq, 2], but got {tuple(memory_positions.shape)}"
+                )
+
+        if memory is None:
+            batch_size = 1
+            device = self.query_tokens.device
+            dtype = self.query_tokens.dtype
+        else:
+            batch_size = memory.shape[0]
+            device = memory.device
+            dtype = memory.dtype
+
+        queries = self.query_tokens.unsqueeze(0).expand(batch_size, -1, -1).to(device=device, dtype=dtype)
+        if memory is None or memory.shape[1] == 0:
+            x = queries
+        else:
+            query_states = self._reshape_heads(self.q_proj(self.query_norm(queries)))
+            key_states = self._reshape_heads(self.k_proj(self.memory_norm(memory)))
+            value_states = self._reshape_heads(self.v_proj(self.memory_norm(memory)))
+
+            if memory_positions is not None:
+                memory_positions = memory_positions.to(device=device)
+                query_positions = torch.zeros(
+                    batch_size,
+                    queries.shape[1],
+                    2,
+                    device=device,
+                    dtype=memory_positions.dtype,
+                )
+                query_states = self.rope(query_states, query_positions)
+                key_states = self.rope(key_states, memory_positions)
+
+            attn_output = F.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                dropout_p=self.attn_dropout if self.training else 0.0,
+            )
+            attn_output = self.out_proj(self._merge_heads(attn_output))
+            x = queries + attn_output
+
+        x = x + self.mlp(self.output_norm(x))
+        return x
+
+
+def _sample_features_for_hsic(x: torch.Tensor, y: torch.Tensor, max_samples: int) -> tuple[torch.Tensor, torch.Tensor]:
+    if max_samples > 0 and x.shape[0] > max_samples:
+        indices = torch.randperm(x.shape[0], device=x.device)[:max_samples]
+        x = x.index_select(0, indices)
+        y = y.index_select(0, indices)
+    return x, y
+
+
+def _resolve_rbf_sigma(x: torch.Tensor, sigma: float) -> torch.Tensor:
+    if sigma is not None and sigma > 0:
+        return x.new_tensor(float(sigma))
+
+    if x.shape[0] <= 1:
+        return x.new_tensor(1.0)
+
+    with torch.no_grad():
+        distances = torch.cdist(x, x, p=2).pow(2)
+        positive = distances[distances > 0]
+        if positive.numel() == 0:
+            return x.new_tensor(1.0)
+        sigma_sq = positive.median().clamp_min(1e-6)
+    return sigma_sq.sqrt()
+
+
+def _rbf_kernel(x: torch.Tensor, sigma: float) -> torch.Tensor:
+    sigma_tensor = _resolve_rbf_sigma(x, sigma)
+    sigma_sq = sigma_tensor.pow(2).clamp_min(1e-6)
+    distances = torch.cdist(x, x, p=2).pow(2)
+    return torch.exp(-distances / (2.0 * sigma_sq))
+
+
+def compute_rbf_hsic_loss(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    sigma_x: float = -1.0,
+    sigma_y: float = -1.0,
+    max_samples: int = 256,
+) -> torch.Tensor:
+    """Biased RBF-HSIC estimate used as a dependence penalty."""
+
+    if x.shape != y.shape:
+        raise ValueError(f"HSIC expects matching feature shapes, got {tuple(x.shape)} and {tuple(y.shape)}")
+
+    if x.ndim != 2:
+        raise ValueError(f"HSIC expects rank-2 tensors, got rank {x.ndim}")
+
+    if x.shape[0] <= 1:
+        return x.new_zeros(())
+
+    x = x.float()
+    y = y.float()
+    x, y = _sample_features_for_hsic(x, y, max_samples)
+    num_samples = x.shape[0]
+    if num_samples <= 1:
+        return x.new_zeros(())
+
+    kernel_x = _rbf_kernel(x, sigma_x)
+    kernel_y = _rbf_kernel(y, sigma_y)
+    center = torch.eye(num_samples, device=x.device, dtype=x.dtype) - 1.0 / num_samples
+    kernel_x = center @ kernel_x @ center
+    kernel_y = center @ kernel_y @ center
+    hsic = (kernel_x * kernel_y).sum() / ((num_samples - 1) ** 2)
+    return hsic.clamp_min(0.0)
 
 
 class GeometryFeatureMerger(nn.Module):

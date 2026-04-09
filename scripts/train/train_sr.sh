@@ -30,6 +30,18 @@ LR=1e-5
 total_batch_size=64
 GRADIENT_ACCUMULATION_STEPS=$(($total_batch_size / $NPROC_PER_NODE))
 
+# ======================
+# unique_3d Prefix Branch
+# ======================
+USE_UNIQUE_3D_PREFIX=False
+UNIQUE_3D_NUM_QUERIES=8
+UNIQUE_3D_PREFIX_NUM_HEADS=8
+UNIQUE_3D_PREFIX_DROPOUT=0.1
+UNIQUE_3D_HSIC_WEIGHT=0.01
+UNIQUE_3D_HSIC_SIGMA_2D=-1
+UNIQUE_3D_HSIC_SIGMA_3D=-1
+UNIQUE_3D_HSIC_MAX_SAMPLES=256
+
 torchrun --nproc_per_node=$NPROC_PER_NODE \
             --master_addr=$MASTER_ADDR \
             --master_port=$MASTER_PORT \
@@ -74,4 +86,12 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --geometry_encoder_type $GEOMETRY_ENCODER_TYPE \
             --geometry_encoder_path $GEOMETRY_ENCODER_PATH \
             --feature_fusion_method "add" \
+            --use_unique_3d_prefix $USE_UNIQUE_3D_PREFIX \
+            --unique_3d_num_queries $UNIQUE_3D_NUM_QUERIES \
+            --unique_3d_prefix_num_heads $UNIQUE_3D_PREFIX_NUM_HEADS \
+            --unique_3d_prefix_dropout $UNIQUE_3D_PREFIX_DROPOUT \
+            --unique_3d_hsic_weight $UNIQUE_3D_HSIC_WEIGHT \
+            --unique_3d_hsic_sigma_2d $UNIQUE_3D_HSIC_SIGMA_2D \
+            --unique_3d_hsic_sigma_3d $UNIQUE_3D_HSIC_SIGMA_3D \
+            --unique_3d_hsic_max_samples $UNIQUE_3D_HSIC_MAX_SAMPLES \
             > ${OUTPUT_DIR}/train.log 2>&1

@@ -11,9 +11,9 @@ NPROC_PER_NODE=$(nvidia-smi --list-gpus | wc -l)  # Automatically detects availa
 # ======================
 # Path Configuration
 # ======================
-MODEL_PATH="Qwen/Qwen2.5-VL-7B-Instruct/"  # [ModelArguments] Pretrained model path
+MODEL_PATH="/inspire/hdd/project/qproject-fundationmodel/public/yxliu/test/Demongorgan/VG-LLM/models/Qwen2.5-VL-7B-Instruct"  # /data7t-root/huggingface/hub/models--Qwen--Qwen2.5-VL-7B-Instruct/snapshots/cc594898137f460bfe9f0759e9844b3ce807cfb5[ModelArguments] Pretrained model path
 GEOMETRY_ENCODER_TYPE="vggt"
-GEOMETRY_ENCODER_PATH="facebook/VGGT-1B"
+GEOMETRY_ENCODER_PATH="/inspire/hdd/project/qproject-fundationmodel/public/yxliu/test/Demongorgan/VG-LLM/models/VGGT-1B" #"facebook/VGGT-1B"
 OUTPUT_DIR="PATH_TO_OUTPUT_DIR"                   # Directory for saving checkpoints
 CACHE_DIR="./cache"                        # [TrainingArguments] Cache directory for models
 mkdir -p $OUTPUT_DIR
@@ -27,9 +27,21 @@ DATASETS="scan2cap,scanrefer,scannet_det"                  # [DataArguments] Dat
 # Training Hyperparameters
 # ======================
 export NCCL_NVLS_ENABLE=0
-LR=1e-5
+LR=2e-5
 total_batch_size=64
 GRADIENT_ACCUMULATION_STEPS=$(($total_batch_size / $NPROC_PER_NODE))
+
+# ======================
+# unique_3d Prefix Branch
+# ======================
+USE_UNIQUE_3D_PREFIX=True
+UNIQUE_3D_NUM_QUERIES=20
+UNIQUE_3D_PREFIX_NUM_HEADS=8
+UNIQUE_3D_PREFIX_DROPOUT=0
+UNIQUE_3D_HSIC_WEIGHT=0.1
+UNIQUE_3D_HSIC_SIGMA_2D=-1
+UNIQUE_3D_HSIC_SIGMA_3D=-1
+UNIQUE_3D_HSIC_MAX_SAMPLES=256
 
 torchrun --nproc_per_node=$NPROC_PER_NODE \
             --master_addr=$MASTER_ADDR \
@@ -63,7 +75,7 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --lr_scheduler_type "cosine" \
             --weight_decay 0.01 \
             --logging_steps 10 \
-            --save_steps 1000 \
+            --save_steps 500 \
             --save_total_limit 1 \
             --deepspeed "scripts/zero2_opt.json" \
             --gradient_checkpointing \
@@ -75,4 +87,12 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --geometry_encoder_type $GEOMETRY_ENCODER_TYPE \
             --geometry_encoder_path $GEOMETRY_ENCODER_PATH \
             --feature_fusion_method "add" \
+            --use_unique_3d_prefix $USE_UNIQUE_3D_PREFIX \
+            --unique_3d_num_queries $UNIQUE_3D_NUM_QUERIES \
+            --unique_3d_prefix_num_heads $UNIQUE_3D_PREFIX_NUM_HEADS \
+            --unique_3d_prefix_dropout $UNIQUE_3D_PREFIX_DROPOUT \
+            --unique_3d_hsic_weight $UNIQUE_3D_HSIC_WEIGHT \
+            --unique_3d_hsic_sigma_2d $UNIQUE_3D_HSIC_SIGMA_2D \
+            --unique_3d_hsic_sigma_3d $UNIQUE_3D_HSIC_SIGMA_3D \
+            --unique_3d_hsic_max_samples $UNIQUE_3D_HSIC_MAX_SAMPLES \
             > ${OUTPUT_DIR}/train.log 2>&1

@@ -52,7 +52,13 @@ from transformers.utils import (
 from .configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLVisionConfig
 from .vggt.models.vggt import VGGT
 from .geometry_encoders import create_geometry_encoder, GeometryEncoderConfig
-from .feature_fusion import FeatureFusionModule, FeatureFusionConfig, GeometryFeatureMerger
+from .feature_fusion import (
+    FeatureFusionModule,
+    FeatureFusionConfig,
+    GeometryFeatureMerger,
+    LearnableQueryPrefixEncoder,
+    compute_rbf_hsic_loss,
+)
 from .loss import normalize_pointcloud, check_and_fix_inf_nan
 
 
@@ -1490,6 +1496,9 @@ class Qwen2_5_VLCausalLMOutputWithPast(ModelOutput):
     """
 
     loss: Optional[torch.FloatTensor] = None
+    loss_ce: Optional[torch.FloatTensor] = None
+    loss_hsic_raw: Optional[torch.FloatTensor] = None
+    loss_hsic_weighted: Optional[torch.FloatTensor] = None
     logits: torch.FloatTensor = None
     past_key_values: Optional[List[torch.FloatTensor]] = None
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
@@ -1614,7 +1623,36 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             spatial_merge_size=config.vision_config.spatial_merge_size,
             merger_type=getattr(config, "geometry_merger_type", "mlp")
         )
-        
+
+        self.unique_3d_hsic_weight = float(getattr(config, "unique_3d_hsic_weight", 0.0))
+        self.unique_3d_hsic_sigma_2d = float(getattr(config, "unique_3d_hsic_sigma_2d", -1.0))
+        self.unique_3d_hsic_sigma_3d = float(getattr(config, "unique_3d_hsic_sigma_3d", -1.0))
+        self.unique_3d_hsic_max_samples = int(getattr(config, "unique_3d_hsic_max_samples", 256))
+        self.use_unique_3d_prefix = bool(getattr(config, "use_unique_3d_prefix", False))
+        self.unique_3d_num_queries = int(getattr(config, "unique_3d_num_queries", 0))
+
+        if self.use_unique_3d_prefix:
+            if self.unique_3d_num_queries <= 0:
+                raise ValueError("unique_3d_num_queries must be > 0 when use_unique_3d_prefix is enabled.")
+
+            self.geometry_unique_merger = GeometryFeatureMerger(
+                output_dim=config.hidden_size,
+                hidden_dim=getattr(config, "geometry_merger_hidden_dim", 4096),
+                context_dim=self.geometry_encoder.get_feature_dim(),
+                spatial_merge_size=config.vision_config.spatial_merge_size,
+                merger_type=getattr(config, "geometry_merger_type", "mlp"),
+            )
+            self.unique_3d_projector = nn.Sequential(
+                nn.LayerNorm(config.hidden_size),
+                nn.Linear(config.hidden_size, config.hidden_size),
+            )
+            self.unique_3d_prefix_encoder = LearnableQueryPrefixEncoder(
+                hidden_size=config.hidden_size,
+                num_queries=self.unique_3d_num_queries,
+                num_heads=int(getattr(config, "unique_3d_prefix_num_heads", 8)),
+                dropout=float(getattr(config, "unique_3d_prefix_dropout", 0.1)),
+            )
+
         # Create feature fusion module
         fusion_config = FeatureFusionConfig(
             fusion_method=getattr(config, "feature_fusion_method", "add"),
@@ -1625,11 +1663,122 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         )
         self.feature_fusion = FeatureFusionModule(fusion_config)
 
-    def _process_geometry_features(self, image_embeds, geometry_encoder_inputs):
+    def _use_unique_3d_prefix(self) -> bool:
+        return (
+            getattr(self.config, "use_unique_3d_prefix", False)
+            and hasattr(self, "geometry_unique_merger")
+            and hasattr(self, "unique_3d_projector")
+            and hasattr(self, "unique_3d_prefix_encoder")
+            and getattr(self.config, "unique_3d_num_queries", 0) > 0
+        )
+
+    def _get_prefix_token_id(self) -> int:
+        if getattr(self.config, "pad_token_id", None) is not None:
+            return self.config.pad_token_id
+        if getattr(self.config, "eos_token_id", None) is not None:
+            return self.config.eos_token_id
+        return 0
+
+    def _get_padding_layout(self, sample_attention_mask: torch.Tensor) -> Tuple[int, int]:
+        seq_len = sample_attention_mask.shape[0]
+        valid_len = int(sample_attention_mask.sum().item())
+        if valid_len == 0:
+            return seq_len, 0
+        left_pad = seq_len - valid_len if sample_attention_mask[0].item() == 0 else 0
+        right_pad = seq_len - valid_len - left_pad
+        return left_pad, right_pad
+
+    def _insert_prefix_tensor(
+        self,
+        sequence: torch.Tensor,
+        prefix: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if attention_mask is None:
+            return torch.cat([prefix, sequence], dim=1)
+
+        updated = []
+        seq_len = sequence.shape[1]
+        for batch_idx in range(sequence.shape[0]):
+            left_pad, right_pad = self._get_padding_layout(attention_mask[batch_idx])
+            right_start = seq_len - right_pad
+            updated.append(
+                torch.cat(
+                    [
+                        sequence[batch_idx, :left_pad],
+                        prefix[batch_idx],
+                        sequence[batch_idx, left_pad:right_start],
+                        sequence[batch_idx, right_start:],
+                    ],
+                    dim=0,
+                )
+            )
+        return torch.stack(updated, dim=0)
+
+    def _prepend_unique_3d_prefix(
+        self,
+        inputs_embeds: torch.Tensor,
+        input_ids: Optional[torch.LongTensor],
+        attention_mask: Optional[torch.Tensor],
+        labels: Optional[torch.LongTensor],
+        prefix_embeds: Optional[torch.Tensor],
+        cache_position: Optional[torch.LongTensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.LongTensor], Optional[torch.Tensor], Optional[torch.LongTensor], Optional[torch.LongTensor]]:
+        if prefix_embeds is None or prefix_embeds.shape[1] == 0:
+            return inputs_embeds, input_ids, attention_mask, labels, cache_position
+
+        prefix_embeds = prefix_embeds.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+        prefix_len = prefix_embeds.shape[1]
+        original_attention_mask = attention_mask
+
+        inputs_embeds = self._insert_prefix_tensor(inputs_embeds, prefix_embeds, original_attention_mask)
+
+        if input_ids is not None:
+            prefix_token_id = self._get_prefix_token_id()
+            prefix_input_ids = input_ids.new_full((input_ids.shape[0], prefix_len), prefix_token_id)
+            input_ids = self._insert_prefix_tensor(input_ids, prefix_input_ids, original_attention_mask)
+
+        if attention_mask is not None:
+            prefix_attention = attention_mask.new_ones((attention_mask.shape[0], prefix_len))
+            attention_mask = self._insert_prefix_tensor(attention_mask, prefix_attention, original_attention_mask)
+
+        if labels is not None:
+            prefix_labels = labels.new_full((labels.shape[0], prefix_len), -100)
+            labels = self._insert_prefix_tensor(labels, prefix_labels, original_attention_mask)
+
+        if cache_position is not None:
+            cache_position = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
+
+        return inputs_embeds, input_ids, attention_mask, labels, cache_position
+
+    def _augment_generation_attention_mask(self, attention_mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if attention_mask is None or not self._use_unique_3d_prefix():
+            return attention_mask
+
+        prefix_attention = attention_mask.new_ones((attention_mask.shape[0], self.config.unique_3d_num_queries))
+        return self._insert_prefix_tensor(attention_mask, prefix_attention, attention_mask)
+
+    def _build_unique_3d_positions(
+        self,
+        num_images: int,
+        h_grid: int,
+        w_grid: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        y_coords = torch.arange(h_grid, device=device)
+        x_coords = torch.arange(w_grid, device=device)
+        patch_positions = torch.cartesian_prod(y_coords, x_coords)
+        patch_positions = patch_positions.view(1, h_grid * w_grid, 2).expand(num_images, -1, -1)
+        return patch_positions.reshape(1, num_images * h_grid * w_grid, 2)
+
+    def _process_geometry_features(self, image_embeds, geometry_encoder_inputs, compute_auxiliary_loss: bool = False):
         """Process geometry features using the geometry encoder."""
 
         batch_size = len(geometry_encoder_inputs)
         geo_embeds = []
+        prefix_embeds = [] if self._use_unique_3d_prefix() else None
+        hsic_losses = []
+        image_offset = 0
         for bn in range(batch_size):
             if geometry_encoder_inputs[bn].shape[0] > 0:
 
@@ -1641,17 +1790,54 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 features = features.reshape(n_image, height // self.geometry_encoder.patch_size, width // self.geometry_encoder.patch_size, -1)
 
                 # Reshape for merger
-                features = self.geometry_merger(features)
-                geo_embeds.append(features)
+                merged_features = self.geometry_merger(features)
+                geo_embeds.append(merged_features)
+
+                sample_token_count = merged_features.shape[0] * merged_features.shape[1] * merged_features.shape[2]
+                feature_2d = image_embeds[image_offset:image_offset + sample_token_count].view_as(merged_features)
+                image_offset += sample_token_count
+
+                if prefix_embeds is not None:
+                    unique_3d = self.geometry_unique_merger(features)
+
+                    if compute_auxiliary_loss and self.unique_3d_hsic_weight > 0:
+                        hsic_losses.append(
+                            compute_rbf_hsic_loss(
+                                unique_3d.view(-1, unique_3d.shape[-1]),
+                                feature_2d.detach().view(-1, feature_2d.shape[-1]),
+                                sigma_x=self.unique_3d_hsic_sigma_3d,
+                                sigma_y=self.unique_3d_hsic_sigma_2d,
+                                max_samples=self.unique_3d_hsic_max_samples,
+                            )
+                        )
+
+                    unique_3d_projected = self.unique_3d_projector(unique_3d.detach())
+                    unique_3d_positions = self._build_unique_3d_positions(
+                        num_images=unique_3d_projected.shape[0],
+                        h_grid=unique_3d_projected.shape[1],
+                        w_grid=unique_3d_projected.shape[2],
+                        device=unique_3d_projected.device,
+                    )
+                    prefix_tokens = self.unique_3d_prefix_encoder(
+                        unique_3d_projected.view(1, -1, unique_3d_projected.shape[-1]),
+                        memory_positions=unique_3d_positions,
+                    )
+                    prefix_embeds.append(prefix_tokens.squeeze(0).to(dtype=image_embeds.dtype))
+            elif prefix_embeds is not None:
+                prefix_embeds.append(self.unique_3d_prefix_encoder(None).squeeze(0).to(image_embeds.device, image_embeds.dtype))
 
         geo_embeds = torch.cat(geo_embeds, dim=0) if geo_embeds else None
+        prefix_embeds = torch.stack(prefix_embeds, dim=0) if prefix_embeds else None
+        hsic_loss = torch.zeros((), device=image_embeds.device, dtype=torch.float32)
+        if hsic_losses:
+            hsic_loss = torch.stack(hsic_losses).mean()
         
         if geo_embeds is not None:
             image_embeds = image_embeds.view(geo_embeds.shape)
             image_embeds = self.feature_fusion(image_embeds, geo_embeds)
             image_embeds = image_embeds.view(-1, image_embeds.shape[-1])
         
-        return image_embeds
+        return image_embeds, prefix_embeds, hsic_loss
 
 
     @classmethod
@@ -1928,16 +2114,32 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        unique_3d_hsic_loss = torch.zeros((), device=self.lm_head.weight.device, dtype=torch.float32)
 
         if inputs_embeds is None:
             inputs_embeds = self.model.embed_tokens(input_ids)
             if pixel_values is not None:
                 pixel_values = pixel_values.type(self.visual.dtype)
                 image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+                prefix_embeds = None
                 
                 # Process 3D geometry features if enabled
                 if getattr(self.config, 'use_geometry_encoder', False) and geometry_encoder_inputs is not None:
-                    image_embeds = self._process_geometry_features(image_embeds, geometry_encoder_inputs)
+                    image_embeds, prefix_embeds, unique_3d_hsic_loss = self._process_geometry_features(
+                        image_embeds,
+                        geometry_encoder_inputs,
+                        compute_auxiliary_loss=labels is not None,
+                    )
+
+                if prefix_embeds is not None:
+                    inputs_embeds, input_ids, attention_mask, labels, cache_position = self._prepend_unique_3d_prefix(
+                        inputs_embeds,
+                        input_ids,
+                        attention_mask,
+                        labels,
+                        prefix_embeds,
+                        cache_position,
+                    )
 
                 n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
                 n_image_features = image_embeds.shape[0]
@@ -2022,6 +2224,9 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
         loss = None
+        loss_ce = None
+        loss_hsic_raw = None
+        loss_hsic_weighted = None
         if labels is not None:
             # Upcast to float if we need to compute the loss to avoid potential precision issues
             logits = logits.float()
@@ -2034,7 +2239,13 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             shift_labels = shift_labels.view(-1)
             # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
+            loss_ce = loss_fct(shift_logits, shift_labels)
+            loss = loss_ce
+            loss_hsic_raw = unique_3d_hsic_loss.to(loss_ce.device)
+            loss_hsic_weighted = loss_hsic_raw * float(getattr(self.config, "unique_3d_hsic_weight", 0.0))
+
+            if loss_hsic_weighted is not None and getattr(self.config, "unique_3d_hsic_weight", 0.0) > 0:
+                loss = loss + loss_hsic_weighted
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -2042,6 +2253,9 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
 
         return Qwen2_5_VLCausalLMOutputWithPast(
             loss=loss,
+            loss_ce=loss_ce,
+            loss_hsic_raw=loss_hsic_raw,
+            loss_hsic_weighted=loss_hsic_weighted,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
@@ -2085,6 +2299,12 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
 
         # Qwen2-5-VL position_ids are prepareed with rope_deltas in forward
         model_inputs["position_ids"] = None
+
+        if cache_position[0] != 0:
+            current_attention_mask = model_inputs.get("attention_mask", attention_mask)
+            expected_length = cache_position[0].item() + 1
+            if current_attention_mask is not None and current_attention_mask.shape[1] != expected_length:
+                model_inputs["attention_mask"] = self._augment_generation_attention_mask(current_attention_mask)
 
         if cache_position[0] != 0:
             model_inputs["pixel_values"] = None
