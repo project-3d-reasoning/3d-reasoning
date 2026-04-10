@@ -6,14 +6,14 @@
 # ======================
 MASTER_ADDR="127.0.0.1"                     # [Required] Master node IP for multi-GPU training
 MASTER_PORT=$(shuf -i 20000-29999 -n 1)     # Random port to avoid conflicts
-NPROC_PER_NODE=$(nvidia-smi --list-gpus | wc -l)  # Automatically detects available GPUs
+NPROC_PER_NODE=4  # Automatically detects available GPUs
 
 # ======================
 # Path Configuration
 # ======================
-MODEL_PATH="Qwen/Qwen2.5-VL-7B-Instruct/"  # [ModelArguments] Pretrained model path
+MODEL_PATH="/inspire/hdd/project/qproject-fundationmodel/public/yxliu/test/Demongorgan/VG-LLM/models/Qwen2.5-VL-7B-Instruct"  # [ModelArguments] Pretrained model path
 GEOMETRY_ENCODER_TYPE="vggt"
-GEOMETRY_ENCODER_PATH="facebook/VGGT-1B"
+GEOMETRY_ENCODER_PATH="/inspire/hdd/project/qproject-fundationmodel/public/yxliu/test/Demongorgan/VG-LLM/models/VGGT-1B"
 USE_HSIC_FUSION=true
 HSIC_LOSS_WEIGHT=10
 HSIC_RBF_SIGMA_2D=-1  # Set to -1 to auto-estimate sigma with the median heuristic

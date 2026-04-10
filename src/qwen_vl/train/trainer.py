@@ -1,3 +1,4 @@
+import contextlib
 import os
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -20,15 +21,22 @@ from transformers.trainer import (
     ALL_LAYERNORM_LAYERS,
     DistributedType,
     OptimizerNames,
-    clear_device_cache,
     get_parameter_names,
     has_length,
     is_sagemaker_mp_enabled,
     is_torch_xla_available,
-    nested_gather,
-    smp_forward_backward,
 )
 from transformers.trainer_utils import SaveStrategy, seed_worker
+
+try:
+    from transformers.trainer import clear_device_cache
+except ImportError:
+    from accelerate.utils.memory import clear_device_cache
+
+if is_sagemaker_mp_enabled():
+    from transformers.trainer_pt_utils import smp_forward_backward
+else:
+    smp_forward_backward = None
 
 if is_torch_xla_available():
     import torch_xla.core.xla_model as xm
@@ -442,13 +450,34 @@ class QwenLossLoggingTrainer(Trainer):
             return zero.new_tensor(float(value))
         return value
 
+    def _prepare_context_parallel_inputs_compat(
+        self,
+        model: nn.Module,
+        inputs: dict[str, torch.Tensor | Any],
+    ) -> tuple[Any, dict[str, torch.Tensor | Any]]:
+        prepare_context_parallel_inputs = getattr(
+            super(),
+            "_prepare_context_parallel_inputs",
+            None,
+        )
+        if prepare_context_parallel_inputs is None:
+            return contextlib.nullcontext, inputs
+        return prepare_context_parallel_inputs(model, inputs)
+
+    def _get_gradient_accumulation_steps_compat(self) -> int:
+        return getattr(
+            self,
+            "current_gradient_accumulation_steps",
+            self.args.gradient_accumulation_steps,
+        )
+
     def training_step(
         self,
         model: nn.Module,
         inputs: dict[str, torch.Tensor | Any],
         num_items_in_batch: torch.Tensor | int | None = None,
     ) -> torch.Tensor:
-        cp_context, inputs = self._prepare_context_parallel_inputs(model, inputs)
+        cp_context, inputs = self._prepare_context_parallel_inputs_compat(model, inputs)
 
         with cp_context():
             model.train()
@@ -512,13 +541,14 @@ class QwenLossLoggingTrainer(Trainer):
                     }
 
             if (not self.model_accepts_loss_kwargs or num_items_in_batch is None) and self.compute_loss_func is None:
-                loss = loss / self.current_gradient_accumulation_steps
-                ce_loss = ce_loss / self.current_gradient_accumulation_steps
-                hsic_loss_raw = hsic_loss_raw / self.current_gradient_accumulation_steps
-                hsic_loss_weighted = hsic_loss_weighted / self.current_gradient_accumulation_steps
+                grad_accumulation_steps = self._get_gradient_accumulation_steps_compat()
+                loss = loss / grad_accumulation_steps
+                ce_loss = ce_loss / grad_accumulation_steps
+                hsic_loss_raw = hsic_loss_raw / grad_accumulation_steps
+                hsic_loss_weighted = hsic_loss_weighted / grad_accumulation_steps
                 if has_feature_stats:
                     feature_stats = {
-                        key: value / self.current_gradient_accumulation_steps
+                        key: value / grad_accumulation_steps
                         for key, value in feature_stats.items()
                     }
 
@@ -555,7 +585,7 @@ class QwenLossLoggingTrainer(Trainer):
             logs: dict[str, float] = {}
             step_delta = self.state.global_step - self._globalstep_last_logged
 
-            tr_loss_scalar = nested_gather(tr_loss, self.args.parallel_mode).mean().item()
+            tr_loss_scalar = self._nested_gather(tr_loss).mean().item()
             tr_loss -= tr_loss
 
             ce_loss_avg = tr_loss_scalar / step_delta
@@ -563,10 +593,8 @@ class QwenLossLoggingTrainer(Trainer):
             logs["Loss_ce"] = ce_loss_avg
 
             if self._tr_loss_hsic_raw is not None and self._tr_loss_hsic_weighted is not None:
-                hsic_loss_raw_scalar = nested_gather(self._tr_loss_hsic_raw, self.args.parallel_mode).mean().item()
-                hsic_loss_weighted_scalar = nested_gather(
-                    self._tr_loss_hsic_weighted, self.args.parallel_mode
-                ).mean().item()
+                hsic_loss_raw_scalar = self._nested_gather(self._tr_loss_hsic_raw).mean().item()
+                hsic_loss_weighted_scalar = self._nested_gather(self._tr_loss_hsic_weighted).mean().item()
                 self._tr_loss_hsic_raw -= self._tr_loss_hsic_raw
                 self._tr_loss_hsic_weighted -= self._tr_loss_hsic_weighted
                 logs["Loss_hsic_raw"] = hsic_loss_raw_scalar / step_delta
@@ -574,7 +602,7 @@ class QwenLossLoggingTrainer(Trainer):
 
             if self._tr_feature_stats:
                 for key, value in self._tr_feature_stats.items():
-                    stat_scalar = nested_gather(value, self.args.parallel_mode).mean().item()
+                    stat_scalar = self._nested_gather(value).mean().item()
                     logs[key] = stat_scalar / step_delta
                     self._tr_feature_stats[key] -= self._tr_feature_stats[key]
 
