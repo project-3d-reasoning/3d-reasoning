@@ -399,10 +399,18 @@ def create_optimizer(self):
 class QwenLossLoggingTrainer(Trainer):
     """Trainer that backpropagates the full loss but logs CE and HSIC components separately."""
 
+    FEATURE_STAT_KEYS = (
+        "unique_3d_projected_mean",
+        "unique_3d_projected_var",
+        "feature_2d_mean",
+        "feature_2d_var",
+    )
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._tr_loss_hsic_raw = None
         self._tr_loss_hsic_weighted = None
+        self._tr_feature_stats = {}
 
     @staticmethod
     def _get_output_value(outputs: Any, key: str, default: Optional[torch.Tensor] = None):
@@ -415,6 +423,24 @@ class QwenLossLoggingTrainer(Trainer):
             zero = reference.detach().new_zeros(())
             self._tr_loss_hsic_raw = zero.clone()
             self._tr_loss_hsic_weighted = zero.clone()
+
+    def _ensure_feature_stat_buffers(self, reference: torch.Tensor) -> None:
+        if not self._tr_feature_stats:
+            zero = reference.detach().new_zeros(())
+            self._tr_feature_stats = {
+                key: zero.clone() for key in self.FEATURE_STAT_KEYS
+            }
+
+    @staticmethod
+    def _coerce_scalar_output(
+        value: Optional[torch.Tensor | float],
+        zero: torch.Tensor,
+    ) -> torch.Tensor:
+        if value is None:
+            return zero
+        if not isinstance(value, torch.Tensor):
+            return zero.new_tensor(float(value))
+        return value
 
     def training_step(
         self,
@@ -445,18 +471,23 @@ class QwenLossLoggingTrainer(Trainer):
             ce_loss = self._get_output_value(outputs, "ce_loss", loss)
             hsic_loss_raw = self._get_output_value(outputs, "hsic_loss_raw")
             hsic_loss_weighted = self._get_output_value(outputs, "hsic_loss_weighted")
+            raw_feature_stats = {
+                key: self._get_output_value(outputs, key)
+                for key in self.FEATURE_STAT_KEYS
+            }
 
             if not isinstance(ce_loss, torch.Tensor):
                 ce_loss = loss.detach().new_tensor(float(ce_loss))
             zero = loss.detach().new_zeros(())
-            if hsic_loss_raw is None:
-                hsic_loss_raw = zero
-            elif not isinstance(hsic_loss_raw, torch.Tensor):
-                hsic_loss_raw = zero.new_tensor(float(hsic_loss_raw))
-            if hsic_loss_weighted is None:
-                hsic_loss_weighted = zero
-            elif not isinstance(hsic_loss_weighted, torch.Tensor):
-                hsic_loss_weighted = zero.new_tensor(float(hsic_loss_weighted))
+            hsic_loss_raw = self._coerce_scalar_output(hsic_loss_raw, zero)
+            hsic_loss_weighted = self._coerce_scalar_output(hsic_loss_weighted, zero)
+            has_feature_stats = any(value is not None for value in raw_feature_stats.values())
+            feature_stats = {}
+            if has_feature_stats:
+                feature_stats = {
+                    key: self._coerce_scalar_output(value, zero)
+                    for key, value in raw_feature_stats.items()
+                }
 
             del inputs
             if (
@@ -475,12 +506,21 @@ class QwenLossLoggingTrainer(Trainer):
                 ce_loss = ce_loss.mean()
                 hsic_loss_raw = hsic_loss_raw.mean()
                 hsic_loss_weighted = hsic_loss_weighted.mean()
+                if has_feature_stats:
+                    feature_stats = {
+                        key: value.mean() for key, value in feature_stats.items()
+                    }
 
             if (not self.model_accepts_loss_kwargs or num_items_in_batch is None) and self.compute_loss_func is None:
                 loss = loss / self.current_gradient_accumulation_steps
                 ce_loss = ce_loss / self.current_gradient_accumulation_steps
                 hsic_loss_raw = hsic_loss_raw / self.current_gradient_accumulation_steps
                 hsic_loss_weighted = hsic_loss_weighted / self.current_gradient_accumulation_steps
+                if has_feature_stats:
+                    feature_stats = {
+                        key: value / self.current_gradient_accumulation_steps
+                        for key, value in feature_stats.items()
+                    }
 
             if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
                 kwargs["scale_wrt_gas"] = False
@@ -488,6 +528,10 @@ class QwenLossLoggingTrainer(Trainer):
             self._ensure_aux_loss_buffers(loss)
             self._tr_loss_hsic_raw += hsic_loss_raw.detach()
             self._tr_loss_hsic_weighted += hsic_loss_weighted.detach()
+            if has_feature_stats:
+                self._ensure_feature_stat_buffers(loss)
+                for key, value in feature_stats.items():
+                    self._tr_feature_stats[key] += value.detach()
 
             self.accelerator.backward(loss, **kwargs)
 
@@ -527,6 +571,12 @@ class QwenLossLoggingTrainer(Trainer):
                 self._tr_loss_hsic_weighted -= self._tr_loss_hsic_weighted
                 logs["Loss_hsic_raw"] = hsic_loss_raw_scalar / step_delta
                 logs["Loss_hsic_weighted"] = hsic_loss_weighted_scalar / step_delta
+
+            if self._tr_feature_stats:
+                for key, value in self._tr_feature_stats.items():
+                    stat_scalar = nested_gather(value, self.args.parallel_mode).mean().item()
+                    logs[key] = stat_scalar / step_delta
+                    self._tr_feature_stats[key] -= self._tr_feature_stats[key]
 
             if grad_norm is not None:
                 logs["grad_norm"] = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm

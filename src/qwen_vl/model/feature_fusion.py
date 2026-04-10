@@ -2,7 +2,7 @@
 
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 from dataclasses import dataclass
 
 
@@ -249,6 +249,21 @@ class FeatureFusionModule(nn.Module):
         return torch.exp(-gamma * distances)
 
     @staticmethod
+    def _compute_feature_stats(features: torch.Tensor, prefix: str) -> Dict[str, torch.Tensor]:
+        detached_features = features.detach().float()
+        if detached_features.numel() == 0:
+            zero = detached_features.new_zeros(())
+            return {
+                f"{prefix}_mean": zero,
+                f"{prefix}_var": zero,
+            }
+
+        return {
+            f"{prefix}_mean": detached_features.mean(),
+            f"{prefix}_var": detached_features.var(unbiased=False),
+        }
+
+    @staticmethod
     def _subsample_features_for_hsic(
         features_2d: torch.Tensor,
         features_3d: torch.Tensor,
@@ -300,7 +315,7 @@ class FeatureFusionModule(nn.Module):
         features_2d: torch.Tensor,
         features_3d: torch.Tensor,
         compute_aux_loss: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[Dict[str, torch.Tensor]]]:
         """
         Fuse 2D and 3D features.
         
@@ -308,27 +323,33 @@ class FeatureFusionModule(nn.Module):
             features_2d: 2D image features
             features_3d: 3D geometry features
         Returns:
-            Fused features, optional raw HSIC loss, and optional weighted HSIC loss
+            Fused features, optional raw HSIC loss, optional weighted HSIC loss,
+            and optional logging stats for fused inputs
         """
         hsic_loss_raw = None
         hsic_loss_weighted = None
+        aux_stats = None
         if self.config.use_hsic_fusion:
             if compute_aux_loss:
                 hsic_loss_raw = self._compute_rbf_hsic(features_2d, features_3d)
                 hsic_loss_weighted = self.config.hsic_loss_weight * hsic_loss_raw
 
             feature_3d_projected = self.feature_3d_projector(features_3d)
-            return features_2d + feature_3d_projected, hsic_loss_raw, hsic_loss_weighted
+            if compute_aux_loss:
+                aux_stats = self._compute_feature_stats(features_2d, "feature_2d")
+                aux_stats.update(self._compute_feature_stats(feature_3d_projected, "unique_3d_projected"))
+
+            return features_2d + feature_3d_projected, hsic_loss_raw, hsic_loss_weighted, aux_stats
 
         _, h_grid, w_grid, _ = features_3d.shape
         if self.fusion_method == "add":
-            return features_2d + features_3d, None, None
+            return features_2d + features_3d, None, None, None
             
         elif self.fusion_method == "concat":
             features_2d = self.norm1(features_2d)
             features_3d = self.norm2(features_3d)
             concat_features = torch.cat([features_2d, features_3d], dim=-1)
-            return self.projection(concat_features), None, None
+            return self.projection(concat_features), None, None, None
             
         elif self.fusion_method == "cross_attention":
             features_2d = features_2d.view(features_2d.size(0), -1, self.hidden_size)  # Flatten spatial dimensions
@@ -336,21 +357,21 @@ class FeatureFusionModule(nn.Module):
             x = features_2d
             for block in self.cross_attn_blocks:
                 x = block(x, features_3d, h_grid, w_grid)
-            return x, None, None
+            return x, None, None, None
             
         elif self.fusion_method == "gated":
             features_2d = self.norm1(features_2d)
             features_3d = self.norm2(features_3d)
             concat_features = torch.cat([features_2d, features_3d], dim=-1)
             gate = self.gate_projection(concat_features)
-            return gate * features_2d + (1 - gate) * features_3d, None, None
+            return gate * features_2d + (1 - gate) * features_3d, None, None, None
             
         elif self.fusion_method == "weighted":
             # Normalize weights to sum to 1
             weight_sum = self.weight_2d + self.weight_3d
             norm_weight_2d = self.weight_2d / weight_sum
             norm_weight_3d = self.weight_3d / weight_sum
-            return norm_weight_2d * features_2d + norm_weight_3d * features_3d, None, None
+            return norm_weight_2d * features_2d + norm_weight_3d * features_3d, None, None, None
             
         else:
             raise ValueError(f"Unknown fusion method: {self.fusion_method}")
