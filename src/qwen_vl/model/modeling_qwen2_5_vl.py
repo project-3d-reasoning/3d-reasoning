@@ -1490,6 +1490,9 @@ class Qwen2_5_VLCausalLMOutputWithPast(ModelOutput):
     """
 
     loss: Optional[torch.FloatTensor] = None
+    ce_loss: Optional[torch.FloatTensor] = None
+    hsic_loss_raw: Optional[torch.FloatTensor] = None
+    hsic_loss_weighted: Optional[torch.FloatTensor] = None
     logits: torch.FloatTensor = None
     past_key_values: Optional[List[torch.FloatTensor]] = None
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
@@ -1621,15 +1624,24 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             hidden_size=config.hidden_size,
             num_heads=getattr(config, "fusion_attention_heads", 8),
             dropout=getattr(config, "fusion_dropout", 0.1),
-            num_layers=getattr(config, "fusion_num_layers", 1)
+            num_layers=getattr(config, "fusion_num_layers", 1),
+            use_hsic_fusion=getattr(config, "use_hsic_fusion", False),
+            hsic_loss_weight=getattr(config, "hsic_loss_weight", 0.0),
+            hsic_rbf_sigma_2d=getattr(config, "hsic_rbf_sigma_2d", 1.0),
+            hsic_rbf_sigma_3d=getattr(config, "hsic_rbf_sigma_3d", 1.0),
+            unique_3d_hsic_max_samples=getattr(config, "unique_3d_hsic_max_samples", -1),
+            hsic_projector_hidden_size=getattr(config, "hsic_projector_hidden_size", None),
+            hsic_projector_dropout=getattr(config, "hsic_projector_dropout", 0.1),
         )
         self.feature_fusion = FeatureFusionModule(fusion_config)
 
-    def _process_geometry_features(self, image_embeds, geometry_encoder_inputs):
+    def _process_geometry_features(self, image_embeds, geometry_encoder_inputs, compute_aux_loss: bool = False):
         """Process geometry features using the geometry encoder."""
 
         batch_size = len(geometry_encoder_inputs)
         geo_embeds = []
+        fusion_hsic_loss_raw = None
+        fusion_hsic_loss_weighted = None
         for bn in range(batch_size):
             if geometry_encoder_inputs[bn].shape[0] > 0:
 
@@ -1648,10 +1660,14 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         
         if geo_embeds is not None:
             image_embeds = image_embeds.view(geo_embeds.shape)
-            image_embeds = self.feature_fusion(image_embeds, geo_embeds)
+            image_embeds, fusion_hsic_loss_raw, fusion_hsic_loss_weighted = self.feature_fusion(
+                image_embeds,
+                geo_embeds,
+                compute_aux_loss=compute_aux_loss,
+            )
             image_embeds = image_embeds.view(-1, image_embeds.shape[-1])
         
-        return image_embeds
+        return image_embeds, fusion_hsic_loss_raw, fusion_hsic_loss_weighted
 
 
     @classmethod
@@ -1928,6 +1944,8 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        fusion_hsic_loss_raw = None
+        fusion_hsic_loss_weighted = None
 
         if inputs_embeds is None:
             inputs_embeds = self.model.embed_tokens(input_ids)
@@ -1937,7 +1955,11 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 
                 # Process 3D geometry features if enabled
                 if getattr(self.config, 'use_geometry_encoder', False) and geometry_encoder_inputs is not None:
-                    image_embeds = self._process_geometry_features(image_embeds, geometry_encoder_inputs)
+                    image_embeds, fusion_hsic_loss_raw, fusion_hsic_loss_weighted = self._process_geometry_features(
+                        image_embeds,
+                        geometry_encoder_inputs,
+                        compute_aux_loss=labels is not None,
+                    )
 
                 n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
                 n_image_features = image_embeds.shape[0]
@@ -2022,6 +2044,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
         loss = None
+        ce_loss = None
         if labels is not None:
             # Upcast to float if we need to compute the loss to avoid potential precision issues
             logits = logits.float()
@@ -2034,7 +2057,10 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             shift_labels = shift_labels.view(-1)
             # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
+            ce_loss = loss_fct(shift_logits, shift_labels)
+            loss = ce_loss
+        if fusion_hsic_loss_weighted is not None:
+            loss = fusion_hsic_loss_weighted if loss is None else loss + fusion_hsic_loss_weighted
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -2042,6 +2068,9 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
 
         return Qwen2_5_VLCausalLMOutputWithPast(
             loss=loss,
+            ce_loss=ce_loss,
+            hsic_loss_raw=fusion_hsic_loss_raw,
+            hsic_loss_weighted=fusion_hsic_loss_weighted,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,

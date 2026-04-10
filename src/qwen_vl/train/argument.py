@@ -18,6 +18,13 @@ class ModelArguments:
     feature_fusion_method: str = field(default="add")  # Method to fuse geometry and visual features ("add", "concat", "cross_attention", "gate")
     fusion_num_layers: int = field(default=1)  # Number of layers in the cross-attention module when feature_fusion_method is "cross_attention"
     geometry_merger_type: str = field(default="mlp")  # Type of geometry feature merger ("mlp", "avg")
+    use_hsic_fusion: bool = field(default=False)  # Whether to use HSIC-guided fusion with detached 3D projection
+    hsic_loss_weight: float = field(default=0.0)  # Weight for the RBF-HSIC auxiliary loss; the loss term is weight * HSIC for decorrelation
+    hsic_rbf_sigma_2d: float = field(default=1.0)  # RBF kernel sigma used for 2D features in HSIC; set to -1 for automatic estimation
+    hsic_rbf_sigma_3d: float = field(default=1.0)  # RBF kernel sigma used for 3D features in HSIC; set to -1 for automatic estimation
+    unique_3d_hsic_max_samples: int = field(default=-1)  # Max random token/feature points per sample for HSIC estimation; <= 0 uses all points
+    hsic_projector_hidden_size: Optional[int] = field(default=None)  # Hidden size of the detached 3D projection MLP
+    hsic_projector_dropout: float = field(default=0.1)  # Dropout of the detached 3D projection MLP
 
 @dataclass
 class DataArguments:

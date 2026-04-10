@@ -52,6 +52,11 @@ class VGLLM(lmms):
         max_image_size: Optional[int] = None,  # Only applicable if use_custom_video_loader is True
         max_length: Optional[int] = None,
         add_frame_index: bool=False,
+        use_hsic_fusion: Optional[bool] = None,
+        hsic_loss_weight: Optional[float] = None,
+        hsic_rbf_sigma_2d: Optional[float] = None,
+        hsic_rbf_sigma_3d: Optional[float] = None,
+        unique_3d_hsic_max_samples: Optional[int] = None,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -79,6 +84,16 @@ class VGLLM(lmms):
             self.device_map = f"cuda:{accelerator.local_process_index}"
 
         config = AutoConfig.from_pretrained(pretrained)
+        config_overrides = {
+            "use_hsic_fusion": use_hsic_fusion,
+            "hsic_loss_weight": hsic_loss_weight,
+            "hsic_rbf_sigma_2d": hsic_rbf_sigma_2d,
+            "hsic_rbf_sigma_3d": hsic_rbf_sigma_3d,
+            "unique_3d_hsic_max_samples": unique_3d_hsic_max_samples,
+        }
+        for key, value in config_overrides.items():
+            if value is not None:
+                setattr(config, key, value)
 
         if getattr(config, "use_geometry_encoder", False) or getattr(config, "use_vggt_feature", False):
             load_class = Qwen2_5_VLForConditionalGenerationWithVGGT

@@ -30,7 +30,7 @@ sys.path.append(str(project_root))
 
 import qwen_vl.train.trainer
 import qwen_vl.train.sampler
-from trainer import replace_qwen2_vl_attention_class
+from trainer import QwenLossLoggingTrainer, replace_qwen2_vl_attention_class
 
 from transformers import (
     Qwen2VLForConditionalGeneration,
@@ -42,7 +42,7 @@ from qwen_vl.train.argument import (
     DataArguments,
     TrainingArguments,
 )
-from transformers import AutoTokenizer, AutoProcessor, Qwen2VLImageProcessor, Trainer, AutoConfig, set_seed, enable_full_determinism
+from transformers import AutoTokenizer, AutoProcessor, Qwen2VLImageProcessor, AutoConfig, set_seed, enable_full_determinism
 
 local_rank = None
 
@@ -132,7 +132,14 @@ def train(attn_implementation="flash_attention_2"):
                 "reference_frame",
                 "feature_fusion_method", 
                 "fusion_num_layers",
-                "geometry_merger_type"
+                "geometry_merger_type",
+                "use_hsic_fusion",
+                "hsic_loss_weight",
+                "hsic_rbf_sigma_2d",
+                "hsic_rbf_sigma_3d",
+                "unique_3d_hsic_max_samples",
+                "hsic_projector_hidden_size",
+                "hsic_projector_dropout",
             ]:
                 setattr(config, k, getattr(model_args, k))
 
@@ -194,7 +201,7 @@ def train(attn_implementation="flash_attention_2"):
     if model_args.use_geometry_encoder:
         setattr(data_args, "use_geometry_encoder", model_args.use_geometry_encoder)
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
-    trainer = Trainer(
+    trainer = QwenLossLoggingTrainer(
         model=model, processing_class=tokenizer, args=training_args, **data_module
     )
 

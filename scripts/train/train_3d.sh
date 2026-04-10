@@ -14,6 +14,11 @@ NPROC_PER_NODE=$(nvidia-smi --list-gpus | wc -l)  # Automatically detects availa
 MODEL_PATH="Qwen/Qwen2.5-VL-7B-Instruct/"  # [ModelArguments] Pretrained model path
 GEOMETRY_ENCODER_TYPE="vggt"
 GEOMETRY_ENCODER_PATH="facebook/VGGT-1B"
+USE_HSIC_FUSION=true
+HSIC_LOSS_WEIGHT=10
+HSIC_RBF_SIGMA_2D=-1  # Set to -1 to auto-estimate sigma with the median heuristic
+HSIC_RBF_SIGMA_3D=-1  # Set to -1 to auto-estimate sigma with the median heuristic
+UNIQUE_3D_HSIC_MAX_SAMPLES=-1  # Max random token/feature points per sample for HSIC; <= 0 uses all points
 OUTPUT_DIR="PATH_TO_OUTPUT_DIR"                   # Directory for saving checkpoints
 CACHE_DIR="./cache"                        # [TrainingArguments] Cache directory for models
 mkdir -p $OUTPUT_DIR
@@ -27,7 +32,7 @@ DATASETS="scan2cap,scanrefer,scannet_det"                  # [DataArguments] Dat
 # Training Hyperparameters
 # ======================
 export NCCL_NVLS_ENABLE=0
-LR=1e-5
+LR=2e-5
 total_batch_size=64
 GRADIENT_ACCUMULATION_STEPS=$(($total_batch_size / $NPROC_PER_NODE))
 
@@ -74,5 +79,10 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --use_geometry_encoder True \
             --geometry_encoder_type $GEOMETRY_ENCODER_TYPE \
             --geometry_encoder_path $GEOMETRY_ENCODER_PATH \
+            --use_hsic_fusion $USE_HSIC_FUSION \
+            --hsic_loss_weight $HSIC_LOSS_WEIGHT \
+            --hsic_rbf_sigma_2d $HSIC_RBF_SIGMA_2D \
+            --hsic_rbf_sigma_3d $HSIC_RBF_SIGMA_3D \
+            --unique_3d_hsic_max_samples $UNIQUE_3D_HSIC_MAX_SAMPLES \
             --feature_fusion_method "add" \
             > ${OUTPUT_DIR}/train.log 2>&1

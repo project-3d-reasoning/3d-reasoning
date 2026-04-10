@@ -1,5 +1,5 @@
 import os
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import datasets
 import torch
@@ -18,11 +18,20 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
 )
 from transformers.trainer import (
     ALL_LAYERNORM_LAYERS,
+    DistributedType,
+    OptimizerNames,
+    clear_device_cache,
     get_parameter_names,
     has_length,
     is_sagemaker_mp_enabled,
+    is_torch_xla_available,
+    nested_gather,
+    smp_forward_backward,
 )
-from transformers.trainer_utils import seed_worker
+from transformers.trainer_utils import SaveStrategy, seed_worker
+
+if is_torch_xla_available():
+    import torch_xla.core.xla_model as xm
 
 
 def _flash_attention_forward(
@@ -385,6 +394,164 @@ def create_optimizer(self):
         self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
 
     return self.optimizer
+
+
+class QwenLossLoggingTrainer(Trainer):
+    """Trainer that backpropagates the full loss but logs CE and HSIC components separately."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._tr_loss_hsic_raw = None
+        self._tr_loss_hsic_weighted = None
+
+    @staticmethod
+    def _get_output_value(outputs: Any, key: str, default: Optional[torch.Tensor] = None):
+        if isinstance(outputs, dict):
+            return outputs.get(key, default)
+        return getattr(outputs, key, default)
+
+    def _ensure_aux_loss_buffers(self, reference: torch.Tensor) -> None:
+        if self._tr_loss_hsic_raw is None or self._tr_loss_hsic_weighted is None:
+            zero = reference.detach().new_zeros(())
+            self._tr_loss_hsic_raw = zero.clone()
+            self._tr_loss_hsic_weighted = zero.clone()
+
+    def training_step(
+        self,
+        model: nn.Module,
+        inputs: dict[str, torch.Tensor | Any],
+        num_items_in_batch: torch.Tensor | int | None = None,
+    ) -> torch.Tensor:
+        cp_context, inputs = self._prepare_context_parallel_inputs(model, inputs)
+
+        with cp_context():
+            model.train()
+            if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
+                self.optimizer.train()
+
+            inputs = self._prepare_inputs(inputs)
+            if is_sagemaker_mp_enabled():
+                loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
+                return loss_mb.reduce_mean().detach().to(self.args.device)
+
+            with self.compute_loss_context_manager():
+                loss, outputs = self.compute_loss(
+                    model,
+                    inputs,
+                    return_outputs=True,
+                    num_items_in_batch=num_items_in_batch,
+                )
+
+            ce_loss = self._get_output_value(outputs, "ce_loss", loss)
+            hsic_loss_raw = self._get_output_value(outputs, "hsic_loss_raw")
+            hsic_loss_weighted = self._get_output_value(outputs, "hsic_loss_weighted")
+
+            if not isinstance(ce_loss, torch.Tensor):
+                ce_loss = loss.detach().new_tensor(float(ce_loss))
+            zero = loss.detach().new_zeros(())
+            if hsic_loss_raw is None:
+                hsic_loss_raw = zero
+            elif not isinstance(hsic_loss_raw, torch.Tensor):
+                hsic_loss_raw = zero.new_tensor(float(hsic_loss_raw))
+            if hsic_loss_weighted is None:
+                hsic_loss_weighted = zero
+            elif not isinstance(hsic_loss_weighted, torch.Tensor):
+                hsic_loss_weighted = zero.new_tensor(float(hsic_loss_weighted))
+
+            del inputs
+            if (
+                self.args.torch_empty_cache_steps is not None
+                and self.state.global_step % self.args.torch_empty_cache_steps == 0
+            ):
+                clear_device_cache()
+
+            kwargs = {}
+
+            if self.args.optim in [OptimizerNames.LOMO, OptimizerNames.ADALOMO]:
+                kwargs["learning_rate"] = self._get_learning_rate()
+
+            if self.args.n_gpu > 1:
+                loss = loss.mean()
+                ce_loss = ce_loss.mean()
+                hsic_loss_raw = hsic_loss_raw.mean()
+                hsic_loss_weighted = hsic_loss_weighted.mean()
+
+            if (not self.model_accepts_loss_kwargs or num_items_in_batch is None) and self.compute_loss_func is None:
+                loss = loss / self.current_gradient_accumulation_steps
+                ce_loss = ce_loss / self.current_gradient_accumulation_steps
+                hsic_loss_raw = hsic_loss_raw / self.current_gradient_accumulation_steps
+                hsic_loss_weighted = hsic_loss_weighted / self.current_gradient_accumulation_steps
+
+            if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
+                kwargs["scale_wrt_gas"] = False
+
+            self._ensure_aux_loss_buffers(loss)
+            self._tr_loss_hsic_raw += hsic_loss_raw.detach()
+            self._tr_loss_hsic_weighted += hsic_loss_weighted.detach()
+
+            self.accelerator.backward(loss, **kwargs)
+
+            return ce_loss.detach()
+
+    def _maybe_log_save_evaluate(
+        self,
+        tr_loss: torch.Tensor,
+        grad_norm: torch.Tensor | float | None,
+        model: nn.Module,
+        trial: "optuna.Trial | dict[str, Any] | None",
+        epoch: float,
+        ignore_keys_for_eval: list[str] | None,
+        start_time: float,
+        learning_rate: float | None = None,
+    ) -> None:
+        if self.control.should_log and self.state.global_step > self._globalstep_last_logged:
+            if is_torch_xla_available():
+                xm.mark_step()
+
+            logs: dict[str, float] = {}
+            step_delta = self.state.global_step - self._globalstep_last_logged
+
+            tr_loss_scalar = nested_gather(tr_loss, self.args.parallel_mode).mean().item()
+            tr_loss -= tr_loss
+
+            ce_loss_avg = tr_loss_scalar / step_delta
+            logs["loss"] = ce_loss_avg
+            logs["Loss_ce"] = ce_loss_avg
+
+            if self._tr_loss_hsic_raw is not None and self._tr_loss_hsic_weighted is not None:
+                hsic_loss_raw_scalar = nested_gather(self._tr_loss_hsic_raw, self.args.parallel_mode).mean().item()
+                hsic_loss_weighted_scalar = nested_gather(
+                    self._tr_loss_hsic_weighted, self.args.parallel_mode
+                ).mean().item()
+                self._tr_loss_hsic_raw -= self._tr_loss_hsic_raw
+                self._tr_loss_hsic_weighted -= self._tr_loss_hsic_weighted
+                logs["Loss_hsic_raw"] = hsic_loss_raw_scalar / step_delta
+                logs["Loss_hsic_weighted"] = hsic_loss_weighted_scalar / step_delta
+
+            if grad_norm is not None:
+                logs["grad_norm"] = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+            if learning_rate is not None:
+                logs["learning_rate"] = learning_rate
+            else:
+                logs["learning_rate"] = self._get_learning_rate()
+
+            self._total_loss_scalar += tr_loss_scalar
+            self._globalstep_last_logged = self.state.global_step
+            self.store_flos()
+
+            self.log(logs, start_time)
+
+        metrics = None
+        if self.control.should_evaluate:
+            metrics = self._evaluate(trial, ignore_keys_for_eval)
+            is_new_best_metric = self._determine_best_metric(metrics=metrics, trial=trial)
+
+            if self.args.save_strategy == SaveStrategy.BEST:
+                self.control.should_save = is_new_best_metric
+
+        if self.control.should_save:
+            self._save_checkpoint(model, trial)
+            self.control = self.callback_handler.on_save(self.args, self.state, self.control)
 
 
 # Apply monkey patches
