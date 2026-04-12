@@ -6,7 +6,14 @@
 # ======================
 MASTER_ADDR="127.0.0.1"                     # [Required] Master node IP for multi-GPU training
 MASTER_PORT=$(shuf -i 20000-29999 -n 1)     # Random port to avoid conflicts
-NPROC_PER_NODE=$(nvidia-smi --list-gpus | wc -l)  # Automatically detects available GPUs
+if [ -z "${NPROC_PER_NODE:-}" ]; then
+    if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+        IFS=',' read -r -a visible_gpu_array <<< "$CUDA_VISIBLE_DEVICES"
+        NPROC_PER_NODE=${#visible_gpu_array[@]}
+    else
+        NPROC_PER_NODE=$(nvidia-smi --list-gpus | wc -l)
+    fi
+fi
 
 # ======================
 # Path Configuration
@@ -15,6 +22,7 @@ MODEL_PATH="Qwen/Qwen2.5-VL-7B-Instruct/"  # [ModelArguments] Pretrained model p
 GEOMETRY_ENCODER_TYPE="vggt"
 GEOMETRY_ENCODER_PATH="facebook/VGGT-1B"
 USE_HSIC_FUSION=true
+BACKPROP_HSIC_LOSS=true  # Set to false to log HSIC without adding it to the total loss
 HSIC_LOSS_WEIGHT=1e-3
 HSIC_RBF_SIGMA_2D=1.0  # Set to -1 to auto-estimate sigma with the median heuristic
 HSIC_RBF_SIGMA_3D=1.0  # Set to -1 to auto-estimate sigma with the median heuristic
@@ -22,6 +30,7 @@ UNIQUE_3D_HSIC_MAX_SAMPLES=-1  # Max random token/feature points per sample for 
 OUTPUT_DIR="PATH_TO_OUTPUT_DIR"                   # Directory for saving checkpoints
 CACHE_DIR="./cache"                        # [TrainingArguments] Cache directory for models
 mkdir -p $OUTPUT_DIR
+echo "Using CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-all} with NPROC_PER_NODE=$NPROC_PER_NODE"
 
 # ======================
 # Model Configuration
@@ -33,6 +42,10 @@ DATASETS="spar_234k,llava_hound_64k"                  # [DataArguments] Dataset 
 # ======================
 LR=1e-5
 total_batch_size=64
+if [ $((total_batch_size % NPROC_PER_NODE)) -ne 0 ]; then
+    echo "total_batch_size=$total_batch_size must be divisible by NPROC_PER_NODE=$NPROC_PER_NODE" >&2
+    exit 1
+fi
 GRADIENT_ACCUMULATION_STEPS=$(($total_batch_size / $NPROC_PER_NODE))
 
 torchrun --nproc_per_node=$NPROC_PER_NODE \
@@ -79,6 +92,7 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --geometry_encoder_type $GEOMETRY_ENCODER_TYPE \
             --geometry_encoder_path $GEOMETRY_ENCODER_PATH \
             --use_hsic_fusion $USE_HSIC_FUSION \
+            --backprop_hsic_loss $BACKPROP_HSIC_LOSS \
             --hsic_loss_weight $HSIC_LOSS_WEIGHT \
             --hsic_rbf_sigma_2d $HSIC_RBF_SIGMA_2D \
             --hsic_rbf_sigma_3d $HSIC_RBF_SIGMA_3D \

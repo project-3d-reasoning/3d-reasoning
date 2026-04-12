@@ -134,6 +134,7 @@ def train(attn_implementation="flash_attention_2"):
                 "fusion_num_layers",
                 "geometry_merger_type",
                 "use_hsic_fusion",
+                "backprop_hsic_loss",
                 "hsic_loss_weight",
                 "hsic_rbf_sigma_2d",
                 "hsic_rbf_sigma_3d",

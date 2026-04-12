@@ -15,6 +15,7 @@ class FeatureFusionConfig:
     dropout: float = 0.1
     num_layers: int = 1
     use_hsic_fusion: bool = False
+    backprop_hsic_loss: bool = True
     hsic_loss_weight: float = 0.0
     hsic_rbf_sigma_2d: float = 1.0
     hsic_rbf_sigma_3d: float = 1.0
@@ -255,12 +256,12 @@ class FeatureFusionModule(nn.Module):
             zero = detached_features.new_zeros(())
             return {
                 f"{prefix}_mean": zero,
-                f"{prefix}_var": zero,
+                f"{prefix}_std": zero,
             }
 
         return {
             f"{prefix}_mean": detached_features.mean(),
-            f"{prefix}_var": detached_features.var(unbiased=False),
+            f"{prefix}_std": detached_features.std(unbiased=False),
         }
 
     @staticmethod
@@ -331,7 +332,11 @@ class FeatureFusionModule(nn.Module):
         aux_stats = None
         if self.config.use_hsic_fusion:
             if compute_aux_loss:
-                hsic_loss_raw = self._compute_rbf_hsic(features_2d, features_3d)
+                if self.config.backprop_hsic_loss:
+                    hsic_loss_raw = self._compute_rbf_hsic(features_2d, features_3d)
+                else:
+                    with torch.no_grad():
+                        hsic_loss_raw = self._compute_rbf_hsic(features_2d, features_3d)
                 hsic_loss_weighted = self.config.hsic_loss_weight * hsic_loss_raw
 
             feature_3d_projected = self.feature_3d_projector(features_3d)

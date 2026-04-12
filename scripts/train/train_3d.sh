@@ -6,7 +6,14 @@
 # ======================
 MASTER_ADDR="127.0.0.1"                     # [Required] Master node IP for multi-GPU training
 MASTER_PORT=$(shuf -i 20000-29999 -n 1)     # Random port to avoid conflicts
-NPROC_PER_NODE=4  # Automatically detects available GPUs
+if [ -z "${NPROC_PER_NODE:-}" ]; then
+    if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+        IFS=',' read -r -a visible_gpu_array <<< "$CUDA_VISIBLE_DEVICES"
+        NPROC_PER_NODE=${#visible_gpu_array[@]}
+    else
+        NPROC_PER_NODE=$(nvidia-smi --list-gpus | wc -l)
+    fi
+fi
 
 # ======================
 # Path Configuration
@@ -15,6 +22,7 @@ MODEL_PATH="/inspire/hdd/project/qproject-fundationmodel/public/yxliu/test/Demon
 GEOMETRY_ENCODER_TYPE="vggt"
 GEOMETRY_ENCODER_PATH="/inspire/hdd/project/qproject-fundationmodel/public/yxliu/test/Demongorgan/VG-LLM/models/VGGT-1B"
 USE_HSIC_FUSION=true
+BACKPROP_HSIC_LOSS=true  # Set to false to log HSIC without adding it to the total loss
 HSIC_LOSS_WEIGHT=10
 HSIC_RBF_SIGMA_2D=-1  # Set to -1 to auto-estimate sigma with the median heuristic
 HSIC_RBF_SIGMA_3D=-1  # Set to -1 to auto-estimate sigma with the median heuristic
@@ -22,6 +30,7 @@ UNIQUE_3D_HSIC_MAX_SAMPLES=-1  # Max random token/feature points per sample for 
 OUTPUT_DIR="PATH_TO_OUTPUT_DIR"                   # Directory for saving checkpoints
 CACHE_DIR="./cache"                        # [TrainingArguments] Cache directory for models
 mkdir -p $OUTPUT_DIR
+echo "Using CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-all} with NPROC_PER_NODE=$NPROC_PER_NODE"
 
 # ======================
 # Model Configuration
@@ -34,6 +43,10 @@ DATASETS="scan2cap,scanrefer,scannet_det"                  # [DataArguments] Dat
 export NCCL_NVLS_ENABLE=0
 LR=2e-5
 total_batch_size=64
+if [ $((total_batch_size % NPROC_PER_NODE)) -ne 0 ]; then
+    echo "total_batch_size=$total_batch_size must be divisible by NPROC_PER_NODE=$NPROC_PER_NODE" >&2
+    exit 1
+fi
 GRADIENT_ACCUMULATION_STEPS=$(($total_batch_size / $NPROC_PER_NODE))
 
 torchrun --nproc_per_node=$NPROC_PER_NODE \
@@ -51,7 +64,7 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --per_device_train_batch_size 1 \
             --gradient_accumulation_steps $GRADIENT_ACCUMULATION_STEPS \
             --learning_rate $LR \
-            --mm_projector_lr 1e-5 \
+            --mm_projector_lr 2e-5 \
             --vision_tower_lr 1e-6 \
             --optim adamw_torch \
             --model_max_length 12800 \
@@ -68,7 +81,7 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --lr_scheduler_type "cosine" \
             --weight_decay 0.01 \
             --logging_steps 10 \
-            --save_steps 1000 \
+            --save_steps 500 \
             --save_total_limit 1 \
             --deepspeed "scripts/zero2_opt.json" \
             --gradient_checkpointing \
@@ -80,6 +93,7 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --geometry_encoder_type $GEOMETRY_ENCODER_TYPE \
             --geometry_encoder_path $GEOMETRY_ENCODER_PATH \
             --use_hsic_fusion $USE_HSIC_FUSION \
+            --backprop_hsic_loss $BACKPROP_HSIC_LOSS \
             --hsic_loss_weight $HSIC_LOSS_WEIGHT \
             --hsic_rbf_sigma_2d $HSIC_RBF_SIGMA_2D \
             --hsic_rbf_sigma_3d $HSIC_RBF_SIGMA_3D \

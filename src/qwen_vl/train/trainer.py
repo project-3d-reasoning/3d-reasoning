@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import datasets
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from flash_attn.flash_attn_interface import flash_attn_varlen_func
 from torch.utils.data import DataLoader, Sampler
 from transformers import Trainer
@@ -234,8 +235,11 @@ def create_optimizer(self):
         decay_parameters = get_parameter_names(opt_model, ALL_LAYERNORM_LAYERS)
         decay_parameters = [name for name in decay_parameters if "bias" not in name]
         if self.args.mm_projector_lr is not None and self.args.mm_projector_lr != 0:
+            mm_projector_keywords = ("merger", "feature_3d_projector")
             projector_parameters = [
-                name for name, _ in opt_model.named_parameters() if "merger" in name
+                name
+                for name, _ in opt_model.named_parameters()
+                if any(keyword in name for keyword in mm_projector_keywords)
             ]
             if self.args.vision_tower_lr is not None and self.args.vision_tower_lr != 0:
                 vision_tower_parameters = [
@@ -409,9 +413,9 @@ class QwenLossLoggingTrainer(Trainer):
 
     FEATURE_STAT_KEYS = (
         "unique_3d_projected_mean",
-        "unique_3d_projected_var",
+        "unique_3d_projected_std",
         "feature_2d_mean",
-        "feature_2d_var",
+        "feature_2d_std",
     )
 
     def __init__(self, *args, **kwargs):
@@ -470,6 +474,18 @@ class QwenLossLoggingTrainer(Trainer):
             "current_gradient_accumulation_steps",
             self.args.gradient_accumulation_steps,
         )
+
+    @staticmethod
+    def _average_scalar_tensors_for_logging(values: Dict[str, torch.Tensor]) -> Dict[str, float]:
+        if not values:
+            return {}
+
+        keys = list(values.keys())
+        stacked = torch.stack([values[key].detach().float().reshape(()) for key in keys])
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(stacked, op=dist.ReduceOp.SUM)
+            stacked /= dist.get_world_size()
+        return {key: stacked[idx].item() for idx, key in enumerate(keys)}
 
     def training_step(
         self,
@@ -585,7 +601,17 @@ class QwenLossLoggingTrainer(Trainer):
             logs: dict[str, float] = {}
             step_delta = self.state.global_step - self._globalstep_last_logged
 
-            tr_loss_scalar = self._nested_gather(tr_loss).mean().item()
+            logging_scalars = {"tr_loss": tr_loss}
+            if self._tr_loss_hsic_raw is not None and self._tr_loss_hsic_weighted is not None:
+                logging_scalars["hsic_loss_raw"] = self._tr_loss_hsic_raw
+                logging_scalars["hsic_loss_weighted"] = self._tr_loss_hsic_weighted
+            if self._tr_feature_stats:
+                for key, value in self._tr_feature_stats.items():
+                    logging_scalars[key] = value
+
+            reduced_logging_scalars = self._average_scalar_tensors_for_logging(logging_scalars)
+
+            tr_loss_scalar = reduced_logging_scalars["tr_loss"]
             tr_loss -= tr_loss
 
             ce_loss_avg = tr_loss_scalar / step_delta
@@ -593,8 +619,8 @@ class QwenLossLoggingTrainer(Trainer):
             logs["Loss_ce"] = ce_loss_avg
 
             if self._tr_loss_hsic_raw is not None and self._tr_loss_hsic_weighted is not None:
-                hsic_loss_raw_scalar = self._nested_gather(self._tr_loss_hsic_raw).mean().item()
-                hsic_loss_weighted_scalar = self._nested_gather(self._tr_loss_hsic_weighted).mean().item()
+                hsic_loss_raw_scalar = reduced_logging_scalars["hsic_loss_raw"]
+                hsic_loss_weighted_scalar = reduced_logging_scalars["hsic_loss_weighted"]
                 self._tr_loss_hsic_raw -= self._tr_loss_hsic_raw
                 self._tr_loss_hsic_weighted -= self._tr_loss_hsic_weighted
                 logs["Loss_hsic_raw"] = hsic_loss_raw_scalar / step_delta
@@ -602,7 +628,7 @@ class QwenLossLoggingTrainer(Trainer):
 
             if self._tr_feature_stats:
                 for key, value in self._tr_feature_stats.items():
-                    stat_scalar = self._nested_gather(value).mean().item()
+                    stat_scalar = reduced_logging_scalars[key]
                     logs[key] = stat_scalar / step_delta
                     self._tr_feature_stats[key] -= self._tr_feature_stats[key]
 

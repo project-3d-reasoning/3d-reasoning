@@ -53,6 +53,7 @@ class VGLLM(lmms):
         max_length: Optional[int] = None,
         add_frame_index: bool=False,
         use_hsic_fusion: Optional[bool] = None,
+        backprop_hsic_loss: Optional[bool] = None,
         hsic_loss_weight: Optional[float] = None,
         hsic_rbf_sigma_2d: Optional[float] = None,
         hsic_rbf_sigma_3d: Optional[float] = None,
@@ -86,6 +87,7 @@ class VGLLM(lmms):
         config = AutoConfig.from_pretrained(pretrained)
         config_overrides = {
             "use_hsic_fusion": use_hsic_fusion,
+            "backprop_hsic_loss": backprop_hsic_loss,
             "hsic_loss_weight": hsic_loss_weight,
             "hsic_rbf_sigma_2d": hsic_rbf_sigma_2d,
             "hsic_rbf_sigma_3d": hsic_rbf_sigma_3d,

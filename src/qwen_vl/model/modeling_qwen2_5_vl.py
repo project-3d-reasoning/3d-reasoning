@@ -1494,9 +1494,9 @@ class Qwen2_5_VLCausalLMOutputWithPast(ModelOutput):
     hsic_loss_raw: Optional[torch.FloatTensor] = None
     hsic_loss_weighted: Optional[torch.FloatTensor] = None
     unique_3d_projected_mean: Optional[torch.FloatTensor] = None
-    unique_3d_projected_var: Optional[torch.FloatTensor] = None
+    unique_3d_projected_std: Optional[torch.FloatTensor] = None
     feature_2d_mean: Optional[torch.FloatTensor] = None
-    feature_2d_var: Optional[torch.FloatTensor] = None
+    feature_2d_std: Optional[torch.FloatTensor] = None
     logits: torch.FloatTensor = None
     past_key_values: Optional[List[torch.FloatTensor]] = None
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
@@ -1630,6 +1630,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             dropout=getattr(config, "fusion_dropout", 0.1),
             num_layers=getattr(config, "fusion_num_layers", 1),
             use_hsic_fusion=getattr(config, "use_hsic_fusion", False),
+            backprop_hsic_loss=getattr(config, "backprop_hsic_loss", True),
             hsic_loss_weight=getattr(config, "hsic_loss_weight", 0.0),
             hsic_rbf_sigma_2d=getattr(config, "hsic_rbf_sigma_2d", 1.0),
             hsic_rbf_sigma_3d=getattr(config, "hsic_rbf_sigma_3d", 1.0),
@@ -2065,7 +2066,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             shift_labels = shift_labels.to(shift_logits.device)
             ce_loss = loss_fct(shift_logits, shift_labels)
             loss = ce_loss
-        if fusion_hsic_loss_weighted is not None:
+        if fusion_hsic_loss_weighted is not None and getattr(self.config, "backprop_hsic_loss", True):
             loss = fusion_hsic_loss_weighted if loss is None else loss + fusion_hsic_loss_weighted
 
         if not return_dict:
@@ -2078,9 +2079,9 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             hsic_loss_raw=fusion_hsic_loss_raw,
             hsic_loss_weighted=fusion_hsic_loss_weighted,
             unique_3d_projected_mean=None if fusion_stats is None else fusion_stats.get("unique_3d_projected_mean"),
-            unique_3d_projected_var=None if fusion_stats is None else fusion_stats.get("unique_3d_projected_var"),
+            unique_3d_projected_std=None if fusion_stats is None else fusion_stats.get("unique_3d_projected_std"),
             feature_2d_mean=None if fusion_stats is None else fusion_stats.get("feature_2d_mean"),
-            feature_2d_var=None if fusion_stats is None else fusion_stats.get("feature_2d_var"),
+            feature_2d_std=None if fusion_stats is None else fusion_stats.get("feature_2d_std"),
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
