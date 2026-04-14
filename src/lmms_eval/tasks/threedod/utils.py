@@ -28,6 +28,17 @@ cate31 = [
     "window", "shelf", "curtain", "plant", "stairs", "picture", "book", "bottle", "lamp", "towl", "sink",
 ]
 
+_CORNERS_NORM = None
+
+def _get_corners_norm():
+    global _CORNERS_NORM
+    if _CORNERS_NORM is None:
+        raw = torch.from_numpy(
+            np.stack(np.unravel_index(np.arange(8), [2] * 3), axis=1)
+        ).float()
+        _CORNERS_NORM = (raw[[0, 1, 3, 2, 4, 5, 7, 6]] - 0.5).clone()
+    return _CORNERS_NORM
+
 def rotation_3d_in_euler(points, angles, convention, return_mat=False, clockwise=False):
     """Rotate points by angles according to axis.
 
@@ -262,15 +273,9 @@ class EulerDepthInstance3DBoxes:
             return torch.empty([0, 8, 3], device=self.tensor.device)
 
         dims = self.dims
-        corners_norm = torch.from_numpy(
-            np.stack(np.unravel_index(np.arange(8), [2] * 3),
-                     axis=1)).to(device=dims.device, dtype=dims.dtype)
-
-        corners_norm = corners_norm[[0, 1, 3, 2, 4, 5, 7, 6]]
-        # use relative origin
         assert self.origin == (0.5, 0.5, 0.5), \
             'self.origin != (0.5, 0.5, 0.5) needs to be checked!'
-        corners_norm = corners_norm - dims.new_tensor(self.origin)
+        corners_norm = _get_corners_norm().to(device=dims.device, dtype=dims.dtype)
         corners = dims.view([-1, 1, 3]) * corners_norm.reshape([1, 8, 3])
 
         # rotate
@@ -304,46 +309,61 @@ def threedod_doc_to_visual(doc):
 
 
 def threedod_doc_to_text(doc, lmms_eval_specific_kwargs=None):
-    prompt = doc["conversations"][0]["value"].replace("<image>", "")
+    prompt = doc["conversations"][0]["value"].replace("<image>\n", "<image>").replace("<image>", "").lstrip("\n")
     return prompt
 
 
 
 def compute_ap(gt_bbox_dict, pred_bbox_dict, iou_threshold=0.25):
 
-    all_tp = defaultdict()
-    all_fp = defaultdict()
-    all_fn = defaultdict()
-    used_gt = defaultdict(set)
+    all_tp = {}
+    all_fp = {}
+    all_fn = {}
+    used_gt_counts = {}
+
     for category in pred_bbox_dict:
-        for bbox in pred_bbox_dict[category]:
-            gt_box_match = -1
-            max_iou = 0
-            for i, gt_box in enumerate(gt_bbox_dict[category]):
-                if i in used_gt[category]:
-                    continue
-                try:
-                    iou = EulerDepthInstance3DBoxes.overlaps(
-                        EulerDepthInstance3DBoxes(torch.tensor([bbox]), convention="ZXY"),
-                        EulerDepthInstance3DBoxes(torch.tensor([gt_box]), convention="ZXY")
-                    )
-                except Exception as e:
-                    eval_logger.error(f"Error calculating IOU: {e}")
-                    iou = 0
-                if iou > max_iou:
-                    max_iou = iou
-                    gt_box_match = i
-            
-            if max_iou > iou_threshold:
-                used_gt[category].add(gt_box_match)
-                all_tp[category] = all_tp.get(category, 0) + 1
+        pred_boxes = pred_bbox_dict[category]
+        gt_boxes = gt_bbox_dict.get(category, [])
+        num_pred = len(pred_boxes)
+        num_gt = len(gt_boxes)
+
+        if num_gt == 0:
+            all_fp[category] = num_pred
+            used_gt_counts[category] = 0
+            continue
+
+        try:
+            pred_tensor = torch.as_tensor(np.array(pred_boxes), dtype=torch.float32)
+            gt_tensor = torch.as_tensor(np.array(gt_boxes), dtype=torch.float32)
+            pred_box3d = EulerDepthInstance3DBoxes(pred_tensor, convention="ZXY")
+            gt_box3d = EulerDepthInstance3DBoxes(gt_tensor, convention="ZXY")
+            iou_matrix = EulerDepthInstance3DBoxes.overlaps(pred_box3d, gt_box3d)
+        except Exception as e:
+            eval_logger.error(f"Error calculating IOU for category {category}: {e}")
+            all_fp[category] = num_pred
+            used_gt_counts[category] = 0
+            continue
+
+        tp = 0
+        fp = 0
+        used_mask = torch.zeros(num_gt, dtype=torch.bool)
+        for pred_idx in range(num_pred):
+            iou_row = iou_matrix[pred_idx].clone()
+            iou_row[used_mask] = 0
+            max_iou, best_gt = iou_row.max(dim=0)
+            if max_iou.item() > iou_threshold:
+                used_mask[best_gt.item()] = True
+                tp += 1
             else:
-                all_fp[category] = all_fp.get(category, 0) + 1
-    
+                fp += 1
+
+        all_tp[category] = tp
+        all_fp[category] = fp
+        used_gt_counts[category] = int(used_mask.sum().item())
+
     for category in gt_bbox_dict:
-        for i, gt_box in enumerate(gt_bbox_dict[category]):
-            if i not in used_gt[category]:
-                all_fn[category] = all_fn.get(category, 0) + 1        
+        matched = used_gt_counts.get(category, 0)
+        all_fn[category] = len(gt_bbox_dict[category]) - matched
 
     categories = set(pred_bbox_dict.keys()) | set(gt_bbox_dict.keys())
     ret = {

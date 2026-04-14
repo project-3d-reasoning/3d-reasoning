@@ -38,7 +38,7 @@ def scan2cap_doc_to_visual(doc):
 
 
 def scan2cap_doc_to_text(doc, lmms_eval_specific_kwargs=None):
-    question = doc["conversations"][0]["value"].replace("<image>", "")
+    question = doc["conversations"][0]["value"].replace("<image>", "").lstrip("\n")
     return question
 
 
