@@ -1811,7 +1811,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                             )
                         )
 
-                    unique_3d_projected = self.unique_3d_projector(unique_3d.detach())
+                    unique_3d_projected = self.unique_3d_projector(unique_3d)
                     unique_3d_positions = self._build_unique_3d_positions(
                         num_images=unique_3d_projected.shape[0],
                         h_grid=unique_3d_projected.shape[1],
