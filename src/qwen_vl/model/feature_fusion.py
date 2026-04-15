@@ -349,26 +349,39 @@ def _sample_features_for_hsic(x: torch.Tensor, y: torch.Tensor, max_samples: int
     return x, y
 
 
-def _resolve_rbf_sigma(x: torch.Tensor, sigma: float) -> torch.Tensor:
-    if sigma is not None and sigma > 0:
-        return x.new_tensor(float(sigma))
+def _pairwise_squared_distances(features: torch.Tensor) -> torch.Tensor:
+    features_norm = (features ** 2).sum(dim=-1, keepdim=True)
+    distances = features_norm + features_norm.transpose(-2, -1) - 2.0 * torch.matmul(features, features.transpose(-2, -1))
+    return distances.clamp_min(0.0)
 
-    if x.shape[0] <= 1:
-        return x.new_tensor(1.0)
+
+def _center_kernel(kernel: torch.Tensor) -> torch.Tensor:
+    row_mean = kernel.mean(dim=-1, keepdim=True)
+    col_mean = kernel.mean(dim=-2, keepdim=True)
+    total_mean = kernel.mean(dim=(-2, -1), keepdim=True)
+    return kernel - row_mean - col_mean + total_mean
+
+
+def _resolve_rbf_sigma(distances: torch.Tensor, sigma: float) -> torch.Tensor:
+    sigma = float(sigma)
+    if sigma != -1:
+        return distances.new_tensor(max(sigma, 1e-6))
+
+    if distances.shape[-1] <= 1:
+        return distances.new_tensor(1.0)
 
     with torch.no_grad():
-        distances = torch.cdist(x, x, p=2).pow(2)
-        positive = distances[distances > 0]
+        non_diagonal_mask = ~torch.eye(distances.shape[-1], dtype=torch.bool, device=distances.device)
+        positive = distances.masked_select(non_diagonal_mask & (distances > 0))
         if positive.numel() == 0:
-            return x.new_tensor(1.0)
-        sigma_sq = positive.median().clamp_min(1e-6)
-    return sigma_sq.sqrt()
+            return distances.new_tensor(1.0)
+        sigma_estimate = positive.median().sqrt().clamp_min(1e-6)
+    return sigma_estimate
 
 
-def _rbf_kernel(x: torch.Tensor, sigma: float) -> torch.Tensor:
-    sigma_tensor = _resolve_rbf_sigma(x, sigma)
+def _rbf_kernel(distances: torch.Tensor, sigma: float) -> torch.Tensor:
+    sigma_tensor = _resolve_rbf_sigma(distances, sigma)
     sigma_sq = sigma_tensor.pow(2).clamp_min(1e-6)
-    distances = torch.cdist(x, x, p=2).pow(2)
     return torch.exp(-distances / (2.0 * sigma_sq))
 
 
@@ -397,13 +410,12 @@ def compute_rbf_hsic_loss(
     if num_samples <= 1:
         return x.new_zeros(())
 
-    kernel_x = _rbf_kernel(x, sigma_x)
-    kernel_y = _rbf_kernel(y, sigma_y)
-    center = torch.eye(num_samples, device=x.device, dtype=x.dtype) - 1.0 / num_samples
-    kernel_x = center @ kernel_x @ center
-    kernel_y = center @ kernel_y @ center
+    distances_x = _pairwise_squared_distances(x)
+    distances_y = _pairwise_squared_distances(y)
+    kernel_x = _center_kernel(_rbf_kernel(distances_x, sigma_x))
+    kernel_y = _center_kernel(_rbf_kernel(distances_y, sigma_y))
     hsic = (kernel_x * kernel_y).sum() / ((num_samples - 1) ** 2)
-    return hsic.clamp_min(0.0)
+    return hsic.mean().clamp_min(0.0)
 
 
 class GeometryFeatureMerger(nn.Module):
