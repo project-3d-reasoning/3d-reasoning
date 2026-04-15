@@ -2140,6 +2140,10 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                         prefix_embeds,
                         cache_position,
                     )
+                    # Prefix insertion changes the effective token layout, so any
+                    # precomputed position ids from the dataloader are now stale.
+                    position_ids = None
+                    self.rope_deltas = None
 
                 n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
                 n_image_features = image_embeds.shape[0]
