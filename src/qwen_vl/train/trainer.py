@@ -1,10 +1,11 @@
+import contextlib
 import os
-from collections import defaultdict
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import datasets
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from flash_attn.flash_attn_interface import flash_attn_varlen_func
 from torch.utils.data import DataLoader, Sampler
 from transformers import Trainer
@@ -19,15 +20,27 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
 )
 from transformers.trainer import (
     ALL_LAYERNORM_LAYERS,
+    DistributedType,
+    OptimizerNames,
     get_parameter_names,
     has_length,
     is_sagemaker_mp_enabled,
+    is_torch_xla_available,
 )
-from transformers.trainer_utils import seed_worker
+from transformers.trainer_utils import SaveStrategy, seed_worker
 
+try:
+    from transformers.trainer import clear_device_cache
+except ImportError:
+    from accelerate.utils.memory import clear_device_cache
 
-ORIGINAL_TRAINER_COMPUTE_LOSS = Trainer.compute_loss
-ORIGINAL_TRAINER_LOG = Trainer.log
+if is_sagemaker_mp_enabled():
+    from transformers.trainer_pt_utils import smp_forward_backward
+else:
+    smp_forward_backward = None
+
+if is_torch_xla_available():
+    import torch_xla.core.xla_model as xm
 
 
 def _flash_attention_forward(
@@ -396,75 +409,251 @@ def create_optimizer(self):
 
     return self.optimizer
 
+class QwenLossLoggingTrainer(Trainer):
+    """Trainer that backpropagates the full loss but logs CE and HSIC components separately."""
 
-def _store_loss_metric(self, split: str, name: str, value: Optional[torch.Tensor]) -> None:
-    if value is None:
-        return
-
-    if not hasattr(self, "_stored_loss_metrics"):
-        self._stored_loss_metrics = {
-            "train": defaultdict(list),
-            "eval": defaultdict(list),
+    @staticmethod
+    def _get_output_value(
+        outputs: Any,
+        key: str,
+        default: Optional[torch.Tensor] = None,
+    ):
+        aliases = {
+            "ce_loss": ("ce_loss", "loss_ce"),
+            "hsic_loss_raw": ("hsic_loss_raw", "loss_hsic_raw"),
+            "hsic_loss_weighted": ("hsic_loss_weighted", "loss_hsic_weighted"),
         }
 
-    if isinstance(value, torch.Tensor):
-        metric_value = value.detach().float().mean().item()
-    else:
-        metric_value = float(value)
-    self._stored_loss_metrics[split][name].append(metric_value)
+        candidate_keys = aliases.get(key, (key,))
+        for candidate in candidate_keys:
+            if isinstance(outputs, dict):
+                if candidate in outputs:
+                    return outputs[candidate]
+            else:
+                value = getattr(outputs, candidate, None)
+                if value is not None:
+                    return value
+        return default
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._tr_loss_hsic_raw = None
+        self._tr_loss_hsic_weighted = None
 
-def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-    outputs = model(**inputs)
-    loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+    def _ensure_aux_loss_buffers(self, reference: torch.Tensor) -> None:
+        if self._tr_loss_hsic_raw is None or self._tr_loss_hsic_weighted is None:
+            zero = reference.detach().new_zeros(())
+            self._tr_loss_hsic_raw = zero.clone()
+            self._tr_loss_hsic_weighted = zero.clone()
 
-    split = "train" if model.training else "eval"
-    loss_ce = getattr(outputs, "loss_ce", None)
-    loss_hsic_raw = getattr(outputs, "loss_hsic_raw", None)
-    loss_hsic_weighted = getattr(outputs, "loss_hsic_weighted", None)
+    @staticmethod
+    def _coerce_scalar_output(
+        value: Optional[torch.Tensor | float],
+        zero: torch.Tensor,
+    ) -> torch.Tensor:
+        if value is None:
+            return zero
+        if not isinstance(value, torch.Tensor):
+            return zero.new_tensor(float(value))
+        return value
 
-    _store_loss_metric(self, split, "Loss_ce", loss_ce)
-    _store_loss_metric(self, split, "Loss_hsic_raw", loss_hsic_raw)
-    _store_loss_metric(self, split, "Loss_hsic_weighted", loss_hsic_weighted)
+    def _prepare_context_parallel_inputs_compat(
+        self,
+        model: nn.Module,
+        inputs: dict[str, torch.Tensor | Any],
+    ) -> tuple[Any, dict[str, torch.Tensor | Any]]:
+        prepare_context_parallel_inputs = getattr(
+            super(),
+            "_prepare_context_parallel_inputs",
+            None,
+        )
+        if prepare_context_parallel_inputs is None:
+            return contextlib.nullcontext, inputs
+        return prepare_context_parallel_inputs(model, inputs)
 
-    if loss_ce is not None:
-        # Keep gradients from the optimization loss, but report CE as the trainer loss value.
-        loss = loss + (loss_ce.to(loss.device) - loss).detach()
+    def _get_gradient_accumulation_steps_compat(self) -> int:
+        return getattr(
+            self,
+            "current_gradient_accumulation_steps",
+            self.args.gradient_accumulation_steps,
+        )
 
-    if num_items_in_batch is not None and self.model_accepts_loss_kwargs:
-        loss = loss / self.args.gradient_accumulation_steps
+    @staticmethod
+    def _average_scalar_tensors_for_logging(
+        values: Dict[str, torch.Tensor],
+    ) -> Dict[str, float]:
+        if not values:
+            return {}
 
-    return (loss, outputs) if return_outputs else loss
+        keys = list(values.keys())
+        stacked = torch.stack(
+            [values[key].detach().float().reshape(()) for key in keys]
+        )
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(stacked, op=dist.ReduceOp.SUM)
+            stacked /= dist.get_world_size()
+        return {key: stacked[idx].item() for idx, key in enumerate(keys)}
 
+    def training_step(
+        self,
+        model: nn.Module,
+        inputs: dict[str, torch.Tensor | Any],
+        num_items_in_batch: torch.Tensor | int | None = None,
+    ) -> torch.Tensor:
+        cp_context, inputs = self._prepare_context_parallel_inputs_compat(model, inputs)
 
-def log(self, logs: Dict[str, float], *args, **kwargs) -> None:
-    split = "eval" if "eval_loss" in logs else "train"
+        with cp_context():
+            model.train()
+            if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
+                self.optimizer.train()
 
-    if hasattr(self, "_stored_loss_metrics") and self._stored_loss_metrics[split]:
-        averaged_metrics = {
-            name: sum(values) / len(values)
-            for name, values in self._stored_loss_metrics[split].items()
-            if len(values) > 0
-        }
-        self._stored_loss_metrics[split].clear()
+            inputs = self._prepare_inputs(inputs)
+            if is_sagemaker_mp_enabled():
+                loss_mb = smp_forward_backward(
+                    model, inputs, self.args.gradient_accumulation_steps
+                )
+                return loss_mb.reduce_mean().detach().to(self.args.device)
 
-        if split == "train":
-            logs.update(averaged_metrics)
-            if "Loss_ce" in averaged_metrics and "loss" in logs:
-                logs["loss"] = averaged_metrics["Loss_ce"]
-        else:
-            eval_metrics = {f"eval_{name}": value for name, value in averaged_metrics.items()}
-            logs.update(eval_metrics)
-            if "Loss_ce" in averaged_metrics and "eval_loss" in logs:
-                logs["eval_loss"] = averaged_metrics["Loss_ce"]
+            with self.compute_loss_context_manager():
+                loss, outputs = self.compute_loss(
+                    model,
+                    inputs,
+                    return_outputs=True,
+                    num_items_in_batch=num_items_in_batch,
+                )
 
-    return ORIGINAL_TRAINER_LOG(self, logs, *args, **kwargs)
+            ce_loss = self._get_output_value(outputs, "ce_loss", loss)
+            hsic_loss_raw = self._get_output_value(outputs, "hsic_loss_raw")
+            hsic_loss_weighted = self._get_output_value(outputs, "hsic_loss_weighted")
+
+            if not isinstance(ce_loss, torch.Tensor):
+                ce_loss = loss.detach().new_tensor(float(ce_loss))
+            zero = loss.detach().new_zeros(())
+            hsic_loss_raw = self._coerce_scalar_output(hsic_loss_raw, zero)
+            hsic_loss_weighted = self._coerce_scalar_output(hsic_loss_weighted, zero)
+
+            del inputs
+            if (
+                self.args.torch_empty_cache_steps is not None
+                and self.state.global_step % self.args.torch_empty_cache_steps == 0
+            ):
+                clear_device_cache()
+
+            kwargs = {}
+            if self.args.optim in [OptimizerNames.LOMO, OptimizerNames.ADALOMO]:
+                kwargs["learning_rate"] = self._get_learning_rate()
+
+            if self.args.n_gpu > 1:
+                loss = loss.mean()
+                ce_loss = ce_loss.mean()
+                hsic_loss_raw = hsic_loss_raw.mean()
+                hsic_loss_weighted = hsic_loss_weighted.mean()
+
+            if (
+                (not self.model_accepts_loss_kwargs or num_items_in_batch is None)
+                and self.compute_loss_func is None
+            ):
+                grad_accumulation_steps = self._get_gradient_accumulation_steps_compat()
+                loss = loss / grad_accumulation_steps
+                ce_loss = ce_loss / grad_accumulation_steps
+                hsic_loss_raw = hsic_loss_raw / grad_accumulation_steps
+                hsic_loss_weighted = hsic_loss_weighted / grad_accumulation_steps
+
+            if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
+                kwargs["scale_wrt_gas"] = False
+
+            self._ensure_aux_loss_buffers(loss)
+            self._tr_loss_hsic_raw += hsic_loss_raw.detach()
+            self._tr_loss_hsic_weighted += hsic_loss_weighted.detach()
+
+            self.accelerator.backward(loss, **kwargs)
+
+            return ce_loss.detach()
+
+    def _maybe_log_save_evaluate(
+        self,
+        tr_loss: torch.Tensor,
+        grad_norm: torch.Tensor | float | None,
+        model: nn.Module,
+        trial: "optuna.Trial | dict[str, Any] | None",
+        epoch: float,
+        ignore_keys_for_eval: list[str] | None,
+        start_time: float,
+        learning_rate: float | None = None,
+    ) -> None:
+        if self.control.should_log and self.state.global_step > self._globalstep_last_logged:
+            if is_torch_xla_available():
+                xm.mark_step()
+
+            logs: dict[str, float] = {}
+            step_delta = self.state.global_step - self._globalstep_last_logged
+
+            logging_scalars = {"tr_loss": tr_loss}
+            if (
+                self._tr_loss_hsic_raw is not None
+                and self._tr_loss_hsic_weighted is not None
+            ):
+                logging_scalars["hsic_loss_raw"] = self._tr_loss_hsic_raw
+                logging_scalars["hsic_loss_weighted"] = self._tr_loss_hsic_weighted
+
+            reduced_logging_scalars = self._average_scalar_tensors_for_logging(
+                logging_scalars
+            )
+
+            tr_loss_scalar = reduced_logging_scalars["tr_loss"]
+            tr_loss -= tr_loss
+
+            ce_loss_avg = tr_loss_scalar / step_delta
+            logs["loss"] = ce_loss_avg
+            logs["Loss_ce"] = ce_loss_avg
+
+            if (
+                self._tr_loss_hsic_raw is not None
+                and self._tr_loss_hsic_weighted is not None
+            ):
+                hsic_loss_raw_scalar = reduced_logging_scalars["hsic_loss_raw"]
+                hsic_loss_weighted_scalar = reduced_logging_scalars["hsic_loss_weighted"]
+                self._tr_loss_hsic_raw -= self._tr_loss_hsic_raw
+                self._tr_loss_hsic_weighted -= self._tr_loss_hsic_weighted
+                logs["Loss_hsic_raw"] = hsic_loss_raw_scalar / step_delta
+                logs["Loss_hsic_weighted"] = hsic_loss_weighted_scalar / step_delta
+
+            if grad_norm is not None:
+                logs["grad_norm"] = (
+                    grad_norm.item()
+                    if isinstance(grad_norm, torch.Tensor)
+                    else grad_norm
+                )
+            if learning_rate is not None:
+                logs["learning_rate"] = learning_rate
+            else:
+                logs["learning_rate"] = self._get_learning_rate()
+
+            self._total_loss_scalar += tr_loss_scalar
+            self._globalstep_last_logged = self.state.global_step
+            self.store_flos()
+
+            self.log(logs, start_time)
+
+        metrics = None
+        if self.control.should_evaluate:
+            metrics = self._evaluate(trial, ignore_keys_for_eval)
+            is_new_best_metric = self._determine_best_metric(
+                metrics=metrics, trial=trial
+            )
+
+            if self.args.save_strategy == SaveStrategy.BEST:
+                self.control.should_save = is_new_best_metric
+
+        if self.control.should_save:
+            self._save_checkpoint(model, trial)
+            self.control = self.callback_handler.on_save(
+                self.args, self.state, self.control
+            )
 
 
 # Apply monkey patches
 Trainer.create_optimizer = create_optimizer
-Trainer.compute_loss = compute_loss
-Trainer.log = log
 
 Qwen2VisionTransformerPretrainedModel.print_trainable_parameters = (
     print_trainable_parameters_visual
