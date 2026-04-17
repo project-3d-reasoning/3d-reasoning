@@ -56,6 +56,7 @@ from .feature_fusion import (
     FeatureFusionModule,
     FeatureFusionConfig,
     GeometryFeatureMerger,
+    LASTViTSparseProjector,
     LearnableQueryPrefixEncoder,
     compute_rbf_hsic_loss,
 )
@@ -1623,6 +1624,18 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             spatial_merge_size=config.vision_config.spatial_merge_size,
             merger_type=getattr(config, "geometry_merger_type", "mlp")
         )
+        self.use_geometry_lastvit_selector = bool(getattr(config, "use_geometry_lastvit_selector", False))
+        self.geometry_lastvit_top_k = int(getattr(config, "geometry_lastvit_top_k", 1))
+        self.geometry_lastvit_top_n = int(getattr(config, "geometry_lastvit_top_n", 32))
+        if self.use_geometry_lastvit_selector:
+            if getattr(config, "feature_fusion_method", "add") != "add":
+                raise ValueError("use_geometry_lastvit_selector currently requires feature_fusion_method='add'.")
+            if getattr(config, "geometry_merger_type", "mlp") != "mlp":
+                raise ValueError("use_geometry_lastvit_selector currently requires geometry_merger_type='mlp'.")
+            self.geometry_lastvit_selector = LASTViTSparseProjector(
+                top_k=self.geometry_lastvit_top_k,
+                top_n=self.geometry_lastvit_top_n,
+            )
 
         self.unique_3d_hsic_weight = float(getattr(config, "unique_3d_hsic_weight", 0.0))
         self.unique_3d_hsic_sigma_2d = float(getattr(config, "unique_3d_hsic_sigma_2d", -1.0))
@@ -1789,8 +1802,11 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 # [n_image, h_patch_size, w_patch_size, feature_dim]
                 features = features.reshape(n_image, height // self.geometry_encoder.patch_size, width // self.geometry_encoder.patch_size, -1)
 
-                # Reshape for merger
-                merged_features = self.geometry_merger(features)
+                merged_tokens = self.geometry_merger.merge_tokens(features)
+                if getattr(self, "use_geometry_lastvit_selector", False):
+                    merged_features, _ = self.geometry_lastvit_selector(merged_tokens, self.geometry_merger)
+                else:
+                    merged_features = self.geometry_merger.project_merged_tokens(merged_tokens)
                 geo_embeds.append(merged_features)
 
                 sample_token_count = merged_features.shape[0] * merged_features.shape[1] * merged_features.shape[2]

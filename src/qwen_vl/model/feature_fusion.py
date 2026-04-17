@@ -431,6 +431,7 @@ class GeometryFeatureMerger(nn.Module):
                  spatial_merge_size: int = 2, merger_type: str = "mlp"):
         super().__init__()
         self.merger_type = merger_type
+        self.context_dim = context_dim
         self.input_dim = context_dim * (spatial_merge_size ** 2)
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
@@ -461,22 +462,143 @@ class GeometryFeatureMerger(nn.Module):
             raise NotImplementedError("Attention merger not implemented yet")
         else:
             raise ValueError(f"Unknown merger type: {merger_type}")
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass through the merger."""
 
+    def _group_spatial_tokens(self, x: torch.Tensor) -> torch.Tensor:
+        """Group neighboring patches into merger windows without applying the projection MLP."""
         n_image, h_patch, w_patch, dim = x.shape
-        x = x[:, :h_patch // self.merge_size * self.merge_size, :w_patch // self.merge_size*self.merge_size , :]
-        x = x.reshape(n_image, h_patch // self.merge_size, self.merge_size, w_patch // self.merge_size, self.merge_size, dim)
-        x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
+        h_patch = h_patch // self.merge_size * self.merge_size
+        w_patch = w_patch // self.merge_size * self.merge_size
+        x = x[:, :h_patch, :w_patch, :]
+        x = x.reshape(
+            n_image,
+            h_patch // self.merge_size,
+            self.merge_size,
+            w_patch // self.merge_size,
+            self.merge_size,
+            dim,
+        )
+        return x.permute(0, 1, 3, 2, 4, 5).contiguous()
+
+    def merge_tokens(self, x: torch.Tensor) -> torch.Tensor:
+        """Return merged geometry tokens before the merger MLP projection."""
+        grouped = self._group_spatial_tokens(x)
+        n_image, h_merge, w_merge, _, _, _ = grouped.shape
+        return grouped.reshape(n_image, h_merge, w_merge, self.input_dim)
+
+    def project_flat_merged_tokens(self, merged_tokens: torch.Tensor) -> torch.Tensor:
+        """Project flattened merged tokens to the target hidden size."""
+        if merged_tokens.numel() == 0:
+            return merged_tokens.new_empty((0, self.output_dim))
+
         if self.merger_type == "mlp":
-            x = self.mlp(self.ln_q(x).view(-1, self.input_dim))
+            grouped = merged_tokens.reshape(-1, self.merge_size, self.merge_size, self.context_dim)
+            x = self.mlp(self.ln_q(grouped).reshape(-1, self.input_dim))
         elif self.merger_type == "avg":
-            # Average pooling across spatial merge dimensions
-            x = x.mean(dim=(3, 4))  # Average over the merge_size dimensions
-            x = x.view(-1, dim)  # Flatten for projection
+            grouped = merged_tokens.reshape(-1, self.merge_size, self.merge_size, self.context_dim)
+            x = grouped.mean(dim=(1, 2))
             x = self.mlp(x)
         else:
             raise NotImplementedError(f"Merger type {self.merger_type} not implemented")
-        x = x.reshape(n_image, h_patch // self.merge_size, w_patch // self.merge_size, -1)
+
         return x
+
+    def project_merged_tokens(self, merged_tokens: torch.Tensor) -> torch.Tensor:
+        """Project merged tokens laid out on the spatial grid."""
+        n_image, h_merge, w_merge, _ = merged_tokens.shape
+        x = self.project_flat_merged_tokens(merged_tokens.reshape(-1, self.input_dim))
+        x = x.reshape(n_image, h_merge, w_merge, -1)
+        return x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through the merger."""
+        merged_tokens = self.merge_tokens(x)
+        return self.project_merged_tokens(merged_tokens)
+
+
+class LASTViTSparseProjector(nn.Module):
+    """Select stable geometry tokens in LAST-ViT style and project only the top-n selected ones."""
+
+    def __init__(self, top_k: int = 1, top_n: int = 32, eps: float = 1e-6):
+        super().__init__()
+        if top_k <= 0:
+            raise ValueError(f"top_k must be > 0, but got {top_k}")
+        if top_n <= 0:
+            raise ValueError(f"top_n must be > 0, but got {top_n}")
+
+        self.top_k = int(top_k)
+        self.top_n = int(top_n)
+        self.eps = float(eps)
+
+    def gaussian_kernel_1d(self, kernel_size: int, sigma: float, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        coords = torch.arange(-kernel_size // 2 + 1, kernel_size // 2 + 1, device=device, dtype=dtype)
+        kernel = torch.exp(-0.5 * (coords / max(sigma, self.eps)) ** 2)
+        kernel = kernel / kernel.max().clamp_min(self.eps)
+        return kernel
+
+    def _compute_stability_scores(self, merged_tokens: torch.Tensor) -> torch.Tensor:
+        flat_tokens = merged_tokens.reshape(merged_tokens.shape[0], -1, merged_tokens.shape[-1]).float()
+        channel_dim = flat_tokens.shape[-1]
+        kernel = self.gaussian_kernel_1d(
+            kernel_size=channel_dim,
+            sigma=channel_dim ** 0.5,
+            device=flat_tokens.device,
+            dtype=flat_tokens.dtype,
+        ).view(1, 1, -1)
+
+        filtered = torch.fft.fft(flat_tokens, dim=-1)
+        filtered = torch.fft.fftshift(filtered, dim=-1)
+        filtered = filtered * kernel
+        filtered = torch.fft.ifftshift(filtered, dim=-1)
+        filtered = torch.fft.ifft(filtered, dim=-1).real
+        return flat_tokens / (filtered - flat_tokens).abs().clamp_min(self.eps)
+
+    def forward(
+        self,
+        merged_tokens: torch.Tensor,
+        projector: GeometryFeatureMerger,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if merged_tokens.dim() != 4:
+            raise ValueError(f"Expected merged_tokens to have shape [batch, h, w, dim], got {tuple(merged_tokens.shape)}")
+
+        batch_size, h_merge, w_merge, channel_dim = merged_tokens.shape
+        token_count = h_merge * w_merge
+        if token_count == 0:
+            sparse_features = merged_tokens.new_zeros(batch_size, h_merge, w_merge, projector.output_dim)
+            return sparse_features, {
+                "cls_token": merged_tokens.new_zeros(batch_size, channel_dim),
+                "selection_counts": merged_tokens.new_zeros(batch_size, h_merge, w_merge, dtype=torch.int64),
+                "selected_mask": merged_tokens.new_zeros(batch_size, h_merge, w_merge, dtype=torch.bool),
+            }
+
+        flat_tokens = merged_tokens.reshape(batch_size, token_count, channel_dim)
+        stability_scores = self._compute_stability_scores(merged_tokens)
+
+        k = min(self.top_k, token_count)
+        n = min(self.top_n, token_count)
+
+        _, indices = torch.topk(stability_scores, k=k, dim=1, largest=True)
+        selected_for_cls = torch.gather(flat_tokens, 1, indices.to(flat_tokens.device))
+        cls_token = selected_for_cls.mean(dim=1)
+
+        selection_counts = torch.zeros(batch_size, token_count, device=flat_tokens.device, dtype=torch.int64)
+        flat_indices = indices.permute(0, 2, 1).reshape(batch_size, -1)
+        selection_counts.scatter_add_(
+            1,
+            flat_indices,
+            torch.ones_like(flat_indices, dtype=selection_counts.dtype),
+        )
+
+        _, top_n_indices = torch.topk(selection_counts, k=n, dim=1, largest=True)
+        selected_mask = torch.zeros(batch_size, token_count, device=flat_tokens.device, dtype=torch.bool)
+        selected_mask.scatter_(1, top_n_indices, True)
+
+        projected_selected = projector.project_flat_merged_tokens(flat_tokens[selected_mask])
+        sparse_features = flat_tokens.new_zeros(batch_size, token_count, projector.output_dim)
+        sparse_features[selected_mask] = projected_selected.to(sparse_features.dtype)
+        sparse_features = sparse_features.reshape(batch_size, h_merge, w_merge, projector.output_dim)
+
+        return sparse_features, {
+            "cls_token": cls_token,
+            "selection_counts": selection_counts.reshape(batch_size, h_merge, w_merge),
+            "selected_mask": selected_mask.reshape(batch_size, h_merge, w_merge),
+        }

@@ -21,7 +21,7 @@ fi
 MODEL_PATH="/inspire/hdd/project/qproject-fundationmodel/public/yxliu/test/Demongorgan/VG-LLM/models/Qwen2.5-VL-7B-Instruct"  # [ModelArguments] Pretrained model path
 GEOMETRY_ENCODER_TYPE="vggt"
 GEOMETRY_ENCODER_PATH="/inspire/hdd/project/qproject-fundationmodel/public/yxliu/test/Demongorgan/VG-LLM/models/VGGT-1B"
-OUTPUT_DIR="PATH_TO_OUTPUT_DIR"                   # Directory for saving checkpoints
+OUTPUT_DIR="7b-lastvit"                   # Directory for saving checkpoints
 CACHE_DIR="./cache"                        # [TrainingArguments] Cache directory for models
 mkdir -p $OUTPUT_DIR
 
@@ -41,7 +41,10 @@ GRADIENT_ACCUMULATION_STEPS=$(($total_batch_size / $NPROC_PER_NODE))
 # ======================
 # unique_3d Prefix Branch
 # ======================
-USE_UNIQUE_3D_PREFIX=True
+USE_GEOMETRY_LASTVIT_SELECTOR=True
+GEOMETRY_LASTVIT_TOP_K=162
+GEOMETRY_LASTVIT_TOP_N=162
+USE_UNIQUE_3D_PREFIX=False
 UNIQUE_3D_NUM_QUERIES=20
 UNIQUE_3D_PREFIX_NUM_HEADS=8
 UNIQUE_3D_PREFIX_DROPOUT=0
@@ -65,7 +68,7 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --per_device_train_batch_size 1 \
             --gradient_accumulation_steps $GRADIENT_ACCUMULATION_STEPS \
             --learning_rate $LR \
-            --mm_projector_lr 1e-5 \
+            --mm_projector_lr 2e-5 \
             --vision_tower_lr 1e-6 \
             --optim adamw_torch \
             --model_max_length 12800 \
@@ -94,6 +97,9 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --geometry_encoder_type $GEOMETRY_ENCODER_TYPE \
             --geometry_encoder_path $GEOMETRY_ENCODER_PATH \
             --feature_fusion_method "add" \
+            --use_geometry_lastvit_selector $USE_GEOMETRY_LASTVIT_SELECTOR \
+            --geometry_lastvit_top_k $GEOMETRY_LASTVIT_TOP_K \
+            --geometry_lastvit_top_n $GEOMETRY_LASTVIT_TOP_N \
             --use_unique_3d_prefix $USE_UNIQUE_3D_PREFIX \
             --unique_3d_num_queries $UNIQUE_3D_NUM_QUERIES \
             --unique_3d_prefix_num_heads $UNIQUE_3D_PREFIX_NUM_HEADS \
