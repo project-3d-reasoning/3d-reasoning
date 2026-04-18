@@ -35,7 +35,6 @@ GRADIENT_ACCUMULATION_STEPS=$(($total_batch_size / $NPROC_PER_NODE))
 # ======================
 USE_GEOMETRY_LASTVIT_SELECTOR=False
 GEOMETRY_LASTVIT_TOP_K=1
-GEOMETRY_LASTVIT_TOP_N=32
 USE_UNIQUE_3D_PREFIX=False
 UNIQUE_3D_NUM_QUERIES=8
 UNIQUE_3D_PREFIX_NUM_HEADS=8
@@ -91,7 +90,6 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --feature_fusion_method "add" \
             --use_geometry_lastvit_selector $USE_GEOMETRY_LASTVIT_SELECTOR \
             --geometry_lastvit_top_k $GEOMETRY_LASTVIT_TOP_K \
-            --geometry_lastvit_top_n $GEOMETRY_LASTVIT_TOP_N \
             --use_unique_3d_prefix $USE_UNIQUE_3D_PREFIX \
             --unique_3d_num_queries $UNIQUE_3D_NUM_QUERIES \
             --unique_3d_prefix_num_heads $UNIQUE_3D_PREFIX_NUM_HEADS \

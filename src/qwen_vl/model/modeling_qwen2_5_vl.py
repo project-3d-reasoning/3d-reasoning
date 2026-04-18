@@ -1626,7 +1626,6 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         )
         self.use_geometry_lastvit_selector = bool(getattr(config, "use_geometry_lastvit_selector", False))
         self.geometry_lastvit_top_k = int(getattr(config, "geometry_lastvit_top_k", 1))
-        self.geometry_lastvit_top_n = int(getattr(config, "geometry_lastvit_top_n", 32))
         if self.use_geometry_lastvit_selector:
             if getattr(config, "feature_fusion_method", "add") != "add":
                 raise ValueError("use_geometry_lastvit_selector currently requires feature_fusion_method='add'.")
@@ -1634,7 +1633,6 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 raise ValueError("use_geometry_lastvit_selector currently requires geometry_merger_type='mlp'.")
             self.geometry_lastvit_selector = LASTViTSparseProjector(
                 top_k=self.geometry_lastvit_top_k,
-                top_n=self.geometry_lastvit_top_n,
             )
 
         self.unique_3d_hsic_weight = float(getattr(config, "unique_3d_hsic_weight", 0.0))
@@ -1803,15 +1801,24 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 features = features.reshape(n_image, height // self.geometry_encoder.patch_size, width // self.geometry_encoder.patch_size, -1)
 
                 merged_tokens = self.geometry_merger.merge_tokens(features)
+                sample_token_count = merged_tokens.shape[0] * merged_tokens.shape[1] * merged_tokens.shape[2]
+                feature_2d = image_embeds[image_offset:image_offset + sample_token_count].view(
+                    merged_tokens.shape[0],
+                    merged_tokens.shape[1],
+                    merged_tokens.shape[2],
+                    -1,
+                )
+                image_offset += sample_token_count
+
                 if getattr(self, "use_geometry_lastvit_selector", False):
-                    merged_features, _ = self.geometry_lastvit_selector(merged_tokens, self.geometry_merger)
+                    merged_features, _ = self.geometry_lastvit_selector(
+                        reference_tokens=feature_2d,
+                        source_tokens=merged_tokens,
+                        projector=self.geometry_merger,
+                    )
                 else:
                     merged_features = self.geometry_merger.project_merged_tokens(merged_tokens)
                 geo_embeds.append(merged_features)
-
-                sample_token_count = merged_features.shape[0] * merged_features.shape[1] * merged_features.shape[2]
-                feature_2d = image_embeds[image_offset:image_offset + sample_token_count].view_as(merged_features)
-                image_offset += sample_token_count
 
                 if prefix_embeds is not None:
                     unique_3d = self.geometry_unique_merger(features)

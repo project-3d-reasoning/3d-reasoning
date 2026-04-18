@@ -135,7 +135,6 @@ def train(attn_implementation="flash_attention_2"):
                 "geometry_merger_type",
                 "use_geometry_lastvit_selector",
                 "geometry_lastvit_top_k",
-                "geometry_lastvit_top_n",
                 "use_unique_3d_prefix",
                 "unique_3d_num_queries",
                 "unique_3d_prefix_num_heads",

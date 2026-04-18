@@ -516,17 +516,14 @@ class GeometryFeatureMerger(nn.Module):
 
 
 class LASTViTSparseProjector(nn.Module):
-    """Select stable geometry tokens in LAST-ViT style and project only the top-n selected ones."""
+    """Select stable 2D tokens in LAST-ViT style and gate the corresponding projected 3D tokens."""
 
-    def __init__(self, top_k: int = 1, top_n: int = 32, eps: float = 1e-6):
+    def __init__(self, top_k: int = 1, eps: float = 1e-6):
         super().__init__()
         if top_k <= 0:
             raise ValueError(f"top_k must be > 0, but got {top_k}")
-        if top_n <= 0:
-            raise ValueError(f"top_n must be > 0, but got {top_n}")
 
         self.top_k = int(top_k)
-        self.top_n = int(top_n)
         self.eps = float(eps)
 
     def gaussian_kernel_1d(self, kernel_size: int, sigma: float, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -535,8 +532,8 @@ class LASTViTSparseProjector(nn.Module):
         kernel = kernel / kernel.max().clamp_min(self.eps)
         return kernel
 
-    def _compute_stability_scores(self, merged_tokens: torch.Tensor) -> torch.Tensor:
-        flat_tokens = merged_tokens.reshape(merged_tokens.shape[0], -1, merged_tokens.shape[-1]).float()
+    def _compute_stability_scores(self, reference_tokens: torch.Tensor) -> torch.Tensor:
+        flat_tokens = reference_tokens.reshape(reference_tokens.shape[0], -1, reference_tokens.shape[-1]).float()
         channel_dim = flat_tokens.shape[-1]
         kernel = self.gaussian_kernel_1d(
             kernel_size=channel_dim,
@@ -554,33 +551,44 @@ class LASTViTSparseProjector(nn.Module):
 
     def forward(
         self,
-        merged_tokens: torch.Tensor,
+        reference_tokens: torch.Tensor,
+        source_tokens: torch.Tensor,
         projector: GeometryFeatureMerger,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        if merged_tokens.dim() != 4:
-            raise ValueError(f"Expected merged_tokens to have shape [batch, h, w, dim], got {tuple(merged_tokens.shape)}")
+        if reference_tokens.dim() != 4:
+            raise ValueError(
+                f"Expected reference_tokens to have shape [batch, h, w, dim], got {tuple(reference_tokens.shape)}"
+            )
+        if source_tokens.dim() != 4:
+            raise ValueError(
+                f"Expected source_tokens to have shape [batch, h, w, dim], got {tuple(source_tokens.shape)}"
+            )
+        if reference_tokens.shape[:3] != source_tokens.shape[:3]:
+            raise ValueError(
+                "reference_tokens and source_tokens must share the same [batch, h, w] layout, "
+                f"got {tuple(reference_tokens.shape)} and {tuple(source_tokens.shape)}"
+            )
 
-        batch_size, h_merge, w_merge, channel_dim = merged_tokens.shape
+        batch_size, h_merge, w_merge, channel_dim = reference_tokens.shape
         token_count = h_merge * w_merge
         if token_count == 0:
-            sparse_features = merged_tokens.new_zeros(batch_size, h_merge, w_merge, projector.output_dim)
+            sparse_features = source_tokens.new_zeros(batch_size, h_merge, w_merge, projector.output_dim)
             return sparse_features, {
-                "cls_token": merged_tokens.new_zeros(batch_size, channel_dim),
-                "selection_counts": merged_tokens.new_zeros(batch_size, h_merge, w_merge, dtype=torch.int64),
-                "selected_mask": merged_tokens.new_zeros(batch_size, h_merge, w_merge, dtype=torch.bool),
+                "cls_token": reference_tokens.new_zeros(batch_size, channel_dim),
+                "selection_counts": reference_tokens.new_zeros(batch_size, h_merge, w_merge, dtype=torch.int64),
+                "gate": reference_tokens.new_zeros(batch_size, h_merge, w_merge),
             }
 
-        flat_tokens = merged_tokens.reshape(batch_size, token_count, channel_dim)
-        stability_scores = self._compute_stability_scores(merged_tokens)
+        flat_reference = reference_tokens.reshape(batch_size, token_count, channel_dim)
+        stability_scores = self._compute_stability_scores(reference_tokens)
 
         k = min(self.top_k, token_count)
-        n = min(self.top_n, token_count)
 
         _, indices = torch.topk(stability_scores, k=k, dim=1, largest=True)
-        selected_for_cls = torch.gather(flat_tokens, 1, indices.to(flat_tokens.device))
+        selected_for_cls = torch.gather(flat_reference, 1, indices.to(flat_reference.device))
         cls_token = selected_for_cls.mean(dim=1)
 
-        selection_counts = torch.zeros(batch_size, token_count, device=flat_tokens.device, dtype=torch.int64)
+        selection_counts = torch.zeros(batch_size, token_count, device=flat_reference.device, dtype=torch.int64)
         flat_indices = indices.permute(0, 2, 1).reshape(batch_size, -1)
         selection_counts.scatter_add_(
             1,
@@ -588,17 +596,14 @@ class LASTViTSparseProjector(nn.Module):
             torch.ones_like(flat_indices, dtype=selection_counts.dtype),
         )
 
-        _, top_n_indices = torch.topk(selection_counts, k=n, dim=1, largest=True)
-        selected_mask = torch.zeros(batch_size, token_count, device=flat_tokens.device, dtype=torch.bool)
-        selected_mask.scatter_(1, top_n_indices, True)
+        max_count = selection_counts.max(dim=1, keepdim=True).values.clamp_min(1)
+        gate = selection_counts.to(dtype=flat_reference.dtype) / max_count.to(dtype=flat_reference.dtype)
 
-        projected_selected = projector.project_flat_merged_tokens(flat_tokens[selected_mask])
-        sparse_features = flat_tokens.new_zeros(batch_size, token_count, projector.output_dim)
-        sparse_features[selected_mask] = projected_selected.to(sparse_features.dtype)
-        sparse_features = sparse_features.reshape(batch_size, h_merge, w_merge, projector.output_dim)
+        projected_source = projector.project_merged_tokens(source_tokens)
+        gated_features = projected_source * gate.reshape(batch_size, h_merge, w_merge, 1).to(projected_source.dtype)
 
-        return sparse_features, {
+        return gated_features, {
             "cls_token": cls_token,
             "selection_counts": selection_counts.reshape(batch_size, h_merge, w_merge),
-            "selected_mask": selected_mask.reshape(batch_size, h_merge, w_merge),
+            "gate": gate.reshape(batch_size, h_merge, w_merge),
         }

@@ -18,9 +18,8 @@ class ModelArguments:
     feature_fusion_method: str = field(default="add")  # Method to fuse geometry and visual features ("add", "concat", "cross_attention", "gate")
     fusion_num_layers: int = field(default=1)  # Number of layers in the cross-attention module when feature_fusion_method is "cross_attention"
     geometry_merger_type: str = field(default="mlp")  # Type of geometry feature merger ("mlp", "avg")
-    use_geometry_lastvit_selector: bool = field(default=False)  # Enable LAST-ViT style sparse token selection on merged 3D tokens
+    use_geometry_lastvit_selector: bool = field(default=False)  # Enable LAST-ViT style 2D-guided gating for projected 3D tokens
     geometry_lastvit_top_k: int = field(default=1)  # Top-k patches selected per channel to form the CLS-like token
-    geometry_lastvit_top_n: int = field(default=32)  # Only the top-n most frequently selected patches are projected and fused into 2D
     use_unique_3d_prefix: bool = field(default=False)  # Whether to build the detached unique_3d prefix branch
     unique_3d_num_queries: int = field(default=0)  # Number of learnable prefix queries extracted from unique_3d
     unique_3d_prefix_num_heads: int = field(default=8)  # Number of heads in the unique_3d cross attention
