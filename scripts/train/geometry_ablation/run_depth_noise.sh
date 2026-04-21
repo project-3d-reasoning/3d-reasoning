@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+EXPERIMENT_NAME="depth_noise"
+GEOMETRY_ABLATION_MODE="depth_noise"
+GEOMETRY_ABLATION_NOISE_SIGMA=${GEOMETRY_ABLATION_NOISE_SIGMA:-1.0}
+export EXPERIMENT_NAME GEOMETRY_ABLATION_MODE GEOMETRY_ABLATION_NOISE_SIGMA
+exec "${SCRIPT_DIR}/train_single_ablation.sh"

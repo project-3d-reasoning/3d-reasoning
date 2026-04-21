@@ -53,6 +53,7 @@ from .configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLVisionConfig
 from .vggt.models.vggt import VGGT
 from .geometry_encoders import create_geometry_encoder, GeometryEncoderConfig
 from .feature_fusion import FeatureFusionModule, FeatureFusionConfig, GeometryFeatureMerger
+from .geometry_ablation_channels import DEPTH_RELATED_CHANNELS, POS_RELATED_CHANNELS
 from .loss import normalize_pointcloud, check_and_fix_inf_nan
 
 
@@ -1624,24 +1625,114 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             num_layers=getattr(config, "fusion_num_layers", 1)
         )
         self.feature_fusion = FeatureFusionModule(fusion_config)
+        self.geometry_ablation_mode = str(getattr(config, "geometry_ablation_mode", "none")).lower()
+        self.geometry_ablation_noise_sigma = float(getattr(config, "geometry_ablation_noise_sigma", 1.0))
+        self.geometry_ablation_layout_block_size = int(getattr(config, "geometry_ablation_layout_block_size", 4))
+        self.register_buffer(
+            "_depth_related_channel_idx",
+            torch.tensor(DEPTH_RELATED_CHANNELS, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_pos_related_channel_idx",
+            torch.tensor(POS_RELATED_CHANNELS, dtype=torch.long),
+            persistent=False,
+        )
+
+    def _non_identity_permutation(self, n: int, device: torch.device) -> torch.Tensor:
+        if n <= 1:
+            return torch.arange(n, device=device)
+        perm = torch.randperm(n, device=device)
+        identity = torch.arange(n, device=device)
+        if torch.all(perm == identity):
+            perm = torch.roll(perm, shifts=1, dims=0)
+        return perm
+
+    def _add_gaussian_noise_to_channels(self, tokens: torch.Tensor, channel_idx: torch.Tensor) -> torch.Tensor:
+        if tokens.numel() == 0 or channel_idx.numel() == 0 or self.geometry_ablation_noise_sigma <= 0:
+            return tokens
+        valid_idx = channel_idx[channel_idx < tokens.shape[-1]]
+        if valid_idx.numel() == 0:
+            return tokens
+        out = tokens.clone()
+        noise = torch.randn(
+            out.shape[0],
+            valid_idx.numel(),
+            device=out.device,
+            dtype=out.dtype,
+        )
+        out[:, valid_idx] = out[:, valid_idx] + noise * self.geometry_ablation_noise_sigma
+        return out
+
+    def _shuffle_layout_blocks(self, merged_features: torch.Tensor, block_size: int) -> torch.Tensor:
+        # merged_features: [n_image, h_merged, w_merged, dim]
+        if merged_features.ndim != 4 or block_size <= 1:
+            return merged_features
+        n_image, h_merged, w_merged, dim = merged_features.shape
+        nbh = h_merged // block_size
+        nbw = w_merged // block_size
+        if nbh == 0 or nbw == 0:
+            return merged_features
+
+        h_use = nbh * block_size
+        w_use = nbw * block_size
+        out = merged_features.clone()
+        core = out[:, :h_use, :w_use, :]
+        blocks = core.reshape(n_image, nbh, block_size, nbw, block_size, dim).permute(0, 1, 3, 2, 4, 5).contiguous()
+        blocks = blocks.reshape(n_image, nbh * nbw, block_size, block_size, dim)
+        for fi in range(n_image):
+            perm = self._non_identity_permutation(nbh * nbw, merged_features.device)
+            blocks[fi] = blocks[fi].index_select(0, perm)
+        core = blocks.reshape(n_image, nbh, nbw, block_size, block_size, dim).permute(0, 1, 3, 2, 4, 5).contiguous()
+        out[:, :h_use, :w_use, :] = core.reshape(n_image, h_use, w_use, dim)
+        return out
 
     def _process_geometry_features(self, image_embeds, geometry_encoder_inputs):
         """Process geometry features using the geometry encoder."""
 
         batch_size = len(geometry_encoder_inputs)
         geo_embeds = []
+        ablation_mode = getattr(self, "geometry_ablation_mode", "none")
         for bn in range(batch_size):
             if geometry_encoder_inputs[bn].shape[0] > 0:
 
                 n_image, _, height, width = geometry_encoder_inputs[bn].shape
+                h_patch = height // self.geometry_encoder.patch_size
+                w_patch = width // self.geometry_encoder.patch_size
+                if ablation_mode in {"2d_only", "zero_geometry"}:
+                    merge_size = getattr(self.geometry_merger, "merge_size", 1)
+                    geo_embeds.append(
+                        torch.zeros(
+                            (n_image, h_patch // merge_size, w_patch // merge_size, image_embeds.shape[-1]),
+                            device=image_embeds.device,
+                            dtype=image_embeds.dtype,
+                        )
+                    )
+                    continue
+
                 # Encode geometry features
                 features = self.geometry_encoder.encode(geometry_encoder_inputs[bn]).to(image_embeds.dtype)
 
+                if ablation_mode == "depth_noise":
+                    features = self._add_gaussian_noise_to_channels(features, self._depth_related_channel_idx)
+                elif ablation_mode == "pos_break":
+                    features = self._add_gaussian_noise_to_channels(features, self._pos_related_channel_idx)
+
                 # [n_image, h_patch_size, w_patch_size, feature_dim]
-                features = features.reshape(n_image, height // self.geometry_encoder.patch_size, width // self.geometry_encoder.patch_size, -1)
+                features = features.reshape(n_image, h_patch, w_patch, -1)
+
+                if ablation_mode == "corr_break" and n_image > 1:
+                    perm = self._non_identity_permutation(n_image, features.device)
+                    features = features.index_select(0, perm)
 
                 # Reshape for merger
                 features = self.geometry_merger(features)
+
+                if ablation_mode == "layout_break":
+                    features = self._shuffle_layout_blocks(
+                        features,
+                        block_size=max(1, int(self.geometry_ablation_layout_block_size)),
+                    )
                 geo_embeds.append(features)
 
         geo_embeds = torch.cat(geo_embeds, dim=0) if geo_embeds else None

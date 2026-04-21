@@ -18,6 +18,9 @@ class ModelArguments:
     feature_fusion_method: str = field(default="add")  # Method to fuse geometry and visual features ("add", "concat", "cross_attention", "gate")
     fusion_num_layers: int = field(default=1)  # Number of layers in the cross-attention module when feature_fusion_method is "cross_attention"
     geometry_merger_type: str = field(default="mlp")  # Type of geometry feature merger ("mlp", "avg")
+    geometry_ablation_mode: str = field(default="none")  # Geometry ablation mode ("none", "2d_only", "depth_noise", "corr_break", "pos_break", "layout_break")
+    geometry_ablation_noise_sigma: float = field(default=1.0)  # Gaussian noise sigma for channel-noise ablations
+    geometry_ablation_layout_block_size: int = field(default=4)  # Block size (in merged patches) for layout_break
 
 @dataclass
 class DataArguments:

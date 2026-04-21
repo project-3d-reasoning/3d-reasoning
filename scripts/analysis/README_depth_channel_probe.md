@@ -45,3 +45,5 @@ bash scripts/analysis/run_depth_channel_probe.sh
 - Probe training defaults:
   - `--probe_train_steps 1000`
   - `--probe_batch_size 8192`
+- Collection defaults:
+  - `--max_collect_steps 1000` (only process first 1000 sampled entries)

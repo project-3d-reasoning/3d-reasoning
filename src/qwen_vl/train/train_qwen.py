@@ -132,7 +132,10 @@ def train(attn_implementation="flash_attention_2"):
                 "reference_frame",
                 "feature_fusion_method", 
                 "fusion_num_layers",
-                "geometry_merger_type"
+                "geometry_merger_type",
+                "geometry_ablation_mode",
+                "geometry_ablation_noise_sigma",
+                "geometry_ablation_layout_block_size",
             ]:
                 setattr(config, k, getattr(model_args, k))
 
