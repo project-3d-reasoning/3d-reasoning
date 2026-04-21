@@ -2,3 +2,12 @@
 *__pycache__
 *egg-info
 data
+cache
+train_log
+7b-adver-with-gate4residual
+7b-pe 
+7b-add-span
+.claude
+experiments
+logs
+.codex
