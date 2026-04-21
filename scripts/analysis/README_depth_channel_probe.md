@@ -41,7 +41,7 @@ bash scripts/analysis/run_depth_channel_probe.sh
 - If memory is tight, reduce:
   - `--frames_per_forward`
   - `--patches_per_frame`
-  - `--max_patch_samples`
+  - `--max_patch_samples` (default `0`, meaning no cap)
 - Probe training defaults:
   - `--probe_train_steps 1000`
   - `--probe_batch_size 8192`

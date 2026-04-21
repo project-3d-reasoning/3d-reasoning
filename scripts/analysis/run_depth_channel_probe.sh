@@ -4,7 +4,7 @@ set -euo pipefail
 # One-command launcher for depth channel probe.
 # You can override defaults by exporting env vars before running:
 #   ANNOTATION_PATH, MEDIA_ROOT, SAMPLE_RATIO, VGGT_MODEL_PATH, DEVICE, OUTPUT_DIR
-#   PROBE_TRAIN_STEPS, PROBE_LR, PROBE_BATCH_SIZE
+#   PROBE_TRAIN_STEPS, PROBE_LR, PROBE_BATCH_SIZE, MAX_PATCH_SAMPLES
 # Example:
 #   ANNOTATION_PATH=data/train/scan2cap_train_32frames.json \
 #   SAMPLE_RATIO=0.1 \
@@ -13,13 +13,14 @@ set -euo pipefail
 ANNOTATION_PATH="${ANNOTATION_PATH:-data/train/scanrefer_train_32frames.json}"
 MEDIA_ROOT="${MEDIA_ROOT:-data/media}"
 SAMPLE_RATIO="${SAMPLE_RATIO:-0.1}"
-VGGT_MODEL_PATH="${VGGT_MODEL_PATH:-/inspire/hdd/project/qproject-fundationmodel/public/yxliu/test/Demongorgan/VG-LLM/models/VGGT-1B}"
+VGGT_MODEL_PATH="${VGGT_MODEL_PATH:-inspire/hdd/project/qproject-fundationmodel/public/yxliu/test/Demongorgan/VG-LLM/models/VGGT-1B}"
 DEVICE="${DEVICE:-cuda}"
 OUTPUT_DIR="${OUTPUT_DIR:-logs/depth_probe}"
 USE_INTRINSICS="${USE_INTRINSICS:-1}"
 PROBE_TRAIN_STEPS="${PROBE_TRAIN_STEPS:-1000}"
 PROBE_LR="${PROBE_LR:-0.02}"
 PROBE_BATCH_SIZE="${PROBE_BATCH_SIZE:-8192}"
+MAX_PATCH_SAMPLES="${MAX_PATCH_SAMPLES:-0}"
 
 TIMESTAMP="$(date -u +%Y%m%d_%H%M%S)"
 mkdir -p "${OUTPUT_DIR}"
@@ -36,6 +37,7 @@ CMD=(
   --probe_train_steps "${PROBE_TRAIN_STEPS}"
   --probe_lr "${PROBE_LR}"
   --probe_batch_size "${PROBE_BATCH_SIZE}"
+  --max_patch_samples "${MAX_PATCH_SAMPLES}"
 )
 
 if [[ "${USE_INTRINSICS}" == "1" ]]; then

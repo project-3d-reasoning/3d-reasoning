@@ -688,7 +688,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_frames_per_entry", type=int, default=0, help="Cap frames per entry (0 means all).")
     parser.add_argument("--frames_per_forward", type=int, default=8, help="Frames per VGGT forward for memory.")
     parser.add_argument("--patches_per_frame", type=int, default=512, help="Random patch cap per frame.")
-    parser.add_argument("--max_patch_samples", type=int, default=300000, help="Total patch sample cap.")
+    parser.add_argument("--max_patch_samples", type=int, default=0, help="Total patch sample cap (0 means no cap).")
     parser.add_argument("--target_size", type=int, default=518, help="Preprocess target width/size.")
     parser.add_argument("--patch_size", type=int, default=14, help="VGGT patch size.")
     parser.add_argument("--depth_scale", type=float, default=1000.0, help="Depth png scale to meters.")
