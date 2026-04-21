@@ -127,10 +127,10 @@ def train(attn_implementation="flash_attention_2"):
                 )
 
             for k in [
-                "use_geometry_encoder", 
-                "geometry_encoder_type", 
+                "use_geometry_encoder",
+                "geometry_encoder_type",
                 "reference_frame",
-                "feature_fusion_method", 
+                "feature_fusion_method",
                 "fusion_num_layers",
                 "geometry_merger_type",
                 "use_geometry_lastvit_selector",
@@ -143,6 +143,21 @@ def train(attn_implementation="flash_attention_2"):
                 "unique_3d_hsic_sigma_2d",
                 "unique_3d_hsic_sigma_3d",
                 "unique_3d_hsic_max_samples",
+                # ===== 新增: 几何位置编码参数 =====
+                "use_geometry_position_encoding",
+                "geometry_position_encoding_type",
+                "geometry_position_encoding_heads",
+                "geometry_position_encoding_dropout",
+                "geometry_position_encoding_frames",
+                # ===== 新增: 双向交叉注意力参数 =====
+                "use_bidirectional_cross_attention",
+                "bidirectional_cross_attention_heads",
+                "bidirectional_cross_attention_layers",
+                "bidirectional_cross_attention_dropout",
+                # ===== 新增: 多尺度金字塔参数 =====
+                "use_multiscale_geometry_pyramid",
+                "multiscale_pyramid_layers",
+                "multiscale_pyramid_dims",
             ]:
                 setattr(config, k, getattr(model_args, k))
 

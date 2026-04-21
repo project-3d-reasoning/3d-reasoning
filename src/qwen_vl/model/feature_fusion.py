@@ -239,9 +239,109 @@ class FeatureFusionModule(nn.Module):
             norm_weight_2d = self.weight_2d / weight_sum
             norm_weight_3d = self.weight_3d / weight_sum
             return norm_weight_2d * features_2d + norm_weight_3d * features_3d
-            
+
         else:
             raise ValueError(f"Unknown fusion method: {self.fusion_method}")
+
+
+class GeometryFeaturePyramid(nn.Module):
+    """
+    多尺度几何特征金字塔 (Multi-Scale Geometry Feature Pyramid)
+
+    理论基础:
+    - VGGT不同层包含不同粒度的几何信息
+    - 浅层: 精细几何细节 (边缘、纹理)
+    - 深层: 语义级几何理解 (物体形状、空间关系)
+    - 多尺度融合可同时捕获两者
+
+    技术实现:
+    - 类似FPN的自顶向下融合
+    - 横向连接投影不同层特征
+    - 最终多尺度特征聚合
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        layer_dims: list = [1024, 2048, 2048],
+        num_layers: int = 3
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+
+        # 横向连接: 投影不同层特征到统一维度
+        self.lateral_convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim, hidden_size),
+                nn.LayerNorm(hidden_size)
+            )
+            for dim in layer_dims
+        ])
+
+        # FPN卷积: 精炼每层特征
+        self.fpn_convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_size, hidden_size),
+                nn.LayerNorm(hidden_size),
+                nn.GELU(),
+                nn.Linear(hidden_size, hidden_size)
+            )
+            for _ in layer_dims
+        ])
+
+        # 输出投影
+        self.output_proj = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU()
+        )
+
+        # 可学习的尺度权重
+        self.scale_weights = nn.Parameter(torch.ones(num_layers) / num_layers)
+
+    def forward(self, multi_layer_features: list) -> torch.Tensor:
+        """
+        Args:
+            multi_layer_features: list of [seq_len, dim] from different VGGT layers
+                                 通常取 [-3, -2, -1] 三层
+
+        Returns:
+            融合后的特征 [seq_len, hidden_size]
+        """
+        assert len(multi_layer_features) == self.num_layers, \
+            f"Expected {self.num_layers} layer features, got {len(multi_layer_features)}"
+
+        # 横向连接: 投影到统一维度
+        laterals = [
+            lateral(feat)
+            for feat, lateral in zip(multi_layer_features, self.lateral_convs)
+        ]
+
+        # 自顶向下融合 (从最深层开始)
+        for i in range(len(laterals) - 1, 0, -1):
+            # 上采样深层特征 (通过复制扩展，保持几何对齐)
+            if laterals[i].shape[1] != laterals[i-1].shape[1]:
+                # 空间维度不匹配时，使用线性插值
+                laterals[i] = F.interpolate(
+                    laterals[i].unsqueeze(0).transpose(1, 2),
+                    size=laterals[i-1].shape[1],
+                    mode='linear',
+                    align_corners=False
+                ).transpose(1, 2).squeeze(0)
+            laterals[i-1] = laterals[i-1] + laterals[i]
+
+        # 应用FPN卷积精炼
+        outputs = [
+            fpn_conv(lat)
+            for lat, fpn_conv in zip(laterals, self.fpn_convs)
+        ]
+
+        # 可学习权重加权聚合
+        weights = F.softmax(self.scale_weights, dim=0)
+        combined = sum(w * out for w, out in zip(weights, outputs))
+
+        return self.output_proj(combined)
 
 
 class LearnableQueryPrefixEncoder(nn.Module):

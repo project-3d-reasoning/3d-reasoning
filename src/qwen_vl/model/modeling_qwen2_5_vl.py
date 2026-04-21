@@ -1627,8 +1627,10 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         self.use_geometry_lastvit_selector = bool(getattr(config, "use_geometry_lastvit_selector", False))
         self.geometry_lastvit_top_k = int(getattr(config, "geometry_lastvit_top_k", 1))
         if self.use_geometry_lastvit_selector:
-            if getattr(config, "feature_fusion_method", "add") != "add":
-                raise ValueError("use_geometry_lastvit_selector currently requires feature_fusion_method='add'.")
+            # Allow 'add' and 'gated' fusion methods with LAST-ViT selector
+            fusion_method = getattr(config, "feature_fusion_method", "add")
+            if fusion_method not in ["add", "gated"]:
+                raise ValueError("use_geometry_lastvit_selector currently requires feature_fusion_method='add' or 'gated'.")
             if getattr(config, "geometry_merger_type", "mlp") != "mlp":
                 raise ValueError("use_geometry_lastvit_selector currently requires geometry_merger_type='mlp'.")
             self.geometry_lastvit_selector = LASTViTSparseProjector(
@@ -1673,6 +1675,29 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             num_layers=getattr(config, "fusion_num_layers", 1)
         )
         self.feature_fusion = FeatureFusionModule(fusion_config)
+
+        # ===== 新增: 几何位置编码模块 (方案1) =====
+        self.use_geometry_position_encoding = bool(getattr(config, "use_geometry_position_encoding", False))
+        if self.use_geometry_position_encoding:
+            from .geometry_position_encoding import create_geometry_position_encoding
+            self.geometry_position_encoding = create_geometry_position_encoding(
+                encoding_type=getattr(config, "geometry_position_encoding_type", "unified"),
+                hidden_size=config.hidden_size,
+                num_heads=int(getattr(config, "geometry_position_encoding_heads", 8)),
+                num_frames=int(getattr(config, "geometry_position_encoding_frames", 8)),
+                dropout=float(getattr(config, "geometry_position_encoding_dropout", 0.1))
+            )
+
+        # ===== 新增: 双向交叉注意力模块 (方案2) =====
+        self.use_bidirectional_cross_attention = bool(getattr(config, "use_bidirectional_cross_attention", False))
+        if self.use_bidirectional_cross_attention:
+            from .bidirectional_cross_attention import create_bidirectional_cross_attention
+            self.bidirectional_cross_attention = create_bidirectional_cross_attention(
+                version="v1",
+                hidden_size=config.hidden_size,
+                num_heads=int(getattr(config, "bidirectional_cross_attention_heads", 8)),
+                dropout=float(getattr(config, "bidirectional_cross_attention_dropout", 0.1))
+            )
 
     def _use_unique_3d_prefix(self) -> bool:
         return (
@@ -1854,12 +1879,24 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         hsic_loss = torch.zeros((), device=image_embeds.device, dtype=torch.float32)
         if hsic_losses:
             hsic_loss = torch.stack(hsic_losses).mean()
-        
+
         if geo_embeds is not None:
             image_embeds = image_embeds.view(geo_embeds.shape)
-            image_embeds = self.feature_fusion(image_embeds, geo_embeds)
+
+            # ===== 新增: 几何位置编码 (方案1) =====
+            if hasattr(self, 'use_geometry_position_encoding') and self.use_geometry_position_encoding:
+                geo_embeds = self.geometry_position_encoding(geo_embeds)
+
+            # ===== 新增: 双向交叉注意力 (方案2) =====
+            if hasattr(self, 'use_bidirectional_cross_attention') and self.use_bidirectional_cross_attention:
+                # 使用双向交叉注意力替代普通融合
+                image_embeds = self.bidirectional_cross_attention(image_embeds, geo_embeds)
+            else:
+                # 原有融合逻辑
+                image_embeds = self.feature_fusion(image_embeds, geo_embeds)
+
             image_embeds = image_embeds.view(-1, image_embeds.shape[-1])
-        
+
         return image_embeds, prefix_embeds, hsic_loss
 
 
