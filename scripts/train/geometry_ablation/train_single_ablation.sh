@@ -24,9 +24,8 @@ FEATURE_FUSION_METHOD=${FEATURE_FUSION_METHOD:-add}
 GEOMETRY_ABLATION_NOISE_SIGMA=${GEOMETRY_ABLATION_NOISE_SIGMA:-1.0}
 GEOMETRY_ABLATION_LAYOUT_BLOCK_SIZE=${GEOMETRY_ABLATION_LAYOUT_BLOCK_SIZE:-4}
 
-MODEL_PATH="/data7t-root/huggingface/hub/models--Qwen--Qwen2.5-VL-7B-Instruct/snapshots/cc594898137f460bfe9f0759e9844b3ce807cfb5"  # [ModelArguments] Pretrained model path
-GEOMETRY_ENCODER_PATH="facebook/VGGT-1B"
-
+MODEL_PATH="/inspire/hdd/project/qproject-fundationmodel/public/yxliu/test/Demongorgan/VG-LLM/models/Qwen2.5-VL-7B-Instruct"  # [ModelArguments] Pretrained model path
+GEOMETRY_ENCODER_PATH="/inspire/hdd/project/qproject-fundationmodel/public/yxliu/test/Demongorgan/VG-LLM/models/VGGT-1B"
 MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 MASTER_PORT=${MASTER_PORT:-$(shuf -i 20000-29999 -n 1)}
 if [ -z "${NPROC_PER_NODE:-}" ]; then
