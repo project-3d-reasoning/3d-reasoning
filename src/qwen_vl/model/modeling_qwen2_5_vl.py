@@ -1655,13 +1655,9 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         if valid_idx.numel() == 0:
             return tokens
         out = tokens.clone()
-        noise = torch.randn(
-            out.shape[0],
-            valid_idx.numel(),
-            device=out.device,
-            dtype=out.dtype,
-        )
-        out[:, valid_idx] = out[:, valid_idx] + noise * self.geometry_ablation_noise_sigma
+        selected = out[..., valid_idx]
+        noise = torch.randn_like(selected)
+        out[..., valid_idx] = selected + noise * self.geometry_ablation_noise_sigma
         return out
 
     def _shuffle_layout_blocks(self, merged_features: torch.Tensor, block_size: int) -> torch.Tensor:

@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+EXPERIMENT_NAME="layout_break"
+GEOMETRY_ABLATION_MODE="layout_break"
+GEOMETRY_ABLATION_LAYOUT_BLOCK_SIZE=${GEOMETRY_ABLATION_LAYOUT_BLOCK_SIZE:-4}
+export EXPERIMENT_NAME GEOMETRY_ABLATION_MODE GEOMETRY_ABLATION_LAYOUT_BLOCK_SIZE
+exec "${SCRIPT_DIR}/train_single_ablation.sh"
