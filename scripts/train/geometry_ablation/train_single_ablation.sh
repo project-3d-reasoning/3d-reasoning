@@ -43,10 +43,10 @@ if [ "${GRADIENT_ACCUMULATION_STEPS}" -lt 1 ]; then
     GRADIENT_ACCUMULATION_STEPS=1
 fi
 
-RUN_ID=$(date +%Y%m%d_%H%M%S)
-OUTPUT_DIR="${OUTPUT_ROOT}/${EXPERIMENT_NAME}/${RUN_ID}"
+RUN_ID=${RUN_ID:-$(date +%Y%m%d_%H%M%S)}
+OUTPUT_DIR=${OUTPUT_DIR:-"${OUTPUT_ROOT}/${EXPERIMENT_NAME}/${RUN_ID}"}
 mkdir -p "${OUTPUT_DIR}"
-LOG_FILE="${OUTPUT_DIR}/train.log"
+LOG_FILE=${LOG_FILE:-"${OUTPUT_DIR}/train.log"}
 
 {
     echo "========================================"
@@ -59,6 +59,10 @@ LOG_FILE="${OUTPUT_DIR}/train.log"
     echo "Start Time: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "========================================"
 } | tee -a "${LOG_FILE}"
+
+if compgen -G "${OUTPUT_DIR}/checkpoint-*" >/dev/null; then
+    echo "Existing checkpoint detected under ${OUTPUT_DIR}; training will resume automatically." | tee -a "${LOG_FILE}"
+fi
 
 export NCCL_NVLS_ENABLE=${NCCL_NVLS_ENABLE:-0}
 
