@@ -1,8 +1,9 @@
 import base64
+import os
 from io import BytesIO
 from typing import List, Optional, Tuple, Union
 
-import copy
+from collections import OrderedDict
 import decord
 import numpy as np
 import torch
@@ -21,7 +22,6 @@ from lmms_eval import utils
 from lmms_eval.api.instance import Instance
 from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model
-from lmms_eval.models.model_utils.load_video import read_video_pyav_base64
 
 from qwen_vl.model.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGenerationWithVGGT
 from qwen_vl.data.utils import load_and_preprocess_images
@@ -52,6 +52,9 @@ class VGLLM(lmms):
         max_image_size: Optional[int] = None,  # Only applicable if use_custom_video_loader is True
         max_length: Optional[int] = None,
         add_frame_index: bool=False,
+        geometry_ablation_mode: Optional[str] = None,
+        geometry_ablation_noise_sigma: Optional[float] = None,
+        geometry_ablation_layout_block_size: Optional[int] = None,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -61,6 +64,10 @@ class VGLLM(lmms):
         self.use_custom_video_loader = use_custom_video_loader
         self.fps = fps
         self.add_frame_index = add_frame_index
+        self.image_tensor_cache_size = max(0, int(os.getenv("VGLLM_IMAGE_TENSOR_CACHE_SIZE", "64")))
+        self.video_frame_cache_size = max(0, int(os.getenv("VGLLM_VIDEO_FRAME_CACHE_SIZE", "8")))
+        self._image_tensor_cache = OrderedDict()
+        self._video_frame_cache = OrderedDict()
         # if self.fps and not self.use_custom_video_loader:
         #     raise ValueError("FPS is only applicable if use_custom_video_loader is True")
         self.max_image_size = max_image_size
@@ -79,6 +86,17 @@ class VGLLM(lmms):
             self.device_map = f"cuda:{accelerator.local_process_index}"
 
         config = AutoConfig.from_pretrained(pretrained)
+        if geometry_ablation_mode is not None:
+            config.geometry_ablation_mode = str(geometry_ablation_mode)
+            eval_logger.info(f"Override geometry_ablation_mode={config.geometry_ablation_mode}")
+        if geometry_ablation_noise_sigma is not None:
+            config.geometry_ablation_noise_sigma = float(geometry_ablation_noise_sigma)
+            eval_logger.info(f"Override geometry_ablation_noise_sigma={config.geometry_ablation_noise_sigma}")
+        if geometry_ablation_layout_block_size is not None:
+            config.geometry_ablation_layout_block_size = int(geometry_ablation_layout_block_size)
+            eval_logger.info(
+                f"Override geometry_ablation_layout_block_size={config.geometry_ablation_layout_block_size}"
+            )
 
         if getattr(config, "use_geometry_encoder", False) or getattr(config, "use_vggt_feature", False):
             load_class = Qwen2_5_VLForConditionalGenerationWithVGGT
@@ -181,6 +199,79 @@ class VGLLM(lmms):
                 new_list.append(j)
         return new_list
 
+    def _as_rgb_pil(self, image: Image.Image) -> Image.Image:
+        if not isinstance(image, Image.Image):
+            raise TypeError(f"Expected PIL.Image.Image, got {type(image)}")
+        source_path = getattr(image, "_vgllm_source_path", None) or getattr(image, "filename", None)
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        if source_path:
+            setattr(image, "_vgllm_source_path", source_path)
+        return image
+
+    def _decode_base64_image(self, image_data: str) -> Image.Image:
+        _, base64_data = image_data.split("base64,", 1)
+        image_bytes = base64.b64decode(base64_data)
+        with BytesIO(image_bytes) as bio:
+            image = Image.open(bio)
+            image.load()
+        return self._as_rgb_pil(image)
+
+    def _get_image_cache_key(self, image: Image.Image) -> Optional[str]:
+        source_path = getattr(image, "_vgllm_source_path", None)
+        if source_path:
+            return source_path
+        filename = getattr(image, "filename", None)
+        return filename or None
+
+    def _get_preprocessed_image(self, image: Image.Image) -> torch.Tensor:
+        image = self._as_rgb_pil(image)
+        cache_key = self._get_image_cache_key(image)
+
+        if cache_key and cache_key in self._image_tensor_cache:
+            self._image_tensor_cache.move_to_end(cache_key)
+            return self._image_tensor_cache[cache_key]
+
+        processed_image = load_and_preprocess_images([image])[0]
+
+        if cache_key and self.image_tensor_cache_size > 0:
+            self._image_tensor_cache[cache_key] = processed_image
+            self._image_tensor_cache.move_to_end(cache_key)
+            while len(self._image_tensor_cache) > self.image_tensor_cache_size:
+                self._image_tensor_cache.popitem(last=False)
+
+        return processed_image
+
+    def _sample_video_frames(self, video_path: str):
+        vr = decord.VideoReader(video_path)
+        image_num = len(vr)
+        if image_num < self.max_num_frames:
+            frame_indices = np.arange(image_num)
+        else:
+            frame_indices = np.linspace(0, image_num - 1, self.max_num_frames).astype(int)
+
+        frames = []
+        for frame_idx in frame_indices.tolist():
+            image = Image.fromarray(vr[frame_idx].asnumpy()).convert("RGB")
+            setattr(image, "_vgllm_source_path", f"{video_path}#frame_{frame_idx}")
+            frames.append(image)
+        return tuple(frames)
+
+    def _get_video_frames(self, video_path: str):
+        if video_path in self._video_frame_cache:
+            self._video_frame_cache.move_to_end(video_path)
+            return self._video_frame_cache[video_path]
+
+        frames = self._sample_video_frames(video_path)
+
+        if self.video_frame_cache_size > 0:
+            self._video_frame_cache[video_path] = frames
+            self._video_frame_cache.move_to_end(video_path)
+            while len(self._video_frame_cache) > self.video_frame_cache_size:
+                self._video_frame_cache.popitem(last=False)
+
+        return frames
+
     def generate_until(self, requests: List[Instance]) -> List[str]:
         res = []
 
@@ -229,40 +320,29 @@ class VGLLM(lmms):
                 if len(visuals) > 0:
                     visual = visuals[i] if i < len(visuals) else None
                     if isinstance(visual, str) and visual.endswith((".mp4", ".avi", ".mov")):  # Video file
-                        vr = decord.VideoReader(visual)
-                        image_num = len(vr)
-                        # sample max_num_frames frame indices from the video
-                        if image_num < self.max_num_frames:
-                            frame_indices = np.arange(image_num)
-                        else:
-                            frame_indices = np.linspace(0, image_num - 1, self.max_num_frames).astype(int)
-                        # read the frames
-                        frames = [vr[i].asnumpy() for i in frame_indices]
+                        frames = self._get_video_frames(visual)
                         visual_content = []
                         for frame in frames:
-                            image = Image.fromarray(frame).convert("RGB")
-                            visual_content.append({"type": "image", "image": image})
+                            visual_content.append({"type": "image", "image": frame})
                         message.append({"role": "user", "content": visual_content + [{"type": "text", "text": context}]})
 
                     elif isinstance(visual, Image.Image):  # Single image
-                        base64_image = visual.convert("RGB")
-                        buffer = BytesIO()
-                        base64_image.save(buffer, format="JPEG")
-                        base64_bytes = base64.b64encode(buffer.getvalue())
-                        base64_string = base64_bytes.decode("utf-8")
-                        message.append({"role": "user", "content": [{"type": "image", "image": f"data:image/jpeg;base64,{base64_string}"}, {"type": "text", "text": context}]})
+                        message.append(
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "image", "image": self._as_rgb_pil(visual)},
+                                    {"type": "text", "text": context},
+                                ],
+                            }
+                        )
                     elif isinstance(visual, (list, tuple)) and all(isinstance(v, Image.Image) for v in visual):  # Multiple images
                         image_content = []
                         image_count = 0
                         for v in visual:
-                            base64_image = v.convert("RGB")
-                            buffer = BytesIO()
-                            base64_image.save(buffer, format="JPEG")
-                            base64_bytes = base64.b64encode(buffer.getvalue())
-                            base64_string = base64_bytes.decode("utf-8")
                             if self.add_frame_index:
                                 image_content.append({"type": "text", "text": "Frame-{}: ".format(image_count)})    
-                            image_content.append({"type": "image", "image": f"data:image/jpeg;base64,{base64_string}"})
+                            image_content.append({"type": "image", "image": self._as_rgb_pil(v)})
                             image_count += 1
                         message.append({"role": "user", "content": image_content + [{"type": "text", "text": context}]})
                     else:
@@ -286,13 +366,9 @@ class VGLLM(lmms):
                     if "image" in ele:
                         image = ele["image"]
                         if isinstance(image, Image.Image):
-                            pass
+                            image = self._as_rgb_pil(image)
                         elif isinstance(image, str) and "base64," in image:
-                            _, base64_data = image.split("base64,", 1)
-                            data = base64.b64decode(base64_data)
-                            # fix memory leak issue while using BytesIO
-                            with BytesIO(data) as bio:
-                                image = copy.deepcopy(Image.open(bio))
+                            image = self._decode_base64_image(image)
                         else:
                             raise NotImplementedError("Unsupported image type")
 
@@ -300,16 +376,15 @@ class VGLLM(lmms):
                         raise NotImplementedError("Unsupported vision info type")
 
                     assert isinstance(image, Image.Image), f"Unsupported image type: {type(image)}"
-                    image = load_and_preprocess_images([image])[0]
-                    cur_geometry_encoder_inputs.append(copy.deepcopy(image))
-                    _, height, width = image.shape
+                    processed_image = self._get_preprocessed_image(image)
+                    cur_geometry_encoder_inputs.append(processed_image)
+                    _, height, width = processed_image.shape
                     # merge_size = 2
                     if (width // patch_size) % merge_size > 0:
                         width = width - (width // patch_size) % merge_size * patch_size
                     if (height // patch_size) % merge_size > 0:
                         height = height - (height // patch_size) % merge_size * patch_size
-                    image = image[:, :height, :width]
-                    image_inputs.append(image)
+                    image_inputs.append(processed_image[:, :height, :width])
 
                 geometry_encoder_inputs.append(torch.stack(cur_geometry_encoder_inputs))
             inputs = self.processor(

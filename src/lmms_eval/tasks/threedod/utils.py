@@ -1,5 +1,6 @@
 import re
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 from pathlib import Path
 import yaml
@@ -27,6 +28,11 @@ cate31 = [
     "bathtub", "ottoman", "dresser", "bin", "toilet", "refrigerator", "stove", "microwave", "monitor", "computer",
     "window", "shelf", "curtain", "plant", "stairs", "picture", "book", "bottle", "lamp", "towl", "sink",
 ]
+
+THREEDOD_MATCHING_WORKERS = max(1, min(int(os.getenv("THREEDOD_MATCHING_WORKERS", os.cpu_count() or 1)), 4))
+THREEDOD_MATCHING_EXECUTOR = (
+    ThreadPoolExecutor(max_workers=THREEDOD_MATCHING_WORKERS) if THREEDOD_MATCHING_WORKERS > 1 else None
+)
 
 def rotation_3d_in_euler(points, angles, convention, return_mat=False, clockwise=False):
     """Rotate points by angles according to axis.
@@ -309,52 +315,96 @@ def threedod_doc_to_text(doc, lmms_eval_specific_kwargs=None):
 
 
 
+def _compute_iou_matrix(pred_boxes, gt_boxes):
+    if len(pred_boxes) == 0 or len(gt_boxes) == 0:
+        return torch.empty((len(pred_boxes), len(gt_boxes)), dtype=torch.float32)
+
+    try:
+        pred_tensor = torch.as_tensor(pred_boxes, dtype=torch.float32)
+        gt_tensor = torch.as_tensor(gt_boxes, dtype=torch.float32)
+        return EulerDepthInstance3DBoxes.overlaps(
+            EulerDepthInstance3DBoxes(pred_tensor, convention="ZXY"),
+            EulerDepthInstance3DBoxes(gt_tensor, convention="ZXY"),
+        ).cpu()
+    except Exception as e:
+        eval_logger.error(f"Error calculating batched IOU matrix: {e}")
+
+    # Fall back to the original pairwise computation path if batched overlaps fails.
+    iou_matrix = torch.zeros((len(pred_boxes), len(gt_boxes)), dtype=torch.float32)
+    for pred_idx, bbox in enumerate(pred_boxes):
+        for gt_idx, gt_box in enumerate(gt_boxes):
+            try:
+                iou_matrix[pred_idx, gt_idx] = EulerDepthInstance3DBoxes.overlaps(
+                    EulerDepthInstance3DBoxes(torch.tensor([bbox]), convention="ZXY"),
+                    EulerDepthInstance3DBoxes(torch.tensor([gt_box]), convention="ZXY"),
+                ).item()
+            except Exception as inner_e:
+                eval_logger.error(f"Error calculating IOU: {inner_e}")
+                iou_matrix[pred_idx, gt_idx] = 0.0
+    return iou_matrix
+
+
+def _compute_category_ap(pred_boxes, gt_boxes, iou_threshold):
+    if len(pred_boxes) == 0:
+        return {"tp": 0, "fp": 0, "fn": len(gt_boxes)}
+    if len(gt_boxes) == 0:
+        return {"tp": 0, "fp": len(pred_boxes), "fn": 0}
+
+    iou_matrix = _compute_iou_matrix(pred_boxes, gt_boxes)
+    used_gt = set()
+    tp = 0
+    fp = 0
+
+    # Preserve the original greedy matching order over predictions and GT indices.
+    for pred_idx in range(len(pred_boxes)):
+        gt_box_match = -1
+        max_iou = 0.0
+        for gt_idx in range(len(gt_boxes)):
+            if gt_idx in used_gt:
+                continue
+            iou = float(iou_matrix[pred_idx, gt_idx])
+            if iou > max_iou:
+                max_iou = iou
+                gt_box_match = gt_idx
+
+        if max_iou > iou_threshold:
+            used_gt.add(gt_box_match)
+            tp += 1
+        else:
+            fp += 1
+
+    return {"tp": tp, "fp": fp, "fn": len(gt_boxes) - len(used_gt)}
+
+
 def compute_ap(gt_bbox_dict, pred_bbox_dict, iou_threshold=0.25):
+    categories = sorted(set(pred_bbox_dict.keys()) | set(gt_bbox_dict.keys()))
+    if not categories:
+        return {}
 
-    all_tp = defaultdict()
-    all_fp = defaultdict()
-    all_fn = defaultdict()
-    used_gt = defaultdict(set)
-    for category in pred_bbox_dict:
-        for bbox in pred_bbox_dict[category]:
-            gt_box_match = -1
-            max_iou = 0
-            for i, gt_box in enumerate(gt_bbox_dict[category]):
-                if i in used_gt[category]:
-                    continue
-                try:
-                    iou = EulerDepthInstance3DBoxes.overlaps(
-                        EulerDepthInstance3DBoxes(torch.tensor([bbox]), convention="ZXY"),
-                        EulerDepthInstance3DBoxes(torch.tensor([gt_box]), convention="ZXY")
-                    )
-                except Exception as e:
-                    eval_logger.error(f"Error calculating IOU: {e}")
-                    iou = 0
-                if iou > max_iou:
-                    max_iou = iou
-                    gt_box_match = i
-            
-            if max_iou > iou_threshold:
-                used_gt[category].add(gt_box_match)
-                all_tp[category] = all_tp.get(category, 0) + 1
-            else:
-                all_fp[category] = all_fp.get(category, 0) + 1
-    
-    for category in gt_bbox_dict:
-        for i, gt_box in enumerate(gt_bbox_dict[category]):
-            if i not in used_gt[category]:
-                all_fn[category] = all_fn.get(category, 0) + 1        
+    category_metrics = {}
 
-    categories = set(pred_bbox_dict.keys()) | set(gt_bbox_dict.keys())
-    ret = {
-        category: {
-            "tp": all_tp.get(category, 0),
-            "fp": all_fp.get(category, 0),
-            "fn": all_fn.get(category, 0),
+    if THREEDOD_MATCHING_EXECUTOR is None or len(categories) <= 1:
+        for category in categories:
+            category_metrics[category] = _compute_category_ap(
+                pred_bbox_dict.get(category, []),
+                gt_bbox_dict.get(category, []),
+                iou_threshold,
+            )
+    else:
+        future_to_category = {
+            THREEDOD_MATCHING_EXECUTOR.submit(
+                _compute_category_ap,
+                pred_bbox_dict.get(category, []),
+                gt_bbox_dict.get(category, []),
+                iou_threshold,
+            ): category
+            for category in categories
         }
-        for category in categories
-    }
-    return ret
+        for future in as_completed(future_to_category):
+            category = future_to_category[future]
+            category_metrics[category] = future.result()
+
+    return {category: category_metrics[category] for category in categories}
    
 
 def threedod_process_results(doc, results):

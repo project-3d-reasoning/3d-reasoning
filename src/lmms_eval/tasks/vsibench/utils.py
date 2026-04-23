@@ -3,9 +3,8 @@ import os
 from pathlib import Path
 import yaml
 from loguru import logger as eval_logger
-from functools import partial
+from functools import partial, lru_cache
 import numpy as np
-import pandas as pd
 
 import datasets
 
@@ -49,14 +48,17 @@ else:
     cache_name = yaml.safe_load("".join(safe_data))["dataset_kwargs"]["cache_dir"]
     cache_dir = os.path.join(base_cache_dir, cache_name)
 
-def vsibench_doc_to_visual(doc):
-    video_path = doc["dataset"] + "/" + doc["scene_name"] + ".mp4"
-    video_path = os.path.join(cache_dir, video_path)
-    if os.path.exists(video_path):
-        video_path = video_path
-    else:
+
+@lru_cache(maxsize=None)
+def _resolve_video_path(dataset_name, scene_name):
+    video_path = os.path.join(cache_dir, dataset_name, f"{scene_name}.mp4")
+    if not os.path.exists(video_path):
         raise FileExistsError(f"video path:{video_path} does not exist.")
-    return [video_path]
+    return video_path
+
+
+def vsibench_doc_to_visual(doc):
+    return [_resolve_video_path(doc["dataset"], doc["scene_name"])]
 
 
 def vsibench_doc_to_text(doc, lmms_eval_specific_kwargs=None):
@@ -96,6 +98,15 @@ def mean_relative_accuracy(pred, target, start, end, interval):
     accuracy = abs_dist_norm(pred, target) <= 1 - conf_intervs
     return accuracy.mean()
 
+
+METRIC_FNS_FOR_MCA = {
+    "accuracy": exact_match,
+}
+
+METRIC_FNS_FOR_NA = {
+    "MRA:.5:.95:.05": partial(mean_relative_accuracy, start=.5, end=.95, interval=.05),
+}
+
 WORST_CASE_FOR_METRICS = {
     "accuracy": 0.,
     "MRA:.5:.95:.05": 0.,
@@ -112,12 +123,16 @@ def vsibench_process_results(doc, results):
     
     doc['prediction'] = results[0]
     if doc['question_type'] in MCA_QUESTION_TYPES:
-        for key, value in METRICS_FOR_MCA.items():
-            doc[key] = eval(value)(fuzzy_matching(doc['prediction']), doc['ground_truth'])
+        pred = fuzzy_matching(doc['prediction'])
+        target = doc['ground_truth']
+        for key, fn in METRIC_FNS_FOR_MCA.items():
+            doc[key] = fn(pred, target)
     elif doc['question_type'] in NA_QUESTION_TYPES:
-        for key, value in METRICS_FOR_NA.items():
+        pred = to_float(fuzzy_matching(doc['prediction']))
+        target = to_float(doc['ground_truth'])
+        for key, fn in METRIC_FNS_FOR_NA.items():
             try:
-                doc[key] = eval(value)(to_float(fuzzy_matching(doc['prediction'])), to_float(doc['ground_truth']))
+                doc[key] = fn(pred, target)
             except TypeError:
                 doc[key] = WORST_CASE_FOR_METRICS[key]
     else:
@@ -126,25 +141,23 @@ def vsibench_process_results(doc, results):
     return {"vsibench_score": doc}
 
 def vsibench_aggregate_results(results):
-    results = pd.DataFrame(results)
-    
     output = {}
+    grouped_results = {}
+    for result in results:
+        grouped_results.setdefault(result["question_type"], []).append(result)
 
-    for question_type, question_type_indexes in results.groupby('question_type').groups.items():
-        per_question_type = results.iloc[question_type_indexes]
-        
+    for question_type, per_question_type in grouped_results.items():
         if question_type in MCA_QUESTION_TYPES:
-            for metric in METRICS_FOR_MCA.keys():
-                output[f"{question_type}_{metric}"] = per_question_type[metric].mean()
+            metric_names = METRICS_FOR_MCA.keys()
         elif question_type in NA_QUESTION_TYPES:
-            for metric in METRICS_FOR_NA.keys():
-                if metric == 'success_rate':
-                    output[f"{question_type}_{metric}"] = per_question_type[metric].mean()
-                else:
-                    output[f"{question_type}_{metric}"] = per_question_type[metric].mean()
-
+            metric_names = METRICS_FOR_NA.keys()
         else:
             raise ValueError(f"Unknown question type: {question_type}")
+
+        for metric in metric_names:
+            output[f"{question_type}_{metric}"] = np.mean(
+                np.asarray([item[metric] for item in per_question_type], dtype=np.float64)
+            )
     
     output['object_rel_direction_accuracy'] = sum([
         output.pop('object_rel_direction_easy_accuracy'),
@@ -152,6 +165,6 @@ def vsibench_aggregate_results(results):
         output.pop('object_rel_direction_hard_accuracy'),
     ]) / 3.
     
-    output['overall'] = sum([_ for _ in output.values()]) / len(output)
+    output['overall'] = np.mean(np.fromiter(output.values(), dtype=np.float64))
     eval_logger.info(f"Evaluation results: {output}")
     return output['overall'] * 100.
