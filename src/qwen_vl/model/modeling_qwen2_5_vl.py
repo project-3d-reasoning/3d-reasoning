@@ -53,7 +53,11 @@ from .configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLVisionConfig
 from .vggt.models.vggt import VGGT
 from .geometry_encoders import create_geometry_encoder, GeometryEncoderConfig
 from .feature_fusion import FeatureFusionModule, FeatureFusionConfig, GeometryFeatureMerger
-from .geometry_ablation_channels import DEPTH_RELATED_CHANNELS, POS_RELATED_CHANNELS
+from .geometry_ablation_channels import (
+    DEPTH_RELATED_CHANNELS,
+    FEATURE_2D_RELATED_CHANNELS,
+    POS_RELATED_CHANNELS,
+)
 from .loss import normalize_pointcloud, check_and_fix_inf_nan
 
 
@@ -1638,6 +1642,11 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             torch.tensor(POS_RELATED_CHANNELS, dtype=torch.long),
             persistent=False,
         )
+        self.register_buffer(
+            "_feature_2d_related_channel_idx",
+            torch.tensor(FEATURE_2D_RELATED_CHANNELS, dtype=torch.long),
+            persistent=False,
+        )
 
     def _non_identity_permutation(self, n: int, device: torch.device) -> torch.Tensor:
         if n <= 1:
@@ -1713,6 +1722,8 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                     features = self._add_gaussian_noise_to_channels(features, self._depth_related_channel_idx)
                 elif ablation_mode == "pos_break":
                     features = self._add_gaussian_noise_to_channels(features, self._pos_related_channel_idx)
+                elif ablation_mode in {"feature2d_noise", "feature_2d_noise"}:
+                    features = self._add_gaussian_noise_to_channels(features, self._feature_2d_related_channel_idx)
 
                 # [n_image, h_patch_size, w_patch_size, feature_dim]
                 features = features.reshape(n_image, h_patch, w_patch, -1)

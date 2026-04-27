@@ -4,6 +4,8 @@ This folder provides a utility script:
 
 - `scripts/analysis/depth_channel_probe.py`
 - `scripts/analysis/run_depth_channel_probe.sh`
+- `scripts/analysis/depth_probe_resample_compare.py`
+- `scripts/analysis/run_depth_probe_resample_compare.sh`
 
 It implements the requested pipeline:
 
@@ -31,6 +33,15 @@ Or use the one-command launcher:
 bash scripts/analysis/run_depth_channel_probe.sh
 ```
 
+To rerun the probe on a new random downsampled subset and compare channel overlap
+with a previous log:
+
+```bash
+BASELINE_LOG_PATH=logs/depth_probe/depth_probe_20260421_053625.json \
+RESAMPLE_SEED=43 \
+bash scripts/analysis/run_depth_probe_resample_compare.sh
+```
+
 ## Notes
 
 - The script expects ScanNet-style frame layout where each RGB file has a depth file with the same basename:
@@ -47,3 +58,6 @@ bash scripts/analysis/run_depth_channel_probe.sh
   - `--probe_batch_size 8192`
 - Collection defaults:
   - `--max_collect_steps 1000` (only process first 1000 sampled entries)
+- Resample comparison output:
+  - new probe log goes to `logs/depth_probe_resample/`
+  - overlap comparison json goes to `logs/depth_probe_compare/`
